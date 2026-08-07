@@ -95,3 +95,7 @@ Run it from the host namespace shared by Shoko media and Silo:
 Bootstrap performs no Shoko write operation. It writes only the configured VFS
 root and can be interrupted and rerun; the same crawl state and journal rules
 apply.
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).

@@ -1,6 +1,6 @@
 {
   "plugin_id": "silo.shokoanime",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "supported_platforms": [
@@ -28,7 +28,7 @@
     "changelog_url": "https://github.com/crowquillx/silo-shoko-plugin/releases",
     "publisher_name": "Renkei",
     "publisher_url": "https://github.com/crowquillx",
-    "license_spdx": "NOASSERTION"
+    "license_spdx": "MIT"
   },
   "capabilities": [
     {
