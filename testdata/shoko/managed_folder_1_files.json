@@ -1,0 +1,54 @@
+{
+  "total": 2,
+  "list": [
+    {
+      "id": 100,
+      "size": 4294967296,
+      "isVariation": false,
+      "isIgnored": false,
+      "locations": [
+        {
+          "id": 1000,
+          "fileId": 100,
+          "managedFolderId": 1,
+          "relativePath": "redacted-release/fixture-pack.mkv",
+          "absolutePath": "/redacted/media/anime/redacted-release/fixture-pack.mkv",
+          "isAccessible": true
+        }
+      ],
+      "seriesIds": [
+        {
+          "seriesId": {"id": 7, "aniDB": 7007},
+          "episodeIds": [
+            {"id": 42, "aniDB": 7042, "source": "redacted"},
+            {"id": 43, "aniDB": 7043, "source": "redacted"}
+          ]
+        }
+      ]
+    },
+    {
+      "id": 101,
+      "size": 2147483648,
+      "isVariation": false,
+      "isIgnored": false,
+      "locations": [
+        {
+          "id": 1001,
+          "fileId": 101,
+          "managedFolderId": 1,
+          "relativePath": "redacted-release/fixture-episode-03.mkv",
+          "absolutePath": "/redacted/media/anime/redacted-release/fixture-episode-03.mkv",
+          "isAccessible": true
+        }
+      ],
+      "seriesIds": [
+        {
+          "seriesId": {"id": 7, "aniDB": 7007},
+          "episodeIds": [
+            {"id": 44, "aniDB": 7044, "source": "redacted"}
+          ]
+        }
+      ]
+    }
+  ]
+}

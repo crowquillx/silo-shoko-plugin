@@ -1,0 +1,41 @@
+{
+  "total": 3,
+  "list": [
+    {
+      "ids": {"id": 42, "parentSeries": 7, "aniDB": 7042},
+      "name": "Fixture episode one",
+      "description": "First redacted episode.",
+      "aniDB": {
+        "id": 7042,
+        "animeID": 7007,
+        "type": "Episode",
+        "episodeNumber": 1,
+        "title": "Fixture episode one"
+      }
+    },
+    {
+      "ids": {"id": 43, "parentSeries": 7, "aniDB": 7043},
+      "name": "Fixture episode two",
+      "description": "Second redacted episode.",
+      "aniDB": {
+        "id": 7043,
+        "animeID": 7007,
+        "type": "Episode",
+        "episodeNumber": 2,
+        "title": "Fixture episode two"
+      }
+    },
+    {
+      "ids": {"id": 44, "parentSeries": 7, "aniDB": 7044},
+      "name": "Fixture episode three",
+      "description": "Third redacted episode.",
+      "aniDB": {
+        "id": 7044,
+        "animeID": 7007,
+        "type": "Episode",
+        "episodeNumber": 3,
+        "title": "Fixture episode three"
+      }
+    }
+  ]
+}

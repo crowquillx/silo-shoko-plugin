@@ -1,0 +1,16 @@
+{
+  "ids": {
+    "id": 42,
+    "parentSeries": 7,
+    "aniDB": 7042
+  },
+  "name": "Fixture episode one",
+  "description": "First redacted episode.",
+  "aniDB": {
+    "id": 7042,
+    "animeID": 7007,
+    "type": "Episode",
+    "episodeNumber": 1,
+    "title": "Fixture episode one"
+  }
+}

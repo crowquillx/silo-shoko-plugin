@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: Test
+        run: go test ./...
+        env:
+          CGO_ENABLED: "0"
+      - name: Vet
+        run: go vet ./...
+        env:
+          CGO_ENABLED: "0"
+      - name: Validate embedded manifest
+        run: |
+          go run . manifest > /tmp/manifest.json
+          jq -e --arg version "$(jq -r '.version' manifest.json)" \
+            '.pluginId == "silo.shokoanime" and .version == $version' /tmp/manifest.json
+        env:
+          CGO_ENABLED: "0"
+      - name: Build release binaries
+        run: make build-all VERSION="$(jq -r '.version' manifest.json)"
+      - name: Generate Silo repository index
+        run: |
+          sha256sum dist/plugin-* > dist/checksums.txt
+          ./scripts/generate-repository-index.sh "$(jq -r '.version' manifest.json)" dist dist/repository.json
+          jq -e '.plugins[0].manifest.plugin_id == "silo.shokoanime"' dist/repository.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-build-${{ github.sha }}
+          path: dist/

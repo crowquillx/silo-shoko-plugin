@@ -1,0 +1,116 @@
+{
+  "plugin_id": "silo.shokoanime",
+  "version": "0.1.0",
+  "checksum": "__CHECKSUM__",
+  "silo_api_version": "v1",
+  "supported_platforms": [
+    {
+      "os": "linux",
+      "arch": "amd64"
+    },
+    {
+      "os": "linux",
+      "arch": "arm64"
+    },
+    {
+      "os": "darwin",
+      "arch": "arm64"
+    }
+  ],
+  "presentation": {
+    "display_name": "ShokoAnime VFS",
+    "summary": "Builds a Shoko-backed virtual filesystem for Silo libraries.",
+    "description_markdown": "Reads Shoko Server API v3, reconciles deterministic plugin-owned leaf symlinks, and publishes successful VFS changes for targeted Silo scans. It deliberately does not expose remote streams or modify Shoko data.",
+    "setup_markdown": "Configure a Shoko Server URL, API key, a Silo-visible output root, and managed-folder path mappings. Start with a dry-run reconcile and verify that the plugin and Silo share the same filesystem namespace. Enable the Shoko VFS autoscan source: the scheduled task uses a bounded step and scan_source.v1 resumes pending work and queues targeted scans after successful commits.",
+    "homepage_url": "https://github.com/crowquillx/silo-shoko-plugin",
+    "source_url": "https://github.com/crowquillx/silo-shoko-plugin",
+    "support_url": "https://github.com/crowquillx/silo-shoko-plugin/issues",
+    "changelog_url": "https://github.com/crowquillx/silo-shoko-plugin/releases",
+    "publisher_name": "Renkei",
+    "publisher_url": "https://github.com/crowquillx",
+    "license_spdx": "NOASSERTION"
+  },
+  "capabilities": [
+    {
+      "type": "metadata_provider.v1",
+      "id": "shoko",
+      "display_name": "Shoko",
+      "description": "Exact Shoko series and episode metadata for VFS paths.",
+      "metadata": {
+        "default_priority": {
+          "movie": 1,
+          "series": 1,
+          "season": 1,
+          "episode": 1
+        }
+      }
+    },
+    {
+      "type": "image_resolver.v1",
+      "id": "shoko",
+      "display_name": "Shoko Images",
+      "description": "Resolves opaque shoko://image/ paths to Shoko image URLs.",
+      "metadata": {
+        "schemes": [
+          "shoko"
+        ],
+        "priority": 100
+      }
+    },
+    {
+      "type": "scheduled_task.v1",
+      "id": "reconcile",
+      "display_name": "Reconcile Shoko VFS",
+      "description": "Plans and reconciles plugin-owned Shoko VFS links."
+    },
+    {
+      "type": "scan_source.v1",
+      "id": "shoko",
+      "display_name": "Shoko VFS changes",
+      "description": "Reports successfully reconciled VFS paths so Silo can scan them automatically."
+    }
+  ],
+  "global_config_schema": [
+    {
+      "key": "connection",
+      "title": "ShokoAnime connection",
+      "description": "Shoko connection and VFS path policy. The API key is encrypted by Silo.",
+      "json_schema": "{\"type\":\"object\",\"properties\":{\"base_url\":{\"type\":\"string\",\"format\":\"uri\",\"minLength\":1},\"api_key\":{\"type\":\"string\",\"minLength\":1},\"vfs_root\":{\"type\":\"string\",\"minLength\":1},\"managed_folder_map\":{\"type\":\"string\",\"minLength\":2}},\"required\":[\"base_url\",\"api_key\",\"vfs_root\",\"managed_folder_map\"],\"additionalProperties\":false}",
+      "required": true,
+      "admin_form": {
+        "fields": [
+          {
+            "key": "base_url",
+            "label": "Shoko Server URL",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "required": true,
+            "placeholder": "http://shoko:8111"
+          },
+          {
+            "key": "api_key",
+            "label": "API key",
+            "control": "ADMIN_FORM_CONTROL_PASSWORD",
+            "required": true,
+            "secret": true
+          },
+          {
+            "key": "vfs_root",
+            "label": "VFS output root",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "required": true,
+            "placeholder": "/srv/silo/shoko-vfs"
+          },
+          {
+            "key": "managed_folder_map",
+            "label": "Managed-folder path map (JSON)",
+            "control": "ADMIN_FORM_CONTROL_TEXTAREA",
+            "required": true,
+            "multiline": true,
+            "rows": 5,
+            "placeholder": "{\"1\": \"/media/anime\"}"
+          }
+        ]
+      }
+    }
+  ]
+}

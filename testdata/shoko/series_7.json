@@ -1,0 +1,13 @@
+{
+  "ids": {
+    "id": 7,
+    "aniDB": 7007,
+    "tmdb": {"show": [70007]}
+  },
+  "name": "Fixture Show",
+  "description": "A redacted fixture series.",
+  "aniDB": {
+    "id": 7007,
+    "type": "TV"
+  }
+}
