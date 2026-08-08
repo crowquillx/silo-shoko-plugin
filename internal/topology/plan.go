@@ -32,7 +32,6 @@ type Kind string
 
 const (
 	KindEpisode Kind = "episode"
-	KindMovie   Kind = "movie"
 )
 
 type Entry struct {
@@ -88,6 +87,7 @@ func Build(snapshot shoko.Snapshot, policy Policy) (Plan, error) {
 	}
 	plan := Plan{Entries: make([]Entry, 0)}
 	seenKeys := make(map[string]struct{})
+	groupLayouts := newSnapshotGroupLayouts(snapshot)
 	for _, file := range snapshot.Files {
 		if file.IsIgnored && !policy.IncludeIgnored {
 			continue
@@ -142,9 +142,9 @@ func Build(snapshot shoko.Snapshot, policy Policy) (Plan, error) {
 				group, groupID, grouped := groupForSeries(snapshot, seriesID)
 				season := 0
 				if grouped {
-					season = groupedSeason(snapshot, groupID, seriesID)
+					season = groupLayouts[groupID].SeasonNumber(seriesID)
 				}
-				entry := makeEntry(sourceRoot, relative, file, series, seriesID, episode, episodeID, group, groupID, season, snapshot)
+				entry := makeEntry(sourceRoot, relative, file, series, seriesID, episode, episodeID, group, groupID, season, groupLayouts[groupID], snapshot)
 				if _, seen := seenKeys[entry.StableKey]; seen {
 					continue
 				}
@@ -180,49 +180,6 @@ func groupForSeries(snapshot shoko.Snapshot, seriesID int) (shoko.Group, int, bo
 		}
 	}
 	return shoko.Group{}, 0, false
-}
-
-func groupedSeason(snapshot shoko.Snapshot, groupID, seriesID int) int {
-	series, ok := snapshot.Series[seriesID]
-	if !ok || series.AniDB == nil {
-		return 0
-	}
-	if isMovie(series) {
-		return 0
-	}
-	if !strings.EqualFold(series.AniDB.Type, "TV") {
-		return 0
-	}
-	members := make([]int, 0)
-	seen := make(map[int]struct{}, len(snapshot.GroupSeries[groupID]))
-	for _, memberID := range snapshot.GroupSeries[groupID] {
-		if _, duplicate := seen[memberID]; duplicate {
-			continue
-		}
-		seen[memberID] = struct{}{}
-		member, exists := snapshot.Series[memberID]
-		if !exists || member.AniDB == nil || !strings.EqualFold(member.AniDB.Type, "TV") {
-			continue
-		}
-		members = append(members, memberID)
-	}
-	sort.Slice(members, func(i, j int) bool {
-		left, leftOK := completeAirDate(snapshot.Series[members[i]])
-		right, rightOK := completeAirDate(snapshot.Series[members[j]])
-		if leftOK != rightOK {
-			return leftOK
-		}
-		if leftOK && !left.Equal(right) {
-			return left.Before(right)
-		}
-		return members[i] < members[j]
-	})
-	for ordinal, memberID := range members {
-		if memberID == seriesID {
-			return ordinal + 1
-		}
-	}
-	return 0
 }
 
 func completeAirDate(series shoko.Series) (time.Time, bool) {
@@ -282,7 +239,7 @@ func resolveEpisode(snapshot shoko.Snapshot, seriesID int, reference shoko.Episo
 	return shoko.Episode{}, 0, false
 }
 
-func makeEntry(sourceRoot, relative string, file shoko.File, series shoko.Series, seriesID int, episode shoko.Episode, episodeID int, group shoko.Group, groupID, groupedSeasonNumber int, snapshot shoko.Snapshot) Entry {
+func makeEntry(sourceRoot, relative string, file shoko.File, series shoko.Series, seriesID int, episode shoko.Episode, episodeID int, group shoko.Group, groupID, groupedSeasonNumber int, groupLayout GroupLayout, snapshot shoko.Snapshot) Entry {
 	relative = filepath.FromSlash(relative)
 	target := filepath.Join(sourceRoot, relative)
 	ext := filepath.Ext(relative)
@@ -295,27 +252,9 @@ func makeEntry(sourceRoot, relative string, file shoko.File, series shoko.Series
 	if groupID != 0 {
 		groupMarker = fmt.Sprintf(" [Shoko Group=%d]", groupID)
 	}
-	if isMovie(series) {
-		name := fmt.Sprintf("%s%s [Shoko Series=%d] [Shoko Episode=%d] [Shoko File=%d]%s", baseTitle, groupMarker, seriesID, episodeID, file.ID, ext)
-		return Entry{
-			StableKey:      stableKey(file.ID, episodeID),
-			LogicalPath:    filepath.Join("Movies", seriesSegment, cleanSegment(name)),
-			TargetPath:     target,
-			SourcePath:     target,
-			Kind:           KindMovie,
-			ShokoFileID:    file.ID,
-			ShokoGroupID:   groupID,
-			ShokoSeriesID:  seriesID,
-			ShokoEpisodeID: episodeID,
-		}
-	}
-
 	season, number := episodeNumbers(episode)
 	if groupID != 0 {
-		season = 0
-		if series.AniDB != nil && strings.EqualFold(series.AniDB.Type, "TV") && episode.AniDB != nil && strings.EqualFold(episode.AniDB.Type, "Episode") {
-			season = groupedSeasonNumber
-		}
+		season, number = groupLayout.Position(series, episode)
 	}
 	name := fmt.Sprintf("%s - S%02dE%02d%s [Shoko Series=%d] [Shoko Episode=%d] [Shoko File=%d]%s", baseTitle, season, number, groupMarker, seriesID, episodeID, file.ID, ext)
 	return Entry{

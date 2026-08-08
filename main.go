@@ -307,6 +307,7 @@ func (s *metadataServer) GetSeasons(ctx context.Context, req *pluginv1.GetSeason
 		response.Seasons = append(response.Seasons, &pluginv1.SeasonRecord{
 			SeasonNumber: int32(number),
 			Title:        fmt.Sprintf("Season %02d", number),
+			PosterPath:   selectedPosterPath(series.Images),
 			ProviderId:   fmt.Sprintf("series:%d:season:%d", seriesID, number),
 			ProviderIds:  stringStruct(seasonIDs),
 		})
@@ -326,28 +327,24 @@ func (s *metadataServer) GetEpisodes(ctx context.Context, req *pluginv1.GetEpiso
 		if err != nil {
 			return nil, err
 		}
-		ordered := orderedGroupSeries(members)
-		response := &pluginv1.GetEpisodesResponse{Episodes: make([]*pluginv1.EpisodeRecord, 0)}
-		for index, series := range ordered {
-			season := groupSeasonNumber(series, index, ordered)
-			if season < 0 {
-				continue
-			}
+		episodesBySeries := make(map[int][]shoko.Episode, len(members))
+		for _, series := range members {
 			episodes, err := client.Episodes(ctx, series.IDs.ID)
 			if err != nil {
 				return nil, err
 			}
-			for _, episode := range episodes {
-				effectiveSeason := season
-				if isTVSeries(series) && !isEpisode(episode) {
-					effectiveSeason = 0
-				}
-				if int(req.GetSeasonNumber()) != effectiveSeason {
+			episodesBySeries[series.IDs.ID] = episodes
+		}
+		layout := topology.NewGroupLayout(members, episodesBySeries)
+		response := &pluginv1.GetEpisodesResponse{Episodes: make([]*pluginv1.EpisodeRecord, 0)}
+		for _, series := range layout.OrderedMembers {
+			for _, episode := range episodesBySeries[series.IDs.ID] {
+				season, number := layout.Position(series, episode)
+				if int(req.GetSeasonNumber()) != season {
 					continue
 				}
-				_, number := episodeNumbers(episode)
 				response.Episodes = append(response.Episodes, &pluginv1.EpisodeRecord{
-					SeasonNumber:  int32(effectiveSeason),
+					SeasonNumber:  int32(season),
 					EpisodeNumber: int32(number),
 					Title:         episode.Name,
 					Overview:      episode.Description,
@@ -822,56 +819,6 @@ func isMovieSeries(series shoko.Series) bool {
 	return series.AniDB != nil && strings.EqualFold(series.AniDB.Type, "Movie")
 }
 
-func orderedGroupSeries(members []shoko.Series) []shoko.Series {
-	ordered := append([]shoko.Series(nil), members...)
-	sort.SliceStable(ordered, func(i, j int) bool {
-		left, right := ordered[i], ordered[j]
-		leftTV, rightTV := isTVSeries(left), isTVSeries(right)
-		if leftTV != rightTV {
-			return leftTV
-		}
-		leftMovie, rightMovie := isMovieSeries(left), isMovieSeries(right)
-		if leftMovie != rightMovie {
-			return !leftMovie
-		}
-		if leftTV {
-			leftDate, leftOK := completeAirDate(left)
-			rightDate, rightOK := completeAirDate(right)
-			if leftOK != rightOK {
-				return leftOK
-			}
-			if leftOK && !leftDate.Equal(rightDate) {
-				return leftDate.Before(rightDate)
-			}
-		}
-		return left.IDs.ID < right.IDs.ID
-	})
-	return ordered
-}
-
-func groupSeasonNumber(series shoko.Series, index int, ordered []shoko.Series) int {
-	if !isTVSeries(series) {
-		if isMovieSeries(series) {
-			return -1
-		}
-		return 0
-	}
-	season := 0
-	for _, member := range ordered {
-		if isTVSeries(member) {
-			season++
-		}
-		if member.IDs.ID == series.IDs.ID {
-			return season
-		}
-	}
-	return index + 1
-}
-
-func isEpisode(episode shoko.Episode) bool {
-	return episode.AniDB != nil && strings.EqualFold(episode.AniDB.Type, "Episode")
-}
-
 func groupYear(ctx context.Context, client *shoko.Client, group shoko.Group, currentSeriesID int) (int, error) {
 	if group.IDs.MainSeries > 0 {
 		series, err := client.Series(ctx, group.IDs.MainSeries)
@@ -907,37 +854,46 @@ func groupYear(ctx context.Context, client *shoko.Client, group shoko.Group, cur
 }
 
 func groupSeasons(group shoko.Group, members []shoko.Series) *pluginv1.GetSeasonsResponse {
-	ordered := orderedGroupSeries(members)
-	response := &pluginv1.GetSeasonsResponse{Seasons: make([]*pluginv1.SeasonRecord, 0, len(ordered))}
-	seenZero := false
-	for index, series := range ordered {
-		season := groupSeasonNumber(series, index, ordered)
-		if season < 0 {
+	layout := topology.NewGroupLayout(members, nil)
+	response := &pluginv1.GetSeasonsResponse{Seasons: make([]*pluginv1.SeasonRecord, 0, len(layout.OrderedMembers))}
+	records := make(map[int]*pluginv1.SeasonRecord)
+	for _, series := range layout.OrderedMembers {
+		season := layout.SeasonNumber(series.IDs.ID)
+		posterPath := selectedPosterPath(series.Images)
+		if existing := records[season]; existing != nil {
+			if existing.PosterPath == "" {
+				existing.PosterPath = posterPath
+			}
 			continue
-		}
-		if season == 0 && seenZero {
-			continue
-		}
-		if season == 0 {
-			seenZero = true
 		}
 		ids := map[string]string{"shoko_group": strconv.Itoa(group.IDs.ID)}
 		providerID := fmt.Sprintf("group:%d:season:%d", group.IDs.ID, season)
 		title := fmt.Sprintf("Season %02d", season)
-		if season > 0 {
+		if season > 0 && isTVSeries(series) {
 			ids["shoko_series"] = strconv.Itoa(series.IDs.ID)
 			providerID = fmt.Sprintf("series:%d:season:%d", series.IDs.ID, season)
 			title = series.Name
 			if series.IDs.AniDB > 0 {
 				ids["anidb"] = strconv.Itoa(series.IDs.AniDB)
 			}
+		} else if isMovieSeries(series) && !layout.HasTV() {
+			title = group.Name
 		}
-		response.Seasons = append(response.Seasons, &pluginv1.SeasonRecord{
+		record := &pluginv1.SeasonRecord{
 			SeasonNumber: int32(season),
 			Title:        title,
+			PosterPath:   posterPath,
 			ProviderId:   providerID,
 			ProviderIds:  stringStruct(ids),
-		})
+		}
+		records[season] = record
+		response.Seasons = append(response.Seasons, record)
+	}
+	groupPosterPath := selectedPosterPath(group.Images)
+	for _, record := range response.Seasons {
+		if record.PosterPath == "" {
+			record.PosterPath = groupPosterPath
+		}
 	}
 	return response
 }
@@ -985,10 +941,15 @@ func selectImage(images []shoko.Image) *shoko.Image {
 
 // applyArtwork fills the opaque poster, backdrop, and logo paths on a
 // metadata item from an entity's image set.
-func applyArtwork(item *pluginv1.MetadataItem, images shoko.Images) {
+func selectedPosterPath(images shoko.Images) string {
 	if poster := selectImage(images.Posters); poster != nil {
-		item.PosterPath = imagePath(*poster)
+		return imagePath(*poster)
 	}
+	return ""
+}
+
+func applyArtwork(item *pluginv1.MetadataItem, images shoko.Images) {
+	item.PosterPath = selectedPosterPath(images)
 	if backdrop := selectImage(images.Backdrops); backdrop != nil {
 		item.BackdropPath = imagePath(*backdrop)
 	}
