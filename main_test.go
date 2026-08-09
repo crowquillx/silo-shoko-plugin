@@ -426,6 +426,44 @@ func TestGetImagesSeriesAndGroup(t *testing.T) {
 		t.Fatalf("group images via provider_ids = %#v", groupResponse.GetImages())
 	}
 
+	seasonIDs, err := structpb.NewStruct(map[string]any{"shoko_group": "5", "shoko_series": "7", "shoko_season": "1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seasonResponse, err := serverUnderTest.GetImages(context.Background(), &pluginv1.GetImagesRequest{
+		ProviderId:  "series:7:season:1",
+		ItemType:    "season",
+		ProviderIds: seasonIDs,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if records := seasonResponse.GetImages(); len(records) != 4 || records[0].GetUrl() != "shoko://image/11111111-1111-4111-8111-111111111111" {
+		t.Fatalf("grouped season images = %#v, want member series images", records)
+	}
+
+	seasonResponse, err = serverUnderTest.GetImages(context.Background(), &pluginv1.GetImagesRequest{
+		ProviderId: "series:7:season:1",
+		ItemType:   "season",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if records := seasonResponse.GetImages(); len(records) != 4 || records[0].GetUrl() != "shoko://image/11111111-1111-4111-8111-111111111111" {
+		t.Fatalf("season images via provider_id = %#v, want member series images", records)
+	}
+
+	seasonZeroResponse, err := serverUnderTest.GetImages(context.Background(), &pluginv1.GetImagesRequest{
+		ProviderId: "group:5:season:0",
+		ItemType:   "season",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if records := seasonZeroResponse.GetImages(); len(records) != 2 || records[0].GetUrl() != "shoko://image/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" {
+		t.Fatalf("season zero images via provider_id = %#v, want group images", records)
+	}
+
 	// Ambiguous bare and episode provider IDs are rejected: no records, no
 	// error.
 	bare, err := serverUnderTest.GetImages(context.Background(), &pluginv1.GetImagesRequest{ProviderId: "7"})
