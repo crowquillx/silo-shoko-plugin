@@ -395,6 +395,22 @@ func (s *metadataServer) GetImages(ctx context.Context, req *pluginv1.GetImagesR
 	if groupID == 0 && seriesID == 0 {
 		groupID = typedPrimaryID(req.GetProviderId(), "group")
 		seriesID = typedPrimaryID(req.GetProviderId(), "series")
+		if seriesID == 0 {
+			seriesID = typedSeasonOwnerID(req.GetProviderId(), "series")
+		}
+		if groupID == 0 {
+			groupID = typedSeasonOwnerID(req.GetProviderId(), "group")
+		}
+	}
+	// Grouped seasons carry both the parent group and their member series ID.
+	// The member series owns the season artwork, so it must win whenever both
+	// IDs are present.
+	if seriesID > 0 {
+		series, err := client.Series(ctx, seriesID)
+		if err != nil {
+			return nil, err
+		}
+		return imageRecords(series.Images), nil
 	}
 	if groupID > 0 {
 		group, err := client.Group(ctx, groupID)
@@ -402,13 +418,6 @@ func (s *metadataServer) GetImages(ctx context.Context, req *pluginv1.GetImagesR
 			return nil, err
 		}
 		return imageRecords(group.Images), nil
-	}
-	if seriesID > 0 {
-		series, err := client.Series(ctx, seriesID)
-		if err != nil {
-			return nil, err
-		}
-		return imageRecords(series.Images), nil
 	}
 	return &pluginv1.GetImagesResponse{}, nil
 }
@@ -777,6 +786,22 @@ func typedPrimaryID(value, kind string) int {
 		return 0
 	}
 	return positiveID(strings.TrimPrefix(value, prefix))
+}
+
+// typedSeasonOwnerID parses the season provider IDs emitted by GetSeasons.
+// Keeping this separate from typedPrimaryID preserves the latter's strict
+// rejection of arbitrary suffixes.
+func typedSeasonOwnerID(value, kind string) int {
+	parts := strings.Split(strings.TrimSpace(value), ":")
+	if len(parts) != 4 || parts[0] != kind || parts[2] != "season" {
+		return 0
+	}
+	ownerID := positiveID(parts[1])
+	season, err := strconv.Atoi(parts[3])
+	if ownerID == 0 || err != nil || season < 0 {
+		return 0
+	}
+	return ownerID
 }
 
 func requestToken(providerIDs map[string]string, paths ...string) identity.Token {
