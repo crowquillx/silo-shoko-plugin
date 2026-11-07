@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	stateVersion  = 2
+	stateVersion  = 3
 	maxStateBytes = 256 << 20
 )
 

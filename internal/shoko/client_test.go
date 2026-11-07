@@ -2,9 +2,12 @@ package shoko
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -150,10 +153,182 @@ func TestSnapshotFetchesDirectGroupMembersWithoutTheirEpisodes(t *testing.T) {
 		t.Fatalf("snapshot graph = %#v", snapshot)
 	}
 	gotMembers := snapshot.GroupSeries[3]
-	if len(gotMembers) != 2 || gotMembers[0] != 7 || gotMembers[1] != 11 {
+	// Members stay in Shoko's order, which decides the group's season numbers.
+	if len(gotMembers) != 2 || gotMembers[0] != 11 || gotMembers[1] != 7 {
 		t.Fatalf("group members = %v", gotMembers)
 	}
 	if unrelatedEpisodeRequests != 0 {
 		t.Fatalf("unrelated episode requests = %d", unrelatedEpisodeRequests)
+	}
+}
+
+func TestFolderRouteFallsBackToImportFolderOnStableServers(t *testing.T) {
+	var managedRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v3/ImportFolder":
+			fmt.Fprint(w, `[{"ID":3,"Name":"Anime","Path":"/anime/"}]`)
+		case "/api/v3/ImportFolder/3/File":
+			fmt.Fprint(w, `{"Total":1,"List":[{"ID":1,"Locations":[{"ImportFolderID":3,"RelativePath":"a.mkv","IsAccessible":true}]}]}`)
+		default:
+			managedRequests++
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{BaseURL: server.URL, APIKey: "key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	folders, err := client.ManagedFolders(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(folders) != 1 || folders[0].ID != 3 {
+		t.Fatalf("folders = %#v", folders)
+	}
+	if managedRequests != 1 {
+		t.Fatalf("managed requests = %d, want 1", managedRequests)
+	}
+	files, err := client.FilesForManagedFolder(context.Background(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0].Locations[0].ManagedFolderID != 3 {
+		t.Fatalf("files = %#v", files)
+	}
+	if managedRequests != 1 {
+		t.Fatalf("detected route was not remembered: %d managed requests", managedRequests)
+	}
+}
+
+// A crawl resumed in a new process fetches a file page before listing folders.
+func TestFilePageDetectsRouteWithoutListingFolders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v3/ImportFolder/3/File" {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprint(w, `{"Total":0,"List":[]}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{BaseURL: server.URL, APIKey: "key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := client.FilesForManagedFolderPage(context.Background(), 3, 1); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFolderRouteFollowsAServerUpgrade(t *testing.T) {
+	daily := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if (daily && r.URL.Path == "/api/v3/ManagedFolder") || (!daily && r.URL.Path == "/api/v3/ImportFolder") {
+			fmt.Fprint(w, `[]`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{BaseURL: server.URL, APIKey: "key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ManagedFolders(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	daily = true
+	if _, err := client.ManagedFolders(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFolderRouteReportsAuthFailureWithoutFallingBack(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{BaseURL: server.URL, APIKey: "key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.ManagedFolders(context.Background())
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("err = %v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("requests = %d, want 1", requests)
+	}
+}
+
+func TestFolderRouteExplainsAServerThatIsNotShoko(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	client, err := NewClient(Config{BaseURL: server.URL, APIKey: "key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.ManagedFolders(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "check that the server URL") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestImageAvailabilityOnBothServerGenerations(t *testing.T) {
+	var images []Image
+	if err := json.Unmarshal([]byte(`[
+		{"ID":1,"Type":"Poster","Source":"AniDB","RelativeFilepath":"/1"},
+		{"ID":2,"Type":"Poster","Source":"AniDB","RelativeFilepath":null},
+		{"ID":3,"UID":"x","Available":true},
+		{"ID":4,"UID":"y","Available":false,"RelativeFilepath":"/4"}
+	]`), &images); err != nil {
+		t.Fatal(err)
+	}
+	for index, want := range []bool{true, false, true, false} {
+		if images[index].Available != want {
+			t.Errorf("image %d available = %v, want %v", index, images[index].Available, want)
+		}
+	}
+	if images[0].ID != 1 || images[0].Source != "AniDB" || images[0].Type != "Poster" {
+		t.Errorf("image = %#v", images[0])
+	}
+}
+
+// Crawl state is persisted as JSON, so decoded values must survive a round trip.
+func TestNormalizedModelsSurviveRoundTrip(t *testing.T) {
+	var location Location
+	if err := json.Unmarshal([]byte(`{"ImportFolderID":7,"RelativePath":"a.mkv"}`), &location); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(location)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded Location
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.ManagedFolderID != 7 {
+		t.Fatalf("decoded = %#v", decoded)
+	}
+	var image Image
+	if err := json.Unmarshal([]byte(`{"ID":1,"RelativeFilepath":"/1"}`), &image); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err = json.Marshal(image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decodedImage Image
+	if err := json.Unmarshal(encoded, &decodedImage); err != nil {
+		t.Fatal(err)
+	}
+	if !decodedImage.Available {
+		t.Fatalf("decoded image = %#v", decodedImage)
 	}
 }

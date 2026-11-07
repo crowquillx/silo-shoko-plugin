@@ -21,7 +21,26 @@ const (
 	maxResponseBytes   = 32 << 20
 	pageSize           = 1000
 	defaultConcurrency = 8
+
+	// Daily servers serve folders from /ManagedFolder and stable servers from
+	// /ImportFolder. The two routes return the same shape.
+	managedFolderRoute = "/ManagedFolder"
+	importFolderRoute  = "/ImportFolder"
 )
+
+// HTTPError reports a non-2xx response from Shoko. Detail is already redacted.
+type HTTPError struct {
+	Endpoint   string
+	StatusCode int
+	Detail     string
+}
+
+func (e *HTTPError) Error() string {
+	if e.Detail == "" {
+		return fmt.Sprintf("shoko: %s returned HTTP %d", e.Endpoint, e.StatusCode)
+	}
+	return fmt.Sprintf("shoko: %s returned HTTP %d: %s", e.Endpoint, e.StatusCode, e.Detail)
+}
 
 // Config configures a read-only Shoko v3 client. The API key is only used for
 // the request header and is never included in returned errors.
@@ -36,6 +55,9 @@ type Client struct {
 	baseURL     *url.URL
 	apiKey      string
 	concurrency int
+
+	folderMu    sync.RWMutex
+	folderRoute string
 }
 
 func NewClient(cfg Config) (*Client, error) {
@@ -102,10 +124,7 @@ func (c *Client) get(ctx context.Context, endpoint string, query url.Values, dst
 		if len(detail) > 512 {
 			detail = detail[:512]
 		}
-		if detail == "" {
-			return fmt.Errorf("shoko: %s returned HTTP %d", endpoint, response.StatusCode)
-		}
-		return fmt.Errorf("shoko: %s returned HTTP %d: %s", endpoint, response.StatusCode, detail)
+		return &HTTPError{Endpoint: endpoint, StatusCode: response.StatusCode, Detail: detail}
 	}
 	if dst == nil || len(bytes.TrimSpace(body)) == 0 || response.StatusCode == http.StatusNoContent {
 		return nil
@@ -122,10 +141,54 @@ func (c *Client) Version(ctx context.Context) (VersionSet, error) {
 	return result, err
 }
 
+// ManagedFolders lists the server's folders. See withFolderRoute for how the
+// server's folder API is detected.
 func (c *Client) ManagedFolders(ctx context.Context) ([]ManagedFolder, error) {
 	var result []ManagedFolder
-	err := c.get(ctx, "/ManagedFolder", nil, &result)
+	err := c.withFolderRoute(func(route string) error {
+		result = nil
+		return c.get(ctx, route, nil, &result)
+	})
+	var httpErr *HTTPError
+	if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound {
+		return nil, errors.New("shoko: neither /ManagedFolder nor /ImportFolder exists; check that the server URL points at Shoko Server")
+	}
 	return result, err
+}
+
+// withFolderRoute calls fn with the server's folder route. The route that worked
+// last is tried first and the other is tried on a 404, so no version check is
+// needed and upgrading Shoko from stable to daily needs no reconfiguration.
+func (c *Client) withFolderRoute(fn func(route string) error) error {
+	routes := []string{managedFolderRoute, importFolderRoute}
+	if c.currentFolderRoute() == importFolderRoute {
+		routes = []string{importFolderRoute, managedFolderRoute}
+	}
+	var err error
+	for _, route := range routes {
+		err = fn(route)
+		if err == nil {
+			c.setFolderRoute(route)
+			return nil
+		}
+		var httpErr *HTTPError
+		if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusNotFound {
+			return err
+		}
+	}
+	return err
+}
+
+func (c *Client) currentFolderRoute() string {
+	c.folderMu.RLock()
+	defer c.folderMu.RUnlock()
+	return c.folderRoute
+}
+
+func (c *Client) setFolderRoute(route string) {
+	c.folderMu.Lock()
+	defer c.folderMu.Unlock()
+	c.folderRoute = route
 }
 
 func (c *Client) FilesForManagedFolder(ctx context.Context, folderID int) ([]File, error) {
@@ -161,7 +224,10 @@ func (c *Client) FilesForManagedFolderPage(ctx context.Context, folderID, page i
 		"include":  {"XRefs"},
 	}
 	var raw json.RawMessage
-	if err := c.get(ctx, "/ManagedFolder/"+strconv.Itoa(folderID)+"/File", query, &raw); err != nil {
+	if err := c.withFolderRoute(func(route string) error {
+		raw = nil
+		return c.get(ctx, route+"/"+strconv.Itoa(folderID)+"/File", query, &raw)
+	}); err != nil {
 		return nil, 0, err
 	}
 	pageFiles, total, err := decodePage[File](raw)
@@ -227,8 +293,67 @@ func (c *Client) Episodes(ctx context.Context, seriesID int) ([]Episode, error) 
 	}
 }
 
+// MetadataEpisodes lists a series' episodes with their TMDB data, which holds
+// the TMDB rating. The crawl does not need it and uses Episodes.
+func (c *Client) MetadataEpisodes(ctx context.Context, seriesID int) ([]Episode, error) {
+	if seriesID < 1 {
+		return nil, errors.New("shoko: series ID must be positive")
+	}
+	var episodes []Episode
+	for page := 1; ; page++ {
+		pageEpisodes, total, err := c.episodesPage(ctx, seriesID, page, "AniDB,TMDB")
+		if err != nil {
+			return nil, err
+		}
+		episodes = append(episodes, pageEpisodes...)
+		if len(pageEpisodes) == 0 || (total > 0 && len(episodes) >= total) || len(pageEpisodes) < pageSize {
+			return episodes, nil
+		}
+	}
+}
+
+// genreTagFilter asks Shoko for only the tags it classifies as genres: the
+// Genre bit with Invert set keeps that category and drops every other one.
+const genreTagFilter = 1<<31 | 1<<7
+
+// SeriesGenres returns the series' verified tags that Shoko counts as genres.
+func (c *Client) SeriesGenres(ctx context.Context, seriesID int) ([]Tag, error) {
+	if seriesID < 1 {
+		return nil, errors.New("shoko: series ID must be positive")
+	}
+	var result []Tag
+	query := url.Values{"filter": {strconv.Itoa(genreTagFilter)}, "excludeDescriptions": {"true"}}
+	err := c.get(ctx, "/Series/"+strconv.Itoa(seriesID)+"/Tags", query, &result)
+	return result, err
+}
+
+// SeriesCast returns the series' cast, staff and studio credits.
+func (c *Client) SeriesCast(ctx context.Context, seriesID int) ([]Role, error) {
+	if seriesID < 1 {
+		return nil, errors.New("shoko: series ID must be positive")
+	}
+	var result []Role
+	err := c.get(ctx, "/Series/"+strconv.Itoa(seriesID)+"/Cast", nil, &result)
+	return result, err
+}
+
+// SeriesTMDBShows returns the TMDB shows linked to a series, with their
+// content ratings.
+func (c *Client) SeriesTMDBShows(ctx context.Context, seriesID int) ([]TMDBShow, error) {
+	if seriesID < 1 {
+		return nil, errors.New("shoko: series ID must be positive")
+	}
+	var result []TMDBShow
+	err := c.get(ctx, "/Series/"+strconv.Itoa(seriesID)+"/TMDB/Show", url.Values{"include": {"ContentRatings"}}, &result)
+	return result, err
+}
+
 // EpisodesPage fetches one series episode page for resumable graph crawls.
 func (c *Client) EpisodesPage(ctx context.Context, seriesID, page int) ([]Episode, int, error) {
+	return c.episodesPage(ctx, seriesID, page, "AniDB")
+}
+
+func (c *Client) episodesPage(ctx context.Context, seriesID, page int, dataSources string) ([]Episode, int, error) {
 	if seriesID < 1 {
 		return nil, 0, errors.New("shoko: series ID must be positive")
 	}
@@ -238,7 +363,7 @@ func (c *Client) EpisodesPage(ctx context.Context, seriesID, page int) ([]Episod
 	query := url.Values{
 		"page":            {strconv.Itoa(page)},
 		"pageSize":        {strconv.Itoa(pageSize)},
-		"includeDataFrom": {"AniDB"},
+		"includeDataFrom": {dataSources},
 	}
 	var raw json.RawMessage
 	if err := c.get(ctx, "/Series/"+strconv.Itoa(seriesID)+"/Episode", query, &raw); err != nil {
@@ -400,6 +525,7 @@ func (c *Client) FetchGraph(ctx context.Context, files []File) (map[int]Group, m
 		if err != nil {
 			return err
 		}
+		// Keep Shoko's order: it decides the group's season numbers.
 		seen := make(map[int]struct{}, len(members))
 		seriesIDs := make([]int, 0, len(members))
 		resultMu.Lock()
@@ -417,7 +543,6 @@ func (c *Client) FetchGraph(ctx context.Context, files []File) (map[int]Group, m
 				seriesResult[memberID] = member
 			}
 		}
-		sort.Ints(seriesIDs)
 		groupSeriesResult[id] = seriesIDs
 		resultMu.Unlock()
 		return nil

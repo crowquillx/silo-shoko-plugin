@@ -228,6 +228,11 @@ func (e *Engine) Step(ctx context.Context, budget time.Duration) (Outcome, error
 						outcome = e.progress(state)
 						return nil
 					}
+					// Drop the snapshot so the next run re-crawls current data
+					// instead of re-committing the same failed plan on every poll.
+					if clearErr := clearState(vfs.CrawlStatePath(locked.Root())); clearErr != nil {
+						return errors.Join(err, clearErr)
+					}
 					return err
 				}
 				if err := clearState(vfs.CrawlStatePath(locked.Root())); err != nil {
@@ -452,13 +457,16 @@ func (e *Engine) fetchGroups(ctx context.Context, state *crawlState) error {
 			continue
 		}
 		state.Groups[item.id] = item.group
+		// Keep Shoko's order: it decides the group's season numbers.
 		memberIDs := make([]int, 0, len(item.series))
 		for _, series := range item.series {
 			if series.IDs.ID <= 0 {
 				continue
 			}
 			state.Series[series.IDs.ID] = series
-			memberIDs = appendUnique(memberIDs, series.IDs.ID)
+			if !containsID(memberIDs, series.IDs.ID) {
+				memberIDs = append(memberIDs, series.IDs.ID)
+			}
 		}
 		state.GroupSeries[item.id] = memberIDs
 		state.GroupDone[item.id] = true
@@ -574,13 +582,9 @@ func (e *Engine) fetchEpisodes(ctx context.Context, state *crawlState) error {
 	if firstErr != nil {
 		return firstErr
 	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if state.Phase != phaseSeries {
-		state.Phase = phaseReady
-	}
-	return nil
+	// Stay in this phase while episodes remain; the empty-pending check above
+	// advances to phaseReady once every batch has been fetched.
+	return ctx.Err()
 }
 
 func (e *Engine) commit(ctx context.Context, locked *vfs.Reconciler, state *crawlState) (topology.Plan, vfs.Result, error) {
@@ -601,7 +605,17 @@ func (e *Engine) commit(ctx context.Context, locked *vfs.Reconciler, state *craw
 		return topology.Plan{}, vfs.Result{}, err
 	}
 	result, err := locked.ReconcileLocked(ctx, plan, false)
-	return plan, result, err
+	if err != nil {
+		return plan, result, err
+	}
+	// Theme songs follow the new links. A theme problem never fails the
+	// reconcile itself; it is reported with the result.
+	themes, err := locked.SyncThemesLocked(ctx, &plan.ThemePairs)
+	if err != nil {
+		themes.Failures = append(themes.Failures, vfs.Failure{Reason: "theme sync: " + err.Error()})
+	}
+	result.Themes = &themes
+	return plan, result, nil
 }
 
 func (e *Engine) progress(state *crawlState) Outcome {

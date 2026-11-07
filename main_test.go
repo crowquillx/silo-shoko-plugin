@@ -66,10 +66,13 @@ func TestMetadataGetSeriesPrefersTypedGroupOverEpisodeFileToken(t *testing.T) {
 		switch r.URL.Path {
 		case "/api/v3/Group/5":
 			fmt.Fprint(w, `{"ids":{"id":5,"mainSeries":7,"mainAnime":100,"topLevelGroup":5},"name":"Clean Group","description":"Group overview"}`)
-		case "/api/v3/Series/7":
-			fmt.Fprint(w, `{"ids":{"id":7,"parentGroup":5,"aniDB":100},"name":"Member Series","aniDB":{"id":100,"type":"TV","airDate":"2014-07-06"}}`)
+		case "/api/v3/Group/5/Series":
+			fmt.Fprint(w, `[{"ids":{"id":7,"parentGroup":5,"aniDB":100},"name":"Member Series","aniDB":{"id":100,"type":"TV","airDate":"2014-07-06"}}]`)
+		case "/api/v3/Series/7/Tags", "/api/v3/Series/7/Cast", "/api/v3/Series/7/TMDB/Show":
+			fmt.Fprint(w, `[]`)
 		default:
-			t.Fatalf("unexpected metadata request path = %q", r.URL.Path)
+			t.Errorf("unexpected metadata request path = %q", r.URL.Path)
+			http.NotFound(w, r)
 		}
 	}))
 	defer server.Close()
@@ -235,6 +238,37 @@ func TestImagePathRequiresCanonicalUUID(t *testing.T) {
 	for _, uid := range []string{"", "not-a-uuid", uuid + "/full", uuid + "?x=1", "../" + uuid, "shoko://image/" + uuid} {
 		if got := imagePath(shoko.Image{UID: uid}); got != "" {
 			t.Fatalf("imagePath(%q) = %q, want empty", uid, got)
+		}
+	}
+}
+
+func TestImagePathForStableServers(t *testing.T) {
+	stable := shoko.Image{ID: 123, Source: "AniDB", Type: "Poster"}
+	if got := imagePath(stable); got != "shoko://image/AniDB/Poster/123" {
+		t.Fatalf("imagePath = %q", got)
+	}
+	for _, image := range []shoko.Image{
+		{ID: 0, Source: "AniDB", Type: "Poster"},
+		{ID: 123, Source: "", Type: "Poster"},
+		{ID: 123, Source: "AniDB", Type: ""},
+		{ID: 123, Source: "../x", Type: "Poster"},
+		{ID: 123, Source: "AniDB", Type: "Poster/../y"},
+		{ID: 123, Source: "AniDB", Type: "Poster", UID: "not-a-uuid"},
+	} {
+		if got := imagePath(image); got != "" {
+			t.Errorf("imagePath(%+v) = %q, want empty", image, got)
+		}
+	}
+}
+
+func TestResolveShokoImagePathForStableServers(t *testing.T) {
+	const base = "http://shoko:8111"
+	if got, want := resolveShokoImagePath("image/AniDB/Poster/123", base), base+"/api/v3/Image/AniDB/Poster/123"; got != want {
+		t.Fatalf("resolved = %q, want %q", got, want)
+	}
+	for _, path := range []string{"image/AniDB/Poster", "image/AniDB/Poster/0", "image/AniDB/Poster/1/x", "image/../Poster/1", "image/AniDB/Poster/1?apikey=x", "image/AniDB/../1"} {
+		if got := resolveShokoImagePath(path, base); got != "" {
+			t.Errorf("resolveShokoImagePath(%q) = %q, want empty", path, got)
 		}
 	}
 }

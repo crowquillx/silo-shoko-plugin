@@ -5,7 +5,7 @@ package vfs
 import "context"
 
 // Non-Unix hosts do not have the production plugin's advisory flock support.
-// The in-process mutex still protects ordinary tests and local use.
+// The in-process semaphore still protects ordinary tests and local use.
 func (r *Reconciler) acquireLock(context.Context) (func(), error) {
 	return func() {}, nil
 }

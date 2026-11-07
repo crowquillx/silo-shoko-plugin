@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/crowquillx/silo-shoko-plugin/internal/topology"
@@ -54,13 +53,24 @@ type Action struct {
 	Reason      string `json:"reason,omitempty"`
 }
 
+// Failure is one link the reconcile could not create or remove. Other links are
+// unaffected, and the link is retried by the next reconcile.
+type Failure struct {
+	LogicalPath string `json:"logical_path"`
+	TargetPath  string `json:"target_path,omitempty"`
+	Reason      string `json:"reason"`
+}
+
 type Result struct {
-	DryRun  bool     `json:"dry_run"`
-	Actions []Action `json:"actions"`
+	DryRun   bool      `json:"dry_run"`
+	Actions  []Action  `json:"actions"`
+	Failures []Failure `json:"failures,omitempty"`
+	// Themes is the theme-song sync that followed the reconcile, if any.
+	Themes *ThemeResult `json:"themes,omitempty"`
 }
 
 type Reconciler struct {
-	mu           sync.Mutex
+	exclusive    chan struct{}
 	config       Config
 	manifestPath string
 	journalPath  string
@@ -88,6 +98,7 @@ func NewReconciler(cfg Config) (*Reconciler, error) {
 		roots = append(roots, cleaned)
 	}
 	return &Reconciler{
+		exclusive:    make(chan struct{}, 1),
 		config:       Config{Root: root, AllowedSourceRoots: roots},
 		manifestPath: filepath.Join(root, ".shokoanime-manifest.json"),
 		journalPath:  ChangeJournalPath(root),
@@ -113,8 +124,12 @@ func (r *Reconciler) WithExclusive(ctx context.Context, fn func(*Reconciler) err
 	if r == nil || fn == nil {
 		return errors.New("vfs: exclusive callback is required")
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	select {
+	case r.exclusive <- struct{}{}:
+		defer func() { <-r.exclusive }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	unlock, err := r.acquireLock(ctx)
 	if err != nil {
 		return err
@@ -127,11 +142,6 @@ func (r *Reconciler) WithExclusive(ctx context.Context, fn func(*Reconciler) err
 func (r *Reconciler) ReconcileLocked(ctx context.Context, plan topology.Plan, dryRun bool) (Result, error) {
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
-	}
-	for _, diagnostic := range plan.Diagnostics {
-		if diagnostic.Severity == "error" {
-			return Result{}, fmt.Errorf("vfs: plan contains an error for file %d: %s", diagnostic.FileID, diagnostic.Message)
-		}
 	}
 	if err := r.ensureRoot(!dryRun); err != nil {
 		return Result{}, err
@@ -148,11 +158,11 @@ func (r *Reconciler) ReconcileLocked(ctx context.Context, plan topology.Plan, dr
 			return Result{}, err
 		}
 	}
-	desired, err := r.validatePlan(plan)
+	desired, failures, err := r.validatePlan(plan)
 	if err != nil {
 		return Result{}, err
 	}
-	result := Result{DryRun: dryRun, Actions: make([]Action, 0)}
+	result := Result{DryRun: dryRun, Actions: make([]Action, 0), Failures: failures}
 	for key, old := range previous.Entries {
 		item, keep := desired[key]
 		if keep && item.LogicalPath == old.LogicalPath {
@@ -191,38 +201,57 @@ func (r *Reconciler) ReconcileLocked(ctx context.Context, plan topology.Plan, dr
 		return result, nil
 	}
 
+	// A link that cannot be changed is reported and skipped so one bad path never
+	// holds back the rest of the library. The manifest records what is actually
+	// on disk, so the next reconcile retries exactly what is left.
+	entries := make(map[string]ManifestItem, len(desired))
+	failed := make(map[string]string)
+	fail := func(item ManifestItem, err error) {
+		failed[item.LogicalPath] = err.Error()
+		result.Failures = append(result.Failures, Failure{LogicalPath: item.LogicalPath, TargetPath: item.TargetPath, Reason: err.Error()})
+	}
 	for key, old := range previous.Entries {
 		item, keep := desired[key]
 		if keep && item.LogicalPath == old.LogicalPath {
 			continue
 		}
-		if _, err := validateTarget(old.TargetPath, r.config.AllowedSourceRoots); err != nil {
-			return Result{}, fmt.Errorf("vfs: obsolete manifest entry %q has unsafe target: %w", key, err)
-		}
 		if err := r.removeOwned(old); err != nil {
-			return Result{}, err
-		}
-	}
-	for key, item := range desired {
-		old, existed := previous.Entries[key]
-		if existed && old.LogicalPath == item.LogicalPath && old.TargetPath == item.TargetPath && r.linkMatches(item.LogicalPath, item.TargetPath) {
-			continue
-		}
-		if existed && old.LogicalPath == item.LogicalPath {
-			if _, err := validateTarget(old.TargetPath, r.config.AllowedSourceRoots); err != nil {
-				return Result{}, fmt.Errorf("vfs: previous manifest entry %q has unsafe target: %w", key, err)
+			fail(old, err)
+			if !keep {
+				entries[key] = old
 			}
 		}
-		if err := r.writeLink(item, previousItem(old, existed && old.LogicalPath == item.LogicalPath)); err != nil {
-			return Result{}, err
-		}
 	}
-	manifest := Manifest{Version: manifestVersion, UpdatedAt: time.Now().UTC(), Entries: desired}
+	written := 0
+	for key, item := range desired {
+		old, existed := previous.Entries[key]
+		sameLogicalPath := existed && old.LogicalPath == item.LogicalPath
+		if sameLogicalPath && old.TargetPath == item.TargetPath && r.linkMatches(item.LogicalPath, item.TargetPath) {
+			entries[key] = item
+			written++
+			continue
+		}
+		if err := r.writeLink(item, previousItem(old, sameLogicalPath)); err != nil {
+			fail(item, err)
+			if sameLogicalPath {
+				entries[key] = old
+			}
+			continue
+		}
+		entries[key] = item
+		written++
+	}
+	manifest := Manifest{Version: manifestVersion, UpdatedAt: time.Now().UTC(), Entries: entries}
 	if err := r.writeManifest(manifest); err != nil {
 		return Result{}, err
 	}
 	changedPaths := make([]string, 0, len(result.Actions))
-	for _, action := range result.Actions {
+	for i, action := range result.Actions {
+		if reason, isFailed := failed[action.LogicalPath]; isFailed {
+			result.Actions[i].Kind = "failed"
+			result.Actions[i].Reason = reason
+			continue
+		}
 		if action.Kind == "unchanged" {
 			continue
 		}
@@ -235,38 +264,51 @@ func (r *Reconciler) ReconcileLocked(ctx context.Context, plan topology.Plan, dr
 	if err := r.appendJournal(changedPaths); err != nil {
 		return Result{}, err
 	}
+	// Nothing could be written at all: that is a broken output root rather than
+	// a few bad paths, and the task should fail visibly.
+	if written == 0 && len(result.Failures) > 0 {
+		return result, fmt.Errorf("vfs: no links could be written, first error: %s", result.Failures[0].Reason)
+	}
 	return result, nil
 }
 
-func (r *Reconciler) validatePlan(plan topology.Plan) (map[string]ManifestItem, error) {
+// validatePlan returns the links to create. An entry whose target falls outside
+// the allowed source roots is left out and reported as a failure.
+func (r *Reconciler) validatePlan(plan topology.Plan) (map[string]ManifestItem, []Failure, error) {
 	desired := make(map[string]ManifestItem, len(plan.Entries))
 	logicalPaths := make(map[string]string, len(plan.Entries))
+	var failures []Failure
 	for _, entry := range plan.Entries {
 		if entry.StableKey == "" || entry.LogicalPath == "" {
-			return nil, errors.New("vfs: every plan entry requires a stable key and logical path")
+			return nil, nil, errors.New("vfs: every plan entry requires a stable key and logical path")
 		}
 		linkPath, err := r.logicalPath(entry.LogicalPath)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if previousKey, exists := logicalPaths[entry.LogicalPath]; exists && previousKey != entry.StableKey {
-			return nil, fmt.Errorf("%w: %q is used by %s and %s", ErrPathConflict, entry.LogicalPath, previousKey, entry.StableKey)
+			return nil, nil, fmt.Errorf("%w: %q is used by %s and %s", ErrPathConflict, entry.LogicalPath, previousKey, entry.StableKey)
 		}
 		logicalPaths[entry.LogicalPath] = entry.StableKey
 		target, err := validateTarget(entry.TargetPath, r.config.AllowedSourceRoots)
 		if err != nil {
-			return nil, fmt.Errorf("vfs: %s: %w", entry.StableKey, err)
+			failures = append(failures, Failure{
+				LogicalPath: entry.LogicalPath,
+				TargetPath:  entry.TargetPath,
+				Reason:      fmt.Sprintf("target is outside the configured source roots: %v", err),
+			})
+			continue
 		}
-		if filepath.Clean(linkPath) == filepath.Clean(r.manifestPath) || filepath.Clean(linkPath) == filepath.Clean(r.journalPath) || filepath.Clean(linkPath) == filepath.Clean(r.statePath) || filepath.Clean(linkPath) == filepath.Clean(r.lockPath) {
-			return nil, errors.New("vfs: plan cannot own plugin state file")
+		if filepath.Clean(linkPath) == filepath.Clean(r.manifestPath) || filepath.Clean(linkPath) == filepath.Clean(r.journalPath) || filepath.Clean(linkPath) == filepath.Clean(r.statePath) || filepath.Clean(linkPath) == filepath.Clean(r.lockPath) || filepath.Clean(linkPath) == filepath.Clean(r.themeStatePath()) {
+			return nil, nil, errors.New("vfs: plan cannot own plugin state file")
 		}
 		item := ManifestItem{LogicalPath: entry.LogicalPath, TargetPath: target}
 		if previous, exists := desired[entry.StableKey]; exists && previous != item {
-			return nil, fmt.Errorf("vfs: stable key %q appears with multiple bindings", entry.StableKey)
+			return nil, nil, fmt.Errorf("vfs: stable key %q appears with multiple bindings", entry.StableKey)
 		}
 		desired[entry.StableKey] = item
 	}
-	return desired, nil
+	return desired, failures, nil
 }
 
 func (r *Reconciler) logicalPath(logical string) (string, error) {
@@ -298,7 +340,16 @@ func validateTarget(target string, roots []string) (string, error) {
 			check = filepath.Dir(check)
 		}
 		resolved, err := filepath.EvalSymlinks(check)
-		if err == nil && !strictUnder(filepath.Clean(resolved), root) && filepath.Clean(resolved) != filepath.Clean(root) {
+		if err != nil {
+			return target, nil
+		}
+		// The source root may itself be reached through a symlink, so compare
+		// resolved paths on both sides.
+		resolvedRoot, err := filepath.EvalSymlinks(root)
+		if err != nil {
+			resolvedRoot = root
+		}
+		if !strictUnder(resolved, resolvedRoot) && filepath.Clean(resolved) != filepath.Clean(resolvedRoot) {
 			return "", ErrOutsideRoot
 		}
 		return target, nil
@@ -340,14 +391,16 @@ func (r *Reconciler) writeLink(item ManifestItem, previous *ManifestItem) error 
 		if info.Mode()&fs.ModeSymlink == 0 {
 			return fmt.Errorf("%w: %s is not a symlink", ErrPathConflict, item.LogicalPath)
 		}
+		// An interrupted run can leave a correct link that the manifest does not
+		// record yet. It already matches, so adopt it.
+		if r.linkMatches(item.LogicalPath, item.TargetPath) {
+			return nil
+		}
 		if previous == nil {
-			return fmt.Errorf("%w: %s is not in the previous manifest", ErrNotOwned, item.LogicalPath)
+			return fmt.Errorf("%w: %s is not in the previous manifest; remove it to let the plugin manage this path", ErrNotOwned, item.LogicalPath)
 		}
 		if !r.linkMatches(item.LogicalPath, previous.TargetPath) {
-			return fmt.Errorf("%w: %s target changed outside the manifest", ErrNotOwned, item.LogicalPath)
-		}
-		if err := os.Remove(linkPath); err != nil {
-			return fmt.Errorf("vfs: replace %q: %w", item.LogicalPath, err)
+			return fmt.Errorf("%w: %s target changed outside the manifest; remove it to let the plugin manage this path", ErrNotOwned, item.LogicalPath)
 		}
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("vfs: inspect %q: %w", item.LogicalPath, err)

@@ -115,9 +115,9 @@ func TestEndToEndFixtureReconcileAndScanJournal(t *testing.T) {
 		t.Fatalf("real reconcile action_count = %#v, want 3", got)
 	}
 
-	linkOne := filepath.Join(outputRoot, "Fixture Show", "Season 01", "Fixture Show - S01E01 [Shoko Series=7] [Shoko Episode=42] [Shoko File=100].mkv")
-	linkTwo := filepath.Join(outputRoot, "Fixture Show", "Season 01", "Fixture Show - S01E02 [Shoko Series=7] [Shoko Episode=43] [Shoko File=100].mkv")
-	linkThree := filepath.Join(outputRoot, "Fixture Show", "Season 01", "Fixture Show - S01E03 [Shoko Series=7] [Shoko Episode=44] [Shoko File=101].mkv")
+	linkOne := filepath.Join(outputRoot, "Fixture Show", "Season 01", "Fixture Show - S01E01 [Shoko Series=7] [AniDB Anime=7007] [Shoko Episode=42] [Shoko File=100].mkv")
+	linkTwo := filepath.Join(outputRoot, "Fixture Show", "Season 01", "Fixture Show - S01E02 [Shoko Series=7] [AniDB Anime=7007] [Shoko Episode=43] [Shoko File=100].mkv")
+	linkThree := filepath.Join(outputRoot, "Fixture Show", "Season 01", "Fixture Show - S01E03 [Shoko Series=7] [AniDB Anime=7007] [Shoko Episode=44] [Shoko File=101].mkv")
 	for _, link := range []string{linkOne, linkTwo, linkThree} {
 		info, err := os.Lstat(link)
 		if err != nil {

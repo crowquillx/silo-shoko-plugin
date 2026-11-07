@@ -7,16 +7,23 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/crowquillx/silo-shoko-plugin/internal/shoko"
 )
 
 type Mode string
+
+// AniDBAnimeMarker carries the series' AniDB anime ID in each link name, so
+// other plugins, such as Theme Songs, can identify the anime of a season from
+// its files. It is a contract: keep the format stable.
+const AniDBAnimeMarker = "[AniDB Anime=%d]"
 
 const ModeAniDB Mode = "anidb"
 
@@ -35,10 +42,12 @@ const (
 )
 
 type Entry struct {
-	StableKey      string `json:"stable_key"`
-	LogicalPath    string `json:"logical_path"`
-	TargetPath     string `json:"target_path"`
-	SourcePath     string `json:"source_path"`
+	StableKey   string `json:"stable_key"`
+	LogicalPath string `json:"logical_path"`
+	TargetPath  string `json:"target_path"`
+	SourcePath  string `json:"source_path"`
+	// SourceRoot is the mapped managed-folder root the target is under.
+	SourceRoot     string `json:"source_root,omitempty"`
 	Kind           Kind   `json:"kind"`
 	ShokoFileID    int    `json:"shoko_file_id"`
 	ShokoGroupID   int    `json:"shoko_group_id,omitempty"`
@@ -57,6 +66,9 @@ type Diagnostic struct {
 type Plan struct {
 	Entries     []Entry      `json:"entries"`
 	Diagnostics []Diagnostic `json:"diagnostics,omitempty"`
+	// ThemePairs links VFS show and season folders to the media folders their
+	// theme songs are kept in sync with.
+	ThemePairs []ThemePair `json:"theme_pairs,omitempty"`
 }
 
 func (p Policy) Validate() error {
@@ -139,12 +151,8 @@ func Build(snapshot shoko.Snapshot, policy Policy) (Plan, error) {
 					})
 					continue
 				}
-				group, groupID, grouped := groupForSeries(snapshot, seriesID)
-				season := 0
-				if grouped {
-					season = groupLayouts[groupID].SeasonNumber(seriesID)
-				}
-				entry := makeEntry(sourceRoot, relative, file, series, seriesID, episode, episodeID, group, groupID, season, groupLayouts[groupID], snapshot)
+				group, groupID, _ := groupForSeries(snapshot, seriesID)
+				entry := makeEntry(sourceRoot, relative, file, series, seriesID, episode, episodeID, group, groupID, groupLayouts[groupID], snapshot)
 				if _, seen := seenKeys[entry.StableKey]; seen {
 					continue
 				}
@@ -159,6 +167,7 @@ func Build(snapshot shoko.Snapshot, policy Policy) (Plan, error) {
 		}
 		return plan.Entries[i].LogicalPath < plan.Entries[j].LogicalPath
 	})
+	plan.ThemePairs = ThemePairs(plan.Entries)
 	return plan, nil
 }
 
@@ -239,12 +248,11 @@ func resolveEpisode(snapshot shoko.Snapshot, seriesID int, reference shoko.Episo
 	return shoko.Episode{}, 0, false
 }
 
-func makeEntry(sourceRoot, relative string, file shoko.File, series shoko.Series, seriesID int, episode shoko.Episode, episodeID int, group shoko.Group, groupID, groupedSeasonNumber int, groupLayout GroupLayout, snapshot shoko.Snapshot) Entry {
+func makeEntry(sourceRoot, relative string, file shoko.File, series shoko.Series, seriesID int, episode shoko.Episode, episodeID int, group shoko.Group, groupID int, groupLayout GroupLayout, snapshot shoko.Snapshot) Entry {
 	relative = filepath.FromSlash(relative)
 	target := filepath.Join(sourceRoot, relative)
 	ext := filepath.Ext(relative)
-	baseTitle := cleanSegment(series.Name)
-	seriesSegment := rootSegment(baseTitle, series.AniDB.AirYear())
+	seriesSegment := rootSegment(cleanSegment(series.Name), series.AniDB.AirYear())
 	if groupID != 0 {
 		seriesSegment = groupRootSegment(snapshot, group, groupID, series)
 	}
@@ -252,16 +260,22 @@ func makeEntry(sourceRoot, relative string, file shoko.File, series shoko.Series
 	if groupID != 0 {
 		groupMarker = fmt.Sprintf(" [Shoko Group=%d]", groupID)
 	}
-	season, number := episodeNumbers(episode)
+	season, number := EpisodeNumbers(episode)
 	if groupID != 0 {
 		season, number = groupLayout.Position(series, episode)
 	}
-	name := fmt.Sprintf("%s - S%02dE%02d%s [Shoko Series=%d] [Shoko Episode=%d] [Shoko File=%d]%s", baseTitle, season, number, groupMarker, seriesID, episodeID, file.ID, ext)
+	anidbMarker := ""
+	if series.IDs.AniDB > 0 {
+		anidbMarker = fmt.Sprintf(" "+AniDBAnimeMarker, series.IDs.AniDB)
+	}
+	suffix := fmt.Sprintf(" - S%02dE%02d%s [Shoko Series=%d]%s [Shoko Episode=%d] [Shoko File=%d]%s", season, number, groupMarker, seriesID, anidbMarker, episodeID, file.ID, ext)
+	name := truncateBytes(fileTitle(series.Name), maxNameBytes-len(suffix)) + suffix
 	return Entry{
 		StableKey:      stableKey(file.ID, episodeID),
 		LogicalPath:    filepath.Join(seriesSegment, fmt.Sprintf("Season %02d", season), cleanSegment(name)),
 		TargetPath:     target,
 		SourcePath:     target,
+		SourceRoot:     filepath.Clean(sourceRoot),
 		Kind:           KindEpisode,
 		ShokoFileID:    file.ID,
 		ShokoGroupID:   groupID,
@@ -312,13 +326,50 @@ func rootSegment(title string, year int) string {
 		title = "Unknown Series"
 	}
 	if year == 0 {
-		return title
+		return truncateBytes(title, maxNameBytes)
 	}
 	yearToken := fmt.Sprintf("(%d)", year)
 	if strings.Contains(title, yearToken) {
-		return title
+		return truncateBytes(title, maxNameBytes)
 	}
-	return title + " " + yearToken
+	return truncateBytes(title, maxNameBytes-len(yearToken)-1) + " " + yearToken
+}
+
+// maxNameBytes is the file name limit of common Linux and macOS filesystems.
+const maxNameBytes = 255
+
+// truncateBytes shortens value to at most limit bytes without splitting a
+// character. The Shoko ID markers keep shortened names unique.
+func truncateBytes(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(value) <= limit {
+		return value
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return strings.TrimSpace(value[:cut])
+}
+
+// partTokenPattern matches the tokens Silo reads as "part N of a split file".
+var partTokenPattern = regexp.MustCompile(`(?i)(?:^|[.\-_\s])(?:cd|disc|part|pt)(?:\s*|[._-]?)\d{1,2}(?:$|[.\-_\s])`)
+
+// fileTitle is the series title used in link names. Silo takes the show's title
+// from the folder, so a token like "Part 2" that belongs to the series name is
+// removed here to keep it from being misread as part 2 of a split episode.
+func fileTitle(name string) string {
+	title := cleanSegment(name)
+	for {
+		stripped := partTokenPattern.ReplaceAllString(title, " ")
+		if stripped == title {
+			break
+		}
+		title = stripped
+	}
+	return cleanSegment(title)
 }
 
 func stableKey(fileID, episodeID int) string {
@@ -326,8 +377,10 @@ func stableKey(fileID, episodeID int) string {
 }
 
 func safeRelativePath(value string) (string, bool) {
-	value = strings.TrimSpace(strings.ReplaceAll(value, "\\", "/"))
-	if value == "" || strings.HasPrefix(value, "/") {
+	// Daily servers report paths with a leading slash and stable servers without
+	// one. Either way the path is relative to the managed folder.
+	value = strings.TrimLeft(strings.TrimSpace(strings.ReplaceAll(value, "\\", "/")), "/")
+	if value == "" {
 		return "", false
 	}
 	cleaned := filepath.ToSlash(filepath.Clean(filepath.FromSlash(value)))
@@ -335,26 +388,6 @@ func safeRelativePath(value string) (string, bool) {
 		return "", false
 	}
 	return filepath.FromSlash(cleaned), true
-}
-
-func episodeNumbers(episode shoko.Episode) (int, int) {
-	if episode.AniDB == nil {
-		return 1, 1
-	}
-	if strings.EqualFold(episode.AniDB.Type, "Episode") {
-		if episode.AniDB.EpisodeNumber > 0 {
-			return 1, episode.AniDB.EpisodeNumber
-		}
-		return 1, 1
-	}
-	if episode.AniDB.EpisodeNumber > 0 {
-		return 0, episode.AniDB.EpisodeNumber
-	}
-	return 0, 1
-}
-
-func isMovie(series shoko.Series) bool {
-	return series.AniDB != nil && strings.EqualFold(series.AniDB.Type, "Movie")
 }
 
 func pointerValue(value *int) int {
@@ -377,8 +410,9 @@ func cleanSegment(value string) string {
 			builder.WriteRune(r)
 		}
 	}
-	value = strings.TrimRight(strings.TrimSpace(builder.String()), ".")
-	if value == "" || value == "." || value == ".." {
+	// Silo's scanner skips dot-prefixed folders, which would hide .hack entirely.
+	value = strings.TrimSpace(strings.Trim(strings.TrimSpace(builder.String()), "."))
+	if value == "" {
 		return "Unknown"
 	}
 	return value

@@ -1,6 +1,6 @@
 {
   "plugin_id": "silo.shokoanime",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "supported_platforms": [
@@ -20,8 +20,8 @@
   "presentation": {
     "display_name": "ShokoAnime VFS",
     "summary": "Builds a Shoko-backed virtual filesystem for Silo libraries.",
-    "description_markdown": "Reads Shoko Server API v3, reconciles deterministic plugin-owned leaf symlinks, and publishes successful VFS changes for targeted Silo scans. It deliberately does not expose remote streams or modify Shoko data.",
-    "setup_markdown": "Configure a Shoko Server URL, API key, a Silo-visible output root, and managed-folder path mappings. Start with a dry-run reconcile and verify that the plugin and Silo share the same filesystem namespace. Enable the Shoko VFS autoscan source: the scheduled task uses a bounded step and scan_source.v1 resumes pending work and queues targeted scans after successful commits.",
+    "description_markdown": "Works with both stable (5.x) and daily (6.x) Shoko Server. Reads Shoko Server API v3, reconciles deterministic plugin-owned leaf symlinks, and publishes successful VFS changes for targeted Silo scans. It deliberately does not expose remote streams or modify Shoko data.",
+    "setup_markdown": "Configure a Shoko Server URL, API key, a Silo-visible output root, and managed-folder path mappings, then use the connection test: it checks the URL, the API key, and every mapped folder. The plugin and Silo must share the same filesystem namespace. Run the Reconcile Shoko VFS task to build the library: a crawl that outlasts the task keeps running in the background, and the task output reports its progress. Enable the Shoko VFS autoscan source so Silo scans changed paths automatically.",
     "homepage_url": "https://github.com/crowquillx/silo-shoko-plugin",
     "source_url": "https://github.com/crowquillx/silo-shoko-plugin",
     "support_url": "https://github.com/crowquillx/silo-shoko-plugin/issues",
@@ -42,7 +42,14 @@
           "series": 1,
           "season": 1,
           "episode": 1
-        }
+        },
+        "rating_sources": [
+          {
+            "id": "anidb",
+            "name": "AniDB",
+            "scale": 10
+          }
+        ]
       }
     },
     {

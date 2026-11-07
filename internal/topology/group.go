@@ -1,105 +1,30 @@
 package topology
 
 import (
-	"sort"
 	"strings"
-	"time"
 
 	"github.com/crowquillx/silo-shoko-plugin/internal/shoko"
 )
 
-// GroupLayout assigns every Shoko series and episode in a group to the logical
-// series coordinates exposed to Silo. TV series become chronological seasons.
-// Movie-only groups become one season whose movies are sequential episodes;
-// movies attached to a TV franchise are exposed as season-zero specials.
+// GroupLayout follows the Shoko group: the group is the show, and each of its
+// series is one season, whatever the series' type. Seasons are numbered in the
+// order Shoko lists the group's series, so no ordering is decided here. Regular
+// episodes go in their series' season and everything else in season zero.
 type GroupLayout struct {
-	OrderedMembers         []shoko.Series
-	SeasonBySeries         map[int]int
-	MovieEpisodeNumberByID map[int]int
-	hasTV                  bool
+	OrderedMembers []shoko.Series
+	SeasonBySeries map[int]int
 }
 
-func NewGroupLayout(members []shoko.Series, episodesBySeries map[int][]shoko.Episode) GroupLayout {
-	ordered := append([]shoko.Series(nil), members...)
-	sort.SliceStable(ordered, func(i, j int) bool {
-		left, right := ordered[i], ordered[j]
-		leftKind, rightKind := groupMemberKind(left), groupMemberKind(right)
-		if leftKind != rightKind {
-			return leftKind < rightKind
-		}
-		leftDate, leftOK := groupSeriesAirDate(left)
-		rightDate, rightOK := groupSeriesAirDate(right)
-		if leftOK != rightOK {
-			return leftOK
-		}
-		if leftOK && !leftDate.Equal(rightDate) {
-			return leftDate.Before(rightDate)
-		}
-		return left.IDs.ID < right.IDs.ID
-	})
-
+// NewGroupLayout takes members in the order Shoko returned them.
+func NewGroupLayout(members []shoko.Series) GroupLayout {
 	layout := GroupLayout{
-		OrderedMembers:         ordered,
-		SeasonBySeries:         make(map[int]int, len(ordered)),
-		MovieEpisodeNumberByID: make(map[int]int),
+		OrderedMembers: append([]shoko.Series(nil), members...),
+		SeasonBySeries: make(map[int]int, len(members)),
 	}
-	for _, series := range ordered {
-		if isTV(series) {
-			layout.hasTV = true
-			break
-		}
-	}
-
-	tvSeason := 0
-	for _, series := range ordered {
-		switch {
-		case isTV(series):
-			tvSeason++
-			layout.SeasonBySeries[series.IDs.ID] = tvSeason
-		case isMovie(series) && !layout.hasTV:
-			layout.SeasonBySeries[series.IDs.ID] = 1
-		default:
-			layout.SeasonBySeries[series.IDs.ID] = 0
-		}
-	}
-
-	movieNumber := 0
-	if layout.hasTV {
-		for _, series := range ordered {
-			if isMovie(series) {
-				continue
-			}
-			for _, episode := range episodesBySeries[series.IDs.ID] {
-				season, number := groupedNaturalPosition(series, layout.SeasonBySeries[series.IDs.ID], episode)
-				if season == 0 && number > movieNumber {
-					movieNumber = number
-				}
-			}
-		}
-	}
-	for _, series := range ordered {
-		if !isMovie(series) {
-			continue
-		}
-		episodes := append([]shoko.Episode(nil), episodesBySeries[series.IDs.ID]...)
-		sort.SliceStable(episodes, func(i, j int) bool {
-			_, left := naturalEpisodePosition(episodes[i])
-			_, right := naturalEpisodePosition(episodes[j])
-			if left != right {
-				return left < right
-			}
-			return episodes[i].IDs.ID < episodes[j].IDs.ID
-		})
-		for _, episode := range episodes {
-			movieNumber++
-			layout.MovieEpisodeNumberByID[episode.IDs.ID] = movieNumber
-		}
+	for index, series := range members {
+		layout.SeasonBySeries[series.IDs.ID] = index + 1
 	}
 	return layout
-}
-
-func (l GroupLayout) HasTV() bool {
-	return l.hasTV
 }
 
 func (l GroupLayout) SeasonNumber(seriesID int) int {
@@ -108,83 +33,80 @@ func (l GroupLayout) SeasonNumber(seriesID int) int {
 
 func (l GroupLayout) Position(series shoko.Series, episode shoko.Episode) (int, int) {
 	season := l.SeasonBySeries[series.IDs.ID]
-	if isMovie(series) {
-		if number := l.MovieEpisodeNumberByID[episode.IDs.ID]; number > 0 {
-			return season, number
+	if isRegularEpisode(episode) {
+		return season, naturalNumber(episode)
+	}
+	return 0, specialNumber(max(season-1, 0), episode)
+}
+
+// EpisodeNumbers returns the coordinates of an episode of a series that belongs
+// to no group.
+func EpisodeNumbers(episode shoko.Episode) (int, int) {
+	if isRegularEpisode(episode) {
+		return 1, naturalNumber(episode)
+	}
+	return 0, specialNumber(0, episode)
+}
+
+// Season-zero numbers must be unique within a show because Silo stores one
+// episode per season and number, yet AniDB restarts numbering for every series
+// and episode type. They are derived from the episode rather than counted, so a
+// number does not move when other files appear and the VFS and metadata always
+// agree. Silo reads at most five digits, which leaves 99 series per group.
+const (
+	seasonZeroMemberBlock = 1000
+	seasonZeroMaxMember   = 99
+	seasonZeroCredits     = 400
+	seasonZeroTrailers    = 600
+	seasonZeroParodies    = 800
+	seasonZeroOther       = 900
+)
+
+func specialNumber(memberIndex int, episode shoko.Episode) int {
+	offset := seasonZeroOther
+	if episode.AniDB != nil {
+		switch strings.ToLower(episode.AniDB.Type) {
+		case "special":
+			offset = 0
+		case "credits":
+			offset = seasonZeroCredits
+		case "trailer":
+			offset = seasonZeroTrailers
+		case "parody":
+			offset = seasonZeroParodies
 		}
 	}
-	return groupedNaturalPosition(series, season, episode)
+	return min(memberIndex, seasonZeroMaxMember)*seasonZeroMemberBlock + offset + naturalNumber(episode)
 }
 
-func isTV(series shoko.Series) bool {
-	return series.AniDB != nil && strings.EqualFold(series.AniDB.Type, "TV")
-}
-
-func groupMemberKind(series shoko.Series) int {
-	switch {
-	case isTV(series):
-		return 0
-	case isMovie(series):
-		return 2
-	default:
-		return 1
+func naturalNumber(episode shoko.Episode) int {
+	if episode.AniDB != nil && episode.AniDB.EpisodeNumber > 0 {
+		return episode.AniDB.EpisodeNumber
 	}
+	return 1
 }
 
-func groupSeriesAirDate(series shoko.Series) (time.Time, bool) {
-	if series.AniDB == nil {
-		return time.Time{}, false
-	}
-	date, err := time.Parse("2006-01-02", series.AniDB.AirDate)
-	return date, err == nil
-}
-
-func groupedNaturalPosition(series shoko.Series, seriesSeason int, episode shoko.Episode) (int, int) {
-	season, number := naturalEpisodePosition(episode)
-	if isTV(series) && episode.AniDB != nil && strings.EqualFold(episode.AniDB.Type, "Episode") {
-		season = seriesSeason
-	} else {
-		season = 0
-	}
-	return season, number
-}
-
-func naturalEpisodePosition(episode shoko.Episode) (int, int) {
+func isRegularEpisode(episode shoko.Episode) bool {
 	if episode.AniDB == nil {
-		return 1, 1
+		return false
 	}
-	if strings.EqualFold(episode.AniDB.Type, "Episode") {
-		if episode.AniDB.EpisodeNumber > 0 {
-			return 1, episode.AniDB.EpisodeNumber
-		}
-		return 1, 1
+	switch strings.ToLower(episode.AniDB.Type) {
+	case "episode", "normal":
+		return true
 	}
-	if episode.AniDB.EpisodeNumber > 0 {
-		return 0, episode.AniDB.EpisodeNumber
-	}
-	return 0, 1
+	return false
 }
 
 func newSnapshotGroupLayouts(snapshot shoko.Snapshot) map[int]GroupLayout {
-	episodesBySeries := make(map[int][]shoko.Episode)
-	for _, episode := range snapshot.Episodes {
-		seriesID := episode.IDs.ParentSeries
-		episodesBySeries[seriesID] = append(episodesBySeries[seriesID], episode)
-	}
 	layouts := make(map[int]GroupLayout, len(snapshot.GroupSeries))
 	for groupID, memberIDs := range snapshot.GroupSeries {
 		members := make([]shoko.Series, 0, len(memberIDs))
-		seen := make(map[int]struct{}, len(memberIDs))
 		for _, seriesID := range memberIDs {
-			if _, duplicate := seen[seriesID]; duplicate {
-				continue
-			}
-			seen[seriesID] = struct{}{}
 			if series, ok := snapshot.Series[seriesID]; ok {
 				members = append(members, series)
 			}
 		}
-		layouts[groupID] = NewGroupLayout(members, episodesBySeries)
+		layouts[groupID] = NewGroupLayout(members)
 	}
 	return layouts
 }

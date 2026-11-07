@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/crowquillx/silo-shoko-plugin/internal/shoko"
 )
@@ -82,7 +83,104 @@ func TestBuildRejectsTraversalLocation(t *testing.T) {
 
 func intPtr(value int) *int { return &value }
 
-func TestBuildGroupsChronologicalTVSeries(t *testing.T) {
+func singleFileSnapshot(relative, seriesName string) shoko.Snapshot {
+	episodeID := 42
+	return shoko.Snapshot{
+		Files: []shoko.File{{
+			ID:        9,
+			Locations: []shoko.Location{{ManagedFolderID: 1, RelativePath: relative, IsAccessible: true}},
+			SeriesIDs: []shoko.FileCrossReference{{SeriesID: shoko.SeriesCrossReferenceIDs{ID: intPtr(7)}, EpisodeIDs: []shoko.EpisodeCrossReferenceIDs{{ID: &episodeID}}}},
+		}},
+		Series:   map[int]shoko.Series{7: {IDs: shoko.IDs{ID: 7}, Name: seriesName, AniDB: &shoko.AnimeMetadata{Type: "TV"}}},
+		Episodes: map[int]shoko.Episode{42: {IDs: shoko.IDs{ID: 42, ParentSeries: 7}, AniDB: &shoko.AnimeMetadata{Type: "Episode", EpisodeNumber: 1}}},
+	}
+}
+
+func buildSingle(t *testing.T, relative, seriesName string) Entry {
+	t.Helper()
+	plan, err := Build(singleFileSnapshot(relative, seriesName), Policy{VFSRoot: "/vfs", ManagedFolderMap: map[int]string{1: "/media/anime"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Entries) != 1 {
+		t.Fatalf("plan = %#v", plan)
+	}
+	return plan.Entries[0]
+}
+
+func TestBuildAcceptsLeadingSlashFromDailyServers(t *testing.T) {
+	for _, relative := range []string{"/Show/ep.mkv", "Show/ep.mkv", `\Show\ep.mkv`, `Show\ep.mkv`} {
+		if got := buildSingle(t, relative, "Show").TargetPath; got != "/media/anime/Show/ep.mkv" {
+			t.Errorf("target for %q = %q", relative, got)
+		}
+	}
+	for _, relative := range []string{"/../outside.mkv", "//../../outside.mkv", "", "/"} {
+		plan, err := Build(singleFileSnapshot(relative, "Show"), Policy{VFSRoot: "/vfs", ManagedFolderMap: map[int]string{1: "/media/anime"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(plan.Entries) != 0 {
+			t.Errorf("path %q escaped: %#v", relative, plan.Entries)
+		}
+	}
+}
+
+func TestBuildKeepsNamesWithinFilesystemLimits(t *testing.T) {
+	for _, title := range []string{strings.Repeat("a", 400), strings.Repeat("の", 200)} {
+		entry := buildSingle(t, "Show/ep.mkv", title)
+		for _, segment := range strings.Split(entry.LogicalPath, string(filepath.Separator)) {
+			if len(segment) > 255 {
+				t.Errorf("segment is %d bytes: %q", len(segment), segment)
+			}
+			if !utf8.ValidString(segment) {
+				t.Errorf("segment was cut inside a character: %q", segment)
+			}
+		}
+		if !strings.Contains(entry.LogicalPath, "[Shoko Episode=42]") || !strings.HasSuffix(entry.LogicalPath, ".mkv") {
+			t.Errorf("identity lost: %q", entry.LogicalPath)
+		}
+	}
+}
+
+func TestBuildDoesNotHideDotPrefixedTitles(t *testing.T) {
+	entry := buildSingle(t, "Show/ep.mkv", ".hack//Sign")
+	for _, segment := range strings.Split(entry.LogicalPath, string(filepath.Separator)) {
+		if strings.HasPrefix(segment, ".") {
+			t.Errorf("segment %q would be skipped by Silo's scanner", segment)
+		}
+	}
+	if !strings.HasPrefix(entry.LogicalPath, "hack__Sign") {
+		t.Errorf("path = %q", entry.LogicalPath)
+	}
+}
+
+func TestBuildStripsPartTokensFromLinkNames(t *testing.T) {
+	entry := buildSingle(t, "Show/ep.mkv", "Mushoku Tensei Part 2")
+	name := filepath.Base(entry.LogicalPath)
+	if !strings.HasPrefix(name, "Mushoku Tensei - S01E01 ") {
+		t.Errorf("name = %q", name)
+	}
+	// The folder keeps the real title, since that is what Silo displays.
+	if !strings.HasPrefix(entry.LogicalPath, "Mushoku Tensei Part 2"+string(filepath.Separator)) {
+		t.Errorf("path = %q", entry.LogicalPath)
+	}
+}
+
+func TestEpisodeNumbersKeepUngroupedTypesApart(t *testing.T) {
+	seen := map[int]string{}
+	for _, kind := range []string{"Special", "Credits", "Trailer", "Parody", "Other"} {
+		season, number := EpisodeNumbers(shoko.Episode{AniDB: &shoko.AnimeMetadata{Type: kind, EpisodeNumber: 1}})
+		if season != 0 {
+			t.Fatalf("%s season = %d", kind, season)
+		}
+		if previous, duplicate := seen[number]; duplicate {
+			t.Fatalf("%s and %s both use S00E%d", kind, previous, number)
+		}
+		seen[number] = kind
+	}
+}
+
+func TestBuildNumbersGroupSeasonsInShokoOrder(t *testing.T) {
 	firstEpisodeID, secondEpisodeID := 1001, 1002
 	snapshot := shoko.Snapshot{
 		Files: []shoko.File{
@@ -100,7 +198,7 @@ func TestBuildGroupsChronologicalTVSeries(t *testing.T) {
 		Groups: map[int]shoko.Group{
 			50: {IDs: shoko.GroupIDs{ID: 50, MainSeries: 101}, Name: "Monogatari"},
 		},
-		GroupSeries: map[int][]int{50: {102, 101}},
+		GroupSeries: map[int][]int{50: {101, 102}},
 		Series: map[int]shoko.Series{
 			101: {IDs: shoko.IDs{ID: 101}, Name: "Bakemonogatari", AniDB: &shoko.AnimeMetadata{Type: "TV", AirDate: "2009-07-03"}},
 			102: {IDs: shoko.IDs{ID: 102}, Name: "Nisemonogatari", AniDB: &shoko.AnimeMetadata{Type: "TV", AirDate: "2012-01-08"}},

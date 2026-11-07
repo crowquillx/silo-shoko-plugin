@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"regexp"
 	goruntime "runtime"
@@ -46,6 +47,11 @@ type runtimeServer struct {
 	client     *shoko.Client
 	reconciler *vfs.Reconciler
 	engine     *reconcile.Engine
+
+	crawlMu       sync.Mutex
+	crawlCancel   context.CancelFunc
+	crawlErr      error
+	verifiedUntil time.Time
 }
 
 func (s *runtimeServer) GetManifest(context.Context, *pluginv1.GetManifestRequest) (*pluginv1.GetManifestResponse, error) {
@@ -78,13 +84,153 @@ func (s *runtimeServer) Configure(_ context.Context, req *pluginv1.ConfigureRequ
 	if err != nil {
 		return nil, err
 	}
+	s.cancelBackgroundCrawl()
 	s.mu.Lock()
 	s.cfg = cfg
 	s.client = client
 	s.reconciler = reconciler
 	s.engine = engine
+	s.verifiedUntil = time.Time{}
 	s.mu.Unlock()
 	return &pluginv1.ConfigureResponse{}, nil
+}
+
+// Silo gives a scheduled task about ten seconds, far less than a crawl of a real
+// library needs, so a run that cannot finish in time keeps going here. Steps
+// are bounded so the VFS lock is released regularly for scan-source polls.
+const (
+	scheduledStepBudget  = 7 * time.Second
+	backgroundStepBudget = 20 * time.Second
+)
+
+// startBackgroundCrawl finishes a crawl after the scheduled task has returned.
+// It does nothing if a crawl is already running.
+func (s *runtimeServer) startBackgroundCrawl(engine *reconcile.Engine) {
+	s.crawlMu.Lock()
+	defer s.crawlMu.Unlock()
+	if s.crawlCancel != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.crawlCancel = cancel
+	s.crawlErr = nil
+	go func() {
+		err := runCrawlToCompletion(ctx, engine)
+		s.crawlMu.Lock()
+		defer s.crawlMu.Unlock()
+		// A canceled context means a reconfigure, and a newer engine owns the VFS.
+		if ctx.Err() == nil {
+			s.crawlCancel = nil
+			s.crawlErr = err
+		}
+		cancel()
+	}()
+}
+
+func runCrawlToCompletion(ctx context.Context, engine *reconcile.Engine) error {
+	for {
+		outcome, err := engine.Step(ctx, backgroundStepBudget)
+		if err != nil {
+			if ctx.Err() == nil {
+				fmt.Fprintf(os.Stderr, "shokoanime: background crawl failed: %v\n", err)
+			}
+			return err
+		}
+		if outcome.Complete {
+			logReconcileFailures(outcome.Result)
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+func logReconcileFailures(result vfs.Result) {
+	for _, failure := range result.Failures {
+		fmt.Fprintf(os.Stderr, "shokoanime: could not link %q: %s\n", failure.LogicalPath, failure.Reason)
+	}
+	if result.Themes != nil {
+		logThemeFailures(*result.Themes)
+	}
+}
+
+func logThemeFailures(result vfs.ThemeResult) {
+	for _, failure := range result.Failures {
+		fmt.Fprintf(os.Stderr, "shokoanime: could not sync theme %q: %s\n", failure.LogicalPath, failure.Reason)
+	}
+}
+
+func (s *runtimeServer) cancelBackgroundCrawl() {
+	s.crawlMu.Lock()
+	defer s.crawlMu.Unlock()
+	if s.crawlCancel != nil {
+		s.crawlCancel()
+		s.crawlCancel = nil
+	}
+	s.crawlErr = nil
+}
+
+func (s *runtimeServer) backgroundCrawlRunning() bool {
+	s.crawlMu.Lock()
+	defer s.crawlMu.Unlock()
+	return s.crawlCancel != nil
+}
+
+// takeBackgroundCrawlError returns a background failure once, so the next
+// scheduled run reports it instead of succeeding silently.
+func (s *runtimeServer) takeBackgroundCrawlError() error {
+	s.crawlMu.Lock()
+	defer s.crawlMu.Unlock()
+	err := s.crawlErr
+	s.crawlErr = nil
+	return err
+}
+
+// connectionVerifyInterval limits how often title-only searches reach Shoko.
+const connectionVerifyInterval = 5 * time.Minute
+
+// verifyConnection checks everything the test connection button can: that the
+// URL reaches Shoko, the API key works, and the path map matches the server.
+func (s *runtimeServer) verifyConnection(ctx context.Context) error {
+	cfg, client, _, err := s.state()
+	if err != nil {
+		return err
+	}
+	s.mu.RLock()
+	fresh := time.Now().Before(s.verifiedUntil)
+	s.mu.RUnlock()
+	if fresh {
+		return nil
+	}
+	folders, err := client.ManagedFolders(ctx)
+	if err != nil {
+		var httpErr *shoko.HTTPError
+		if errors.As(err, &httpErr) && (httpErr.StatusCode == http.StatusUnauthorized || httpErr.StatusCode == http.StatusForbidden) {
+			return fmt.Errorf("shokoanime: Shoko rejected the API key (HTTP %d)", httpErr.StatusCode)
+		}
+		return err
+	}
+	known := make(map[int]struct{}, len(folders))
+	available := make([]string, 0, len(folders))
+	for _, folder := range folders {
+		known[folder.ID] = struct{}{}
+		available = append(available, fmt.Sprintf("%d (%s)", folder.ID, folder.Name))
+	}
+	for id, root := range cfg.ManagedFolderMap {
+		if _, ok := known[id]; !ok {
+			return fmt.Errorf("shokoanime: Shoko has no folder %d; available folders: %s", id, strings.Join(available, ", "))
+		}
+		if info, err := os.Stat(root); err != nil || !info.IsDir() {
+			return fmt.Errorf("shokoanime: mapped path %q for folder %d is not a directory visible to Silo", root, id)
+		}
+	}
+	s.mu.Lock()
+	s.verifiedUntil = time.Now().Add(connectionVerifyInterval)
+	s.mu.Unlock()
+	return nil
 }
 
 func (s *runtimeServer) state() (config.Connection, *shoko.Client, *vfs.Reconciler, error) {
@@ -143,6 +289,15 @@ type metadataServer struct {
 	pluginv1.UnimplementedMetadataProviderServer
 	pluginv1.UnimplementedImageResolverServer
 	runtime *runtimeServer
+	// now overrides the clock in tests.
+	now func() time.Time
+}
+
+func (s *metadataServer) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
 }
 
 func (s *metadataServer) Search(ctx context.Context, req *pluginv1.SearchMetadataRequest) (*pluginv1.SearchMetadataResponse, error) {
@@ -153,6 +308,13 @@ func (s *metadataServer) Search(ctx context.Context, req *pluginv1.SearchMetadat
 	providerIDs := stringMap(req.GetProviderIds())
 	token := requestToken(providerIDs, providerIDs["_filepath"], req.GetQuery())
 	if !token.Valid() {
+		// Silo's connection test is a title search with no file path or IDs. Scans
+		// always send a file path, so they never wait on Shoko for non-VFS files.
+		if len(providerIDs) == 0 {
+			if err := s.runtime.verifyConnection(ctx); err != nil {
+				return nil, err
+			}
+		}
 		return &pluginv1.SearchMetadataResponse{}, nil
 	}
 
@@ -222,11 +384,19 @@ func (s *metadataServer) GetMetadata(ctx context.Context, req *pluginv1.GetMetad
 		if err != nil {
 			return nil, err
 		}
-		year, err := groupYear(ctx, client, group, token.SeriesID)
+		members, err := client.GroupSeries(ctx, token.GroupID)
 		if err != nil {
 			return nil, err
 		}
-		return &pluginv1.GetMetadataResponse{Item: groupMetadata(group, req.GetItemType(), year)}, nil
+		year, err := yearFromMembers(ctx, client, group, members, token.SeriesID)
+		if err != nil {
+			return nil, err
+		}
+		item := groupMetadata(group, req.GetItemType(), year)
+		if err := addShowDetails(ctx, client, item, members, group.IDs.MainSeries, s.clock()); err != nil {
+			return nil, err
+		}
+		return &pluginv1.GetMetadataResponse{Item: item}, nil
 	}
 	seriesID := token.SeriesID
 	if seriesID == 0 {
@@ -249,7 +419,11 @@ func (s *metadataServer) GetMetadata(ctx context.Context, req *pluginv1.GetMetad
 	if err != nil {
 		return nil, err
 	}
-	return &pluginv1.GetMetadataResponse{Item: seriesMetadata(series, req.GetItemType())}, nil
+	item := seriesMetadata(series, req.GetItemType())
+	if err := addShowDetails(ctx, client, item, []shoko.Series{series}, series.IDs.ID, s.clock()); err != nil {
+		return nil, err
+	}
+	return &pluginv1.GetMetadataResponse{Item: item}, nil
 }
 
 func (s *metadataServer) GetSeasons(ctx context.Context, req *pluginv1.GetSeasonsRequest) (*pluginv1.GetSeasonsResponse, error) {
@@ -268,7 +442,11 @@ func (s *metadataServer) GetSeasons(ctx context.Context, req *pluginv1.GetSeason
 		if err != nil {
 			return nil, err
 		}
-		return groupSeasons(group, members), nil
+		episodesBySeries, err := groupEpisodes(ctx, client.Episodes, members)
+		if err != nil {
+			return nil, err
+		}
+		return groupSeasons(group, members, episodesBySeries), nil
 	}
 	seriesID := token.SeriesID
 	if seriesID == 0 {
@@ -287,7 +465,7 @@ func (s *metadataServer) GetSeasons(ctx context.Context, req *pluginv1.GetSeason
 	}
 	seasons := make(map[int]struct{})
 	for _, episode := range episodes {
-		season, _ := episodeNumbers(episode)
+		season, _ := topology.EpisodeNumbers(episode)
 		seasons[season] = struct{}{}
 	}
 	numbers := make([]int, 0, len(seasons))
@@ -304,13 +482,18 @@ func (s *metadataServer) GetSeasons(ctx context.Context, req *pluginv1.GetSeason
 		if series.IDs.AniDB > 0 {
 			seasonIDs["anidb"] = strconv.Itoa(series.IDs.AniDB)
 		}
-		response.Seasons = append(response.Seasons, &pluginv1.SeasonRecord{
+		record := &pluginv1.SeasonRecord{
 			SeasonNumber: int32(number),
 			Title:        fmt.Sprintf("Season %02d", number),
 			PosterPath:   selectedPosterPath(series.Images),
 			ProviderId:   fmt.Sprintf("series:%d:season:%d", seriesID, number),
 			ProviderIds:  stringStruct(seasonIDs),
-		})
+		}
+		if number > 0 {
+			record.Overview = sanitizeDescription(series.Description)
+			record.AirDate = seriesAirDate(series)
+		}
+		response.Seasons = append(response.Seasons, record)
 	}
 	return response, nil
 }
@@ -327,15 +510,11 @@ func (s *metadataServer) GetEpisodes(ctx context.Context, req *pluginv1.GetEpiso
 		if err != nil {
 			return nil, err
 		}
-		episodesBySeries := make(map[int][]shoko.Episode, len(members))
-		for _, series := range members {
-			episodes, err := client.Episodes(ctx, series.IDs.ID)
-			if err != nil {
-				return nil, err
-			}
-			episodesBySeries[series.IDs.ID] = episodes
+		episodesBySeries, err := groupEpisodes(ctx, client.MetadataEpisodes, members)
+		if err != nil {
+			return nil, err
 		}
-		layout := topology.NewGroupLayout(members, episodesBySeries)
+		layout := topology.NewGroupLayout(members)
 		response := &pluginv1.GetEpisodesResponse{Episodes: make([]*pluginv1.EpisodeRecord, 0)}
 		for _, series := range layout.OrderedMembers {
 			for _, episode := range episodesBySeries[series.IDs.ID] {
@@ -343,14 +522,7 @@ func (s *metadataServer) GetEpisodes(ctx context.Context, req *pluginv1.GetEpiso
 				if int(req.GetSeasonNumber()) != season {
 					continue
 				}
-				response.Episodes = append(response.Episodes, &pluginv1.EpisodeRecord{
-					SeasonNumber:  int32(season),
-					EpisodeNumber: int32(number),
-					Title:         episode.Name,
-					Overview:      episode.Description,
-					ProviderId:    fmt.Sprintf("episode:%d", episode.IDs.ID),
-					ProviderIds:   idsStruct(episodeIDs(episode)),
-				})
+				response.Episodes = append(response.Episodes, episodeRecord(season, number, episode))
 			}
 		}
 		return response, nil
@@ -362,24 +534,17 @@ func (s *metadataServer) GetEpisodes(ctx context.Context, req *pluginv1.GetEpiso
 	if seriesID == 0 {
 		return &pluginv1.GetEpisodesResponse{}, nil
 	}
-	episodes, err := client.Episodes(ctx, seriesID)
+	episodes, err := client.MetadataEpisodes(ctx, seriesID)
 	if err != nil {
 		return nil, err
 	}
 	response := &pluginv1.GetEpisodesResponse{Episodes: make([]*pluginv1.EpisodeRecord, 0)}
 	for _, episode := range episodes {
-		season, number := episodeNumbers(episode)
+		season, number := topology.EpisodeNumbers(episode)
 		if int(req.GetSeasonNumber()) != season {
 			continue
 		}
-		response.Episodes = append(response.Episodes, &pluginv1.EpisodeRecord{
-			SeasonNumber:  int32(season),
-			EpisodeNumber: int32(number),
-			Title:         episode.Name,
-			Overview:      episode.Description,
-			ProviderId:    fmt.Sprintf("episode:%d", episode.IDs.ID),
-			ProviderIds:   idsStruct(episodeIDs(episode)),
-		})
+		response.Episodes = append(response.Episodes, episodeRecord(season, number, episode))
 	}
 	return response, nil
 }
@@ -489,6 +654,8 @@ func imageRecords(images shoko.Images) *pluginv1.GetImagesResponse {
 type scheduledTaskServer struct {
 	pluginv1.UnimplementedScheduledTaskServer
 	runtime *runtimeServer
+	// stepBudget overrides scheduledStepBudget in tests.
+	stepBudget time.Duration
 }
 
 func (s *scheduledTaskServer) Run(ctx context.Context, req *pluginv1.RunScheduledTaskRequest) (*pluginv1.RunScheduledTaskResponse, error) {
@@ -499,6 +666,11 @@ func (s *scheduledTaskServer) Run(ctx context.Context, req *pluginv1.RunSchedule
 	if req.GetInput() != nil {
 		if value, ok := req.GetInput().AsMap()["dry_run"].(bool); ok {
 			dryRun = value
+		}
+	}
+	if !dryRun {
+		if err := s.runtime.takeBackgroundCrawlError(); err != nil {
+			return nil, err
 		}
 	}
 	var plan topology.Plan
@@ -522,14 +694,28 @@ func (s *scheduledTaskServer) Run(ctx context.Context, req *pluginv1.RunSchedule
 		if err != nil {
 			return nil, err
 		}
-		outcome, err := engine.Step(ctx, 7*time.Second)
-		if err != nil {
-			return nil, err
+		var outcome reconcile.Outcome
+		if s.runtime.backgroundCrawlRunning() {
+			phase = "background"
+		} else {
+			budget := s.stepBudget
+			if budget == 0 {
+				budget = scheduledStepBudget
+			}
+			outcome, err = engine.Step(ctx, budget)
+			if err != nil {
+				return nil, err
+			}
+			phase = outcome.Phase
 		}
 		complete = outcome.Complete
-		phase = outcome.Phase
 		filesFetched, seriesFetched, episodesFetched = outcome.FilesFetched, outcome.SeriesFetched, outcome.EpisodesFetched
 		plan, result = outcome.Plan, outcome.Result
+		if complete {
+			logReconcileFailures(result)
+		} else {
+			s.runtime.startBackgroundCrawl(engine)
+		}
 	}
 	output, err := taskOutput(dryRun, complete, phase, filesFetched, seriesFetched, episodesFetched, plan, result)
 	if err != nil {
@@ -538,7 +724,34 @@ func (s *scheduledTaskServer) Run(ctx context.Context, req *pluginv1.RunSchedule
 	return &pluginv1.RunScheduledTaskResponse{Output: output}, nil
 }
 
-const maxTaskOutputActions = 100
+const (
+	maxTaskOutputActions  = 100
+	maxTaskOutputFailures = 100
+)
+
+func themeOutput(themes *vfs.ThemeResult) map[string]any {
+	if themes == nil {
+		return nil
+	}
+	return map[string]any{
+		"linked":        themes.Linked,
+		"written_back":  themes.WrittenBack,
+		"removed":       themes.Removed,
+		"failure_count": len(themes.Failures),
+	}
+}
+
+func taskMessage(dryRun, complete bool, filesFetched, entries int, result vfs.Result) string {
+	switch {
+	case !complete:
+		return fmt.Sprintf("Still crawling Shoko in the background (%d files so far). Links are written when the crawl finishes.", filesFetched)
+	case dryRun:
+		return fmt.Sprintf("Dry run: %d links planned, nothing written.", entries)
+	case len(result.Failures) > 0:
+		return fmt.Sprintf("Reconciled %d links, but %d could not be changed; see failures.", entries, len(result.Failures))
+	}
+	return fmt.Sprintf("Reconciled %d links.", entries)
+}
 
 func taskOutput(dryRun, complete bool, phase string, filesFetched, seriesFetched, episodesFetched int, plan topology.Plan, result vfs.Result) (*structpb.Struct, error) {
 	actionLimit := len(result.Actions)
@@ -554,7 +767,17 @@ func taskOutput(dryRun, complete bool, phase string, filesFetched, seriesFetched
 			"reason":       action.Reason,
 		})
 	}
+	failureLimit := min(len(result.Failures), maxTaskOutputFailures)
+	failures := make([]any, 0, failureLimit)
+	for _, failure := range result.Failures[:failureLimit] {
+		failures = append(failures, map[string]any{
+			"logical_path": failure.LogicalPath,
+			"target_path":  failure.TargetPath,
+			"reason":       failure.Reason,
+		})
+	}
 	return structpb.NewStruct(map[string]any{
+		"message":           taskMessage(dryRun, complete, filesFetched, len(plan.Entries), result),
 		"dry_run":           dryRun,
 		"complete":          complete,
 		"queued":            !complete,
@@ -567,6 +790,10 @@ func taskOutput(dryRun, complete bool, phase string, filesFetched, seriesFetched
 		"actions_returned":  len(actions),
 		"actions_truncated": len(result.Actions) - len(actions),
 		"actions":           actions,
+		"failure_count":     len(result.Failures),
+		"failures":          failures,
+		"diagnostic_count":  len(plan.Diagnostics),
+		"themes":            themeOutput(result.Themes),
 		"diagnostics":       diagnostics(plan.Diagnostics),
 	})
 }
@@ -614,15 +841,26 @@ func (s *scanSourceServer) PollChanges(ctx context.Context, req *pluginv1.PollCh
 	s.runtime.mu.RLock()
 	engine := s.runtime.engine
 	s.runtime.mu.RUnlock()
-	if engine != nil {
+	if engine != nil && !s.runtime.backgroundCrawlRunning() {
 		pending, err := engine.Pending(ctx)
 		if err != nil {
 			return nil, err
 		}
 		if pending {
-			if _, err := engine.Step(ctx, 4*time.Minute+30*time.Second); err != nil {
+			outcome, err := engine.Step(ctx, 4*time.Minute+30*time.Second)
+			if err != nil {
 				return nil, err
 			}
+			logReconcileFailures(outcome.Result)
+		}
+	}
+	// Pick up themes written into the VFS since the last poll, so they reach the
+	// media folders without waiting for the next reconcile.
+	if !s.runtime.backgroundCrawlRunning() {
+		if themes, err := reconciler.SyncThemes(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "shokoanime: theme sync failed: %v\n", err)
+		} else {
+			logThemeFailures(themes)
 		}
 	}
 	paths, nextMarker, err := reconciler.PollChanges(ctx, marker)
@@ -727,6 +965,7 @@ func runBootstrap(args []string) error {
 	if err != nil {
 		return err
 	}
+	logReconcileFailures(outcome.Result)
 	encoded, err := json.Marshal(map[string]any{
 		"complete":         outcome.Complete,
 		"phase":            outcome.Phase,
@@ -734,6 +973,7 @@ func runBootstrap(args []string) error {
 		"series_fetched":   outcome.SeriesFetched,
 		"episodes_fetched": outcome.EpisodesFetched,
 		"action_count":     len(outcome.Result.Actions),
+		"failure_count":    len(outcome.Result.Failures),
 	})
 	if err != nil {
 		return err
@@ -836,27 +1076,23 @@ func completeAirDate(series shoko.Series) (time.Time, bool) {
 	return date, err == nil
 }
 
-func isTVSeries(series shoko.Series) bool {
-	return series.AniDB != nil && strings.EqualFold(series.AniDB.Type, "TV")
-}
-
-func isMovieSeries(series shoko.Series) bool {
-	return series.AniDB != nil && strings.EqualFold(series.AniDB.Type, "Movie")
-}
-
 func groupYear(ctx context.Context, client *shoko.Client, group shoko.Group, currentSeriesID int) (int, error) {
-	if group.IDs.MainSeries > 0 {
-		series, err := client.Series(ctx, group.IDs.MainSeries)
-		if err != nil {
-			return 0, err
-		}
-		if year := series.AniDB.AirYear(); year > 0 {
-			return year, nil
-		}
-	}
 	members, err := client.GroupSeries(ctx, group.IDs.ID)
 	if err != nil {
 		return 0, err
+	}
+	return yearFromMembers(ctx, client, group, members, currentSeriesID)
+}
+
+// yearFromMembers returns the main series' year, else the earliest member's,
+// else the current series' year.
+func yearFromMembers(ctx context.Context, client *shoko.Client, group shoko.Group, members []shoko.Series, currentSeriesID int) (int, error) {
+	for _, member := range members {
+		if member.IDs.ID == group.IDs.MainSeries {
+			if year := member.AniDB.AirYear(); year > 0 {
+				return year, nil
+			}
+		}
 	}
 	var earliest time.Time
 	for _, member := range members {
@@ -878,54 +1114,66 @@ func groupYear(ctx context.Context, client *shoko.Client, group shoko.Group, cur
 	return 0, nil
 }
 
-func groupSeasons(group shoko.Group, members []shoko.Series) *pluginv1.GetSeasonsResponse {
-	layout := topology.NewGroupLayout(members, nil)
-	response := &pluginv1.GetSeasonsResponse{Seasons: make([]*pluginv1.SeasonRecord, 0, len(layout.OrderedMembers))}
-	records := make(map[int]*pluginv1.SeasonRecord)
+func groupEpisodes(ctx context.Context, list func(context.Context, int) ([]shoko.Episode, error), members []shoko.Series) (map[int][]shoko.Episode, error) {
+	episodesBySeries := make(map[int][]shoko.Episode, len(members))
+	for _, series := range members {
+		episodes, err := list(ctx, series.IDs.ID)
+		if err != nil {
+			return nil, err
+		}
+		episodesBySeries[series.IDs.ID] = episodes
+	}
+	return episodesBySeries, nil
+}
+
+func groupSeasons(group shoko.Group, members []shoko.Series, episodesBySeries map[int][]shoko.Episode) *pluginv1.GetSeasonsResponse {
+	layout := topology.NewGroupLayout(members)
+	response := &pluginv1.GetSeasonsResponse{Seasons: make([]*pluginv1.SeasonRecord, 0, len(layout.OrderedMembers)+1)}
+	groupID := strconv.Itoa(group.IDs.ID)
+	groupPoster := selectedPosterPath(group.Images)
 	for _, series := range layout.OrderedMembers {
 		season := layout.SeasonNumber(series.IDs.ID)
-		posterPath := selectedPosterPath(series.Images)
-		if existing := records[season]; existing != nil {
-			if existing.PosterPath == "" {
-				existing.PosterPath = posterPath
-			}
-			continue
+		ids := map[string]string{"shoko_group": groupID, "shoko_series": strconv.Itoa(series.IDs.ID)}
+		if series.IDs.AniDB > 0 {
+			ids["anidb"] = strconv.Itoa(series.IDs.AniDB)
 		}
-		ids := map[string]string{"shoko_group": strconv.Itoa(group.IDs.ID)}
-		providerID := fmt.Sprintf("group:%d:season:%d", group.IDs.ID, season)
-		title := fmt.Sprintf("Season %02d", season)
-		if season > 0 && isTVSeries(series) {
-			ids["shoko_series"] = strconv.Itoa(series.IDs.ID)
-			providerID = fmt.Sprintf("series:%d:season:%d", series.IDs.ID, season)
-			title = series.Name
-			if series.IDs.AniDB > 0 {
-				ids["anidb"] = strconv.Itoa(series.IDs.AniDB)
-			}
-		} else if isMovieSeries(series) && !layout.HasTV() {
-			title = group.Name
+		poster := selectedPosterPath(series.Images)
+		if poster == "" {
+			poster = groupPoster
 		}
-		record := &pluginv1.SeasonRecord{
+		response.Seasons = append(response.Seasons, &pluginv1.SeasonRecord{
 			SeasonNumber: int32(season),
-			Title:        title,
-			PosterPath:   posterPath,
-			ProviderId:   providerID,
+			Title:        series.Name,
+			Overview:     sanitizeDescription(series.Description),
+			AirDate:      seriesAirDate(series),
+			PosterPath:   poster,
+			ProviderId:   fmt.Sprintf("series:%d:season:%d", series.IDs.ID, season),
 			ProviderIds:  stringStruct(ids),
-		}
-		records[season] = record
-		response.Seasons = append(response.Seasons, record)
+		})
 	}
-	groupPosterPath := selectedPosterPath(group.Images)
-	for _, record := range response.Seasons {
-		if record.PosterPath == "" {
-			record.PosterPath = groupPosterPath
+	// Silo only asks for the episodes of seasons listed here, so season zero is
+	// listed when the group has specials.
+	for _, series := range layout.OrderedMembers {
+		for _, episode := range episodesBySeries[series.IDs.ID] {
+			if season, _ := layout.Position(series, episode); season == 0 {
+				response.Seasons = append(response.Seasons, &pluginv1.SeasonRecord{
+					SeasonNumber: 0,
+					Title:        "Specials",
+					PosterPath:   groupPoster,
+					ProviderId:   fmt.Sprintf("group:%d:season:0", group.IDs.ID),
+					ProviderIds:  stringStruct(map[string]string{"shoko_group": groupID}),
+				})
+				return response
+			}
 		}
 	}
 	return response
 }
 
-// Shoko artwork is addressed by opaque shoko://image/<uuid> paths. The paths
-// carry no host, credentials, or query, so a path alone can never leak the
-// configured API key; hosts resolve them through the image_resolver.v1
+// Shoko artwork is addressed by opaque shoko://image/ paths: <uuid> on daily
+// servers and <source>/<type>/<id> on stable servers, which have no UUIDs. The
+// paths carry no host, credentials, or query, so a path alone can never leak
+// the configured API key; hosts resolve them through the image_resolver.v1
 // capability.
 const (
 	shokoImageScheme         = "shoko://image/"
@@ -933,16 +1181,24 @@ const (
 	shokoImageEndpointPrefix = "/api/v3/Image/"
 )
 
-var shokoImageUUIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+var (
+	shokoImageUUIDPattern   = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	shokoStableImagePattern = regexp.MustCompile(`^[A-Za-z]+/[A-Za-z]+/[1-9][0-9]*$`)
+)
 
-// imagePath returns the opaque shoko://image/<uuid> path for a Shoko image.
-// Images without a canonical UUID cannot be addressed and yield an empty
-// path.
+// imagePath returns the opaque shoko://image/ path for a Shoko image. Images
+// that cannot be addressed either way yield an empty path.
 func imagePath(image shoko.Image) string {
-	if !shokoImageUUIDPattern.MatchString(image.UID) {
-		return ""
+	if shokoImageUUIDPattern.MatchString(image.UID) {
+		return shokoImageScheme + image.UID
 	}
-	return shokoImageScheme + image.UID
+	if image.UID == "" {
+		stablePath := fmt.Sprintf("%s/%s/%d", image.Source, image.Type, image.ID)
+		if shokoStableImagePattern.MatchString(stablePath) {
+			return shokoImageScheme + stablePath
+		}
+	}
+	return ""
 }
 
 // selectImage returns the preferred available image, falling back to the
@@ -983,20 +1239,20 @@ func applyArtwork(item *pluginv1.MetadataItem, images shoko.Images) {
 	}
 }
 
-// resolveShokoImagePath strictly resolves the scheme-stripped image/<uuid>
-// path supplied by Silo against the configured Shoko base URL. Anything that
-// is not exactly that shape resolves to an empty string. The base URL is
+// resolveShokoImagePath strictly resolves the scheme-stripped image path
+// supplied by Silo against the configured Shoko base URL. Anything that is not
+// exactly a path imagePath produces resolves to an empty string. The base URL is
 // validated at configure time and can carry no credentials, query, or
 // fragment.
 func resolveShokoImagePath(barePath, baseURL string) string {
 	if !strings.HasPrefix(barePath, shokoImageBarePrefix) {
 		return ""
 	}
-	uuid := strings.TrimPrefix(barePath, shokoImageBarePrefix)
-	if !shokoImageUUIDPattern.MatchString(uuid) {
+	imageID := strings.TrimPrefix(barePath, shokoImageBarePrefix)
+	if !shokoImageUUIDPattern.MatchString(imageID) && !shokoStableImagePattern.MatchString(imageID) {
 		return ""
 	}
-	return strings.TrimRight(baseURL, "/") + shokoImageEndpointPrefix + uuid
+	return strings.TrimRight(baseURL, "/") + shokoImageEndpointPrefix + imageID
 }
 
 func seriesSearchResult(series shoko.Series, itemType string) *pluginv1.ProviderSearchResult {
@@ -1009,7 +1265,7 @@ func seriesSearchResult(series shoko.Series, itemType string) *pluginv1.Provider
 		Title:         series.Name,
 		OriginalTitle: series.Name,
 		Year:          int32(series.AniDB.AirYear()),
-		Overview:      series.Description,
+		Overview:      sanitizeDescription(series.Description),
 		ProviderIds:   idsStruct(seriesIDs(series)),
 	}
 	if poster := selectImage(series.Images.Posters); poster != nil {
@@ -1028,7 +1284,7 @@ func groupSearchResult(group shoko.Group, itemType string, year int) *pluginv1.P
 		Title:         group.Name,
 		OriginalTitle: group.Name,
 		Year:          int32(year),
-		Overview:      group.Description,
+		Overview:      sanitizeDescription(group.Description),
 		ProviderIds:   idsStruct(groupIDs(group)),
 	}
 }
@@ -1042,7 +1298,7 @@ func episodeSearchResult(episode shoko.Episode, itemType string) *pluginv1.Provi
 		ItemType:      itemType,
 		Title:         episode.Name,
 		OriginalTitle: episode.Name,
-		Overview:      episode.Description,
+		Overview:      sanitizeDescription(episode.Description),
 		ProviderIds:   idsStruct(episodeIDs(episode)),
 	}
 }
@@ -1057,7 +1313,7 @@ func seriesMetadata(series shoko.Series, itemType string) *pluginv1.MetadataItem
 		Title:                series.Name,
 		OriginalTitle:        series.Name,
 		Year:                 int32(series.AniDB.AirYear()),
-		Overview:             series.Description,
+		Overview:             sanitizeDescription(series.Description),
 		ProviderIds:          idsStruct(seriesIDs(series)),
 		TitleAliasesComplete: false,
 	}
@@ -1075,7 +1331,7 @@ func groupMetadata(group shoko.Group, itemType string, year int) *pluginv1.Metad
 		Title:                group.Name,
 		OriginalTitle:        group.Name,
 		Year:                 int32(year),
-		Overview:             group.Description,
+		Overview:             sanitizeDescription(group.Description),
 		ProviderIds:          idsStruct(groupIDs(group)),
 		TitleAliasesComplete: false,
 	}
@@ -1092,7 +1348,7 @@ func episodeMetadata(episode shoko.Episode, itemType string) *pluginv1.MetadataI
 		ItemType:      itemType,
 		Title:         episode.Name,
 		OriginalTitle: episode.Name,
-		Overview:      episode.Description,
+		Overview:      sanitizeDescription(episode.Description),
 		ProviderIds:   idsStruct(episodeIDs(episode)),
 	}
 }
@@ -1145,25 +1401,10 @@ func idsStruct(ids map[string]string) *structpb.Struct {
 	return stringStruct(ids)
 }
 
-func episodeNumbers(episode shoko.Episode) (int, int) {
-	if episode.AniDB == nil {
-		return 1, 1
-	}
-	if strings.EqualFold(episode.AniDB.Type, "Episode") {
-		if episode.AniDB.EpisodeNumber > 0 {
-			return 1, episode.AniDB.EpisodeNumber
-		}
-		return 1, 1
-	}
-	if episode.AniDB.EpisodeNumber > 0 {
-		return 0, episode.AniDB.EpisodeNumber
-	}
-	return 0, 1
-}
-
 func diagnostics(values []topology.Diagnostic) []any {
-	result := make([]any, 0, len(values))
-	for _, value := range values {
+	limit := min(len(values), maxTaskOutputFailures)
+	result := make([]any, 0, limit)
+	for _, value := range values[:limit] {
 		result = append(result, map[string]any{
 			"file_id":  value.FileID,
 			"message":  value.Message,
