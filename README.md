@@ -1,8 +1,5 @@
 # Silo ShokoAnime VFS
 
-> [!WARNING]
-> **Deprecated.** This plugin is no longer maintained and may not work with current Silo releases. The repository is archived, and the plugin will be removed from the [Crowquillx catalog](https://github.com/crowquillx/crowquillx-silo-plugins). Existing installations keep running, but get no fixes or updates.
-
 Builds a virtual media library from Shoko's groups and series, with metadata and artwork for Silo. Media files are linked into a separate output directory.
 
 Part of [Crowquillx Silo Plugins](https://github.com/crowquillx/crowquillx-silo-plugins#install). Supports Linux amd64, Linux arm64 and macOS arm64, and both stable (5.x) and daily (6.x) Shoko Server. The plugin detects which one it is talking to, so upgrading Shoko needs no configuration change.
