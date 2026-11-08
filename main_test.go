@@ -70,6 +70,8 @@ func TestMetadataGetSeriesPrefersTypedGroupOverEpisodeFileToken(t *testing.T) {
 			fmt.Fprint(w, `[{"ids":{"id":7,"parentGroup":5,"aniDB":100},"name":"Member Series","aniDB":{"id":100,"type":"TV","airDate":"2014-07-06"}}]`)
 		case "/api/v3/Series/7/Tags", "/api/v3/Series/7/Cast", "/api/v3/Series/7/TMDB/Show":
 			fmt.Fprint(w, `[]`)
+		case "/api/plugin/season-posters/show-posters":
+			http.NotFound(w, r)
 		default:
 			t.Errorf("unexpected metadata request path = %q", r.URL.Path)
 			http.NotFound(w, r)
@@ -616,5 +618,96 @@ func TestTaskOutputBoundsLargeReconcileResponse(t *testing.T) {
 	}
 	if got := proto.Size(output); got >= 4*1024*1024 {
 		t.Fatalf("protobuf output size = %d, must fit the default gRPC receive limit", got)
+	}
+}
+
+const seasonPostersShowPoster = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+
+// A show poster chosen with the Season Posters Shoko plugin replaces the group
+// poster, which Shoko takes from the main series and so repeats season 1.
+func TestGroupShowUsesSeasonPostersShowPoster(t *testing.T) {
+	lookups := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/plugin/season-posters/show-posters":
+			lookups++
+			fmt.Fprintf(w, `{"shows":[{"key":"group:5","groupId":5,"mainSeriesId":7,"imageId":%q}]}`, seasonPostersShowPoster)
+		case "/api/v3/Group/5":
+			fmt.Fprint(w, groupWithImagesFixture)
+		case "/api/v3/Group/5/Series":
+			fmt.Fprint(w, `[{"ids":{"id":7,"parentGroup":5,"aniDB":100},"name":"Member Series","aniDB":{"id":100,"type":"TV","airDate":"2014-07-06"}}]`)
+		case "/api/v3/Series/7/Tags", "/api/v3/Series/7/Cast", "/api/v3/Series/7/TMDB/Show":
+			fmt.Fprint(w, `[]`)
+		default:
+			t.Errorf("unexpected request path = %q", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	metadata := showMetadataServer(t, server)
+	ctx := context.Background()
+	want := "shoko://image/" + seasonPostersShowPoster
+
+	response, err := metadata.GetMetadata(ctx, &pluginv1.GetMetadataRequest{ItemType: "series", ProviderId: "group:5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := response.GetItem().GetPosterPath(); got != want {
+		t.Fatalf("show poster = %q, want %q", got, want)
+	}
+
+	images, err := metadata.GetImages(ctx, &pluginv1.GetImagesRequest{ProviderId: "group:5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := images.GetImages()
+	if len(records) != 3 || records[0].GetKind() != "poster" || records[0].GetUrl() != want ||
+		records[1].GetUrl() != "shoko://image/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" {
+		t.Fatalf("show images = %#v", records)
+	}
+
+	specials, err := metadata.GetImages(ctx, &pluginv1.GetImagesRequest{ProviderId: "group:5:season:0", ItemType: "season"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if records := specials.GetImages(); len(records) != 2 || records[0].GetUrl() != "shoko://image/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" {
+		t.Fatalf("specials images = %#v, want the group's own images", records)
+	}
+
+	if lookups != 1 {
+		t.Fatalf("show poster list fetched %d times, want once while cached", lookups)
+	}
+}
+
+// Without the Season Posters plugin, or when it fails, the show keeps the
+// group poster.
+func TestGroupShowKeepsGroupPosterWithoutSeasonPosters(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/plugin/season-posters/show-posters":
+					w.WriteHeader(status)
+				case "/api/v3/Group/5":
+					fmt.Fprint(w, groupWithImagesFixture)
+				case "/api/v3/Group/5/Series":
+					fmt.Fprint(w, `[{"ids":{"id":7,"parentGroup":5,"aniDB":100},"name":"Member Series","aniDB":{"id":100,"type":"TV","airDate":"2014-07-06"}}]`)
+				case "/api/v3/Series/7/Tags", "/api/v3/Series/7/Cast", "/api/v3/Series/7/TMDB/Show":
+					fmt.Fprint(w, `[]`)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			metadata := showMetadataServer(t, server)
+
+			response, err := metadata.GetMetadata(context.Background(), &pluginv1.GetMetadataRequest{ItemType: "series", ProviderId: "group:5"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := response.GetItem().GetPosterPath(); got != "shoko://image/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" {
+				t.Fatalf("show poster = %q, want the group poster", got)
+			}
+		})
 	}
 }
