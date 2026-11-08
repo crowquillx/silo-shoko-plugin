@@ -86,8 +86,14 @@ func NewClient(cfg Config) (*Client, error) {
 }
 
 func (c *Client) resolve(endpoint string, query url.Values) string {
+	return c.resolvePath(apiPrefix+endpoint, query)
+}
+
+// resolvePath resolves a server path that is not under the v3 API, such as a
+// plugin's own route.
+func (c *Client) resolvePath(path string, query url.Values) string {
 	u := *c.baseURL
-	u.Path = strings.TrimRight(c.baseURL.Path, "/") + apiPrefix + endpoint
+	u.Path = strings.TrimRight(c.baseURL.Path, "/") + path
 	u.RawQuery = ""
 	if query != nil {
 		u.RawQuery = query.Encode()
@@ -96,7 +102,13 @@ func (c *Client) resolve(endpoint string, query url.Values) string {
 }
 
 func (c *Client) get(ctx context.Context, endpoint string, query url.Values, dst any) error {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.resolve(endpoint, query), nil)
+	return c.fetch(ctx, c.resolve(endpoint, query), endpoint, dst)
+}
+
+// fetch sends an authenticated GET to target and decodes the JSON response.
+// endpoint names the request in errors.
+func (c *Client) fetch(ctx context.Context, target, endpoint string, dst any) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return fmt.Errorf("shoko: create request: %w", err)
 	}
@@ -133,6 +145,39 @@ func (c *Client) get(ctx context.Context, endpoint string, query url.Values, dst
 		return fmt.Errorf("shoko: decode %s response: %w", endpoint, err)
 	}
 	return nil
+}
+
+// showPostersPath is the show poster list of the Season Posters Shoko plugin
+// (https://github.com/crowquillx/shoko-season-posters).
+const showPostersPath = "/api/plugin/season-posters/show-posters"
+
+// ShowPosters returns the show posters chosen with the Season Posters Shoko
+// plugin, as Shoko image IDs keyed by group ID. Shoko gives a group only its
+// main series' poster, so this is the only way for a show to have its own. A
+// server without the plugin answers 404, which yields an empty map and no
+// error.
+func (c *Client) ShowPosters(ctx context.Context) (map[int]string, error) {
+	var result struct {
+		Shows []struct {
+			GroupID *int   `json:"groupId"`
+			ImageID string `json:"imageId"`
+		} `json:"shows"`
+	}
+	err := c.fetch(ctx, c.resolvePath(showPostersPath, nil), showPostersPath, &result)
+	var httpErr *HTTPError
+	if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound {
+		return map[int]string{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	posters := make(map[int]string, len(result.Shows))
+	for _, show := range result.Shows {
+		if show.GroupID != nil && *show.GroupID > 0 && show.ImageID != "" {
+			posters[*show.GroupID] = show.ImageID
+		}
+	}
+	return posters, nil
 }
 
 func (c *Client) Version(ctx context.Context) (VersionSet, error) {

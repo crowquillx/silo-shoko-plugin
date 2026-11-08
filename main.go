@@ -52,6 +52,45 @@ type runtimeServer struct {
 	crawlCancel   context.CancelFunc
 	crawlErr      error
 	verifiedUntil time.Time
+
+	// Show posters from the Season Posters Shoko plugin, fetched at most once
+	// per showPosterTTL for the current client.
+	postersMu      sync.Mutex
+	posters        map[int]string
+	postersClient  *shoko.Client
+	postersFetched time.Time
+}
+
+// showPosterTTL bounds how long a show poster chosen with the Season Posters
+// Shoko plugin can be stale, and how often a server without that plugin is
+// asked again.
+const showPosterTTL = 10 * time.Minute
+
+// showPoster returns the opaque path of the poster chosen for a group with the
+// Season Posters Shoko plugin, or "" when there is none. A failed lookup is
+// logged and treated as none, so show metadata never depends on that plugin.
+func (s *runtimeServer) showPoster(ctx context.Context, client *shoko.Client, groupID int) string {
+	s.postersMu.Lock()
+	defer s.postersMu.Unlock()
+	now := time.Now()
+	if s.postersClient != client || now.Sub(s.postersFetched) >= showPosterTTL {
+		lookupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		posters, err := client.ShowPosters(lookupCtx)
+		cancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				return ""
+			}
+			fmt.Fprintf(os.Stderr, "shokoanime: using group posters, Season Posters lookup failed: %v\n", err)
+			posters = nil
+		}
+		s.posters, s.postersClient, s.postersFetched = posters, client, now
+	}
+	imageID := s.posters[groupID]
+	if !shokoImageUUIDPattern.MatchString(imageID) {
+		return ""
+	}
+	return shokoImageScheme + imageID
 }
 
 func (s *runtimeServer) GetManifest(context.Context, *pluginv1.GetManifestRequest) (*pluginv1.GetManifestResponse, error) {
@@ -393,6 +432,9 @@ func (s *metadataServer) GetMetadata(ctx context.Context, req *pluginv1.GetMetad
 			return nil, err
 		}
 		item := groupMetadata(group, req.GetItemType(), year)
+		if poster := s.runtime.showPoster(ctx, client, group.IDs.ID); poster != "" {
+			item.PosterPath = poster
+		}
 		if err := addShowDetails(ctx, client, item, members, group.IDs.MainSeries, s.clock()); err != nil {
 			return nil, err
 		}
@@ -582,7 +624,13 @@ func (s *metadataServer) GetImages(ctx context.Context, req *pluginv1.GetImagesR
 		if err != nil {
 			return nil, err
 		}
-		return imageRecords(group.Images), nil
+		records := imageRecords(group.Images)
+		// The specials season shares the group's images; only the show itself
+		// takes a show poster chosen with Season Posters.
+		if req.GetItemType() == "season" || strings.Contains(req.GetProviderId(), ":season:") {
+			return records, nil
+		}
+		return withShowPoster(records, s.runtime.showPoster(ctx, client, groupID)), nil
 	}
 	return &pluginv1.GetImagesResponse{}, nil
 }
@@ -648,6 +696,22 @@ func imageRecords(images shoko.Images) *pluginv1.GetImagesResponse {
 	add("banner", images.Banners)
 	add("logo", images.Logos)
 	add("disc", images.Discs)
+	return response
+}
+
+// withShowPoster puts a show poster chosen with the Season Posters Shoko plugin
+// first among a group's images, without listing it twice.
+func withShowPoster(response *pluginv1.GetImagesResponse, poster string) *pluginv1.GetImagesResponse {
+	if poster == "" {
+		return response
+	}
+	images := []*pluginv1.ImageRecord{{Kind: "poster", Url: poster}}
+	for _, image := range response.GetImages() {
+		if image.GetUrl() != poster {
+			images = append(images, image)
+		}
+	}
+	response.Images = images
 	return response
 }
 

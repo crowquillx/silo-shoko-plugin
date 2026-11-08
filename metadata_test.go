@@ -245,6 +245,10 @@ func showServer(t *testing.T, stable bool, failCast bool) *httptest.Server {
 	}
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/api/v3")
+		if path == "/api/plugin/season-posters/show-posters" {
+			http.NotFound(w, r)
+			return
+		}
 		if failCast && strings.HasSuffix(path, "/Cast") {
 			w.WriteHeader(http.StatusInternalServerError)
 			return

@@ -332,3 +332,37 @@ func TestNormalizedModelsSurviveRoundTrip(t *testing.T) {
 		t.Fatalf("decoded image = %#v", decodedImage)
 	}
 }
+
+func TestShowPostersReadsTheSeasonPostersList(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/plugin/season-posters/show-posters" || r.Header.Get("apikey") != "test-key" {
+			t.Errorf("request = %s apikey=%q", r.URL.Path, r.Header.Get("apikey"))
+		}
+		fmt.Fprint(w, `{"shows":[{"key":"group:933","groupId":933,"mainSeriesId":102,"imageId":"78141125-0278-55f6-8034-32152fa1a5ed"},{"key":"series:4","groupId":null,"mainSeriesId":4,"imageId":"11111111-1111-4111-8111-111111111111"}]}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{BaseURL: server.URL, APIKey: "test-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	posters, err := client.ShowPosters(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(posters) != 1 || posters[933] != "78141125-0278-55f6-8034-32152fa1a5ed" {
+		t.Fatalf("posters = %#v", posters)
+	}
+}
+
+func TestShowPostersWithoutThePlugin(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	client, err := NewClient(Config{BaseURL: server.URL, APIKey: "test-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	posters, err := client.ShowPosters(context.Background())
+	if err != nil || len(posters) != 0 {
+		t.Fatalf("posters = %#v, err = %v", posters, err)
+	}
+}

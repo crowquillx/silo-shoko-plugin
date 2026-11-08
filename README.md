@@ -29,6 +29,10 @@ Shows get their dates, status, genres, studios, cast and AniDB rating from all o
 
 The AniDB rating appears in Silo once an administrator turns on the AniDB rating source the plugin declares.
 
+## Posters
+
+Each season uses its Shoko series' preferred poster. Shoko gives a group only its main series' poster, so on its own a show repeats its first season's poster. With the [Season Posters](https://github.com/crowquillx/shoko-season-posters) Shoko plugin installed, a show uses the show poster chosen there in its own show poster mode, and keeps the group poster otherwise. The plugin reads that list at most every 10 minutes. A changed poster appears once the show's metadata is refreshed in Silo. Specials keep the group poster.
+
 ## Theme songs
 
 Theme songs are kept in sync between your media folders and the VFS, in both directions:
