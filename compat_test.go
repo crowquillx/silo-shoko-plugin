@@ -397,3 +397,132 @@ func TestConfigureStopsRunningBackgroundCrawl(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A poll must answer quickly while a crawl runs, and once the crawl has built
+// the VFS, a source without a marker must still get the build scanned.
+func TestFirstPollAfterTheInitialCrawlScansTheWholeVFS(t *testing.T) {
+	generation := shokoGenerations[1]
+	release := make(chan struct{})
+	handler := generation.handler(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/1/File") {
+			<-release
+		}
+		handler.ServeHTTP(w, r)
+	}))
+	defer server.Close()
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	source, _ := mediaFixture(t)
+	outputRoot := filepath.Join(t.TempDir(), "vfs")
+	runtime := configuredRuntime(t, server.URL, compatAPIKey, fmt.Sprintf(`{"1":%q}`, source), outputRoot)
+	task := &scheduledTaskServer{runtime: runtime, stepBudget: 20 * time.Millisecond}
+	scanner := &scanSourceServer{runtime: runtime}
+	if _, err := task.Run(context.Background(), &pluginv1.RunScheduledTaskRequest{TaskKey: "reconcile"}); err != nil {
+		t.Fatal(err)
+	}
+
+	during := pollWithin(t, scanner, "", time.Second)
+	if len(during.GetSourcePaths()) != 0 || during.GetNextMarker() != "" {
+		t.Fatalf("poll during the crawl = paths %v, marker %q; want none and no marker", during.GetSourcePaths(), during.GetNextMarker())
+	}
+
+	close(release)
+	waitForBackgroundCrawl(t, runtime)
+	first := pollWithin(t, scanner, "", time.Second)
+	// Silo scans each reported path's parent folder, here the library root.
+	if got := first.GetSourcePaths(); len(got) != 1 || filepath.Dir(got[0]) != outputRoot {
+		t.Fatalf("first poll after the crawl = paths %v, want one path directly in %s", got, outputRoot)
+	}
+	if first.GetNextMarker() == "" || first.GetNextMarker() == "0" {
+		t.Fatalf("first poll marker = %q, want the journal tail", first.GetNextMarker())
+	}
+	next := pollWithin(t, scanner, first.GetNextMarker(), time.Second)
+	if len(next.GetSourcePaths()) != 0 || next.GetNextMarker() != first.GetNextMarker() {
+		t.Fatalf("next poll = paths %v, marker %q", next.GetSourcePaths(), next.GetNextMarker())
+	}
+}
+
+// A crawl left pending, for example by a restart, is finished in the
+// background; the poll neither blocks on it nor loses its changes.
+func TestPollHandsAPendingCrawlToTheBackground(t *testing.T) {
+	generation := shokoGenerations[1]
+	release := make(chan struct{})
+	handler := generation.handler(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/1/File") {
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		handler.ServeHTTP(w, r)
+	}))
+	defer server.Close()
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	source, _ := mediaFixture(t)
+	outputRoot := filepath.Join(t.TempDir(), "vfs")
+	runtime := configuredRuntime(t, server.URL, compatAPIKey, fmt.Sprintf(`{"1":%q}`, source), outputRoot)
+	task := &scheduledTaskServer{runtime: runtime, stepBudget: 20 * time.Millisecond}
+	scanner := &scanSourceServer{runtime: runtime}
+	start := pollWithin(t, scanner, "", time.Second)
+	if start.GetNextMarker() != "0" {
+		t.Fatalf("first poll on an empty VFS = marker %q, want 0", start.GetNextMarker())
+	}
+	if _, err := task.Run(context.Background(), &pluginv1.RunScheduledTaskRequest{TaskKey: "reconcile"}); err != nil {
+		t.Fatal(err)
+	}
+	runtime.cancelBackgroundCrawl()
+
+	during := pollWithin(t, scanner, "0", time.Second)
+	if len(during.GetSourcePaths()) != 0 || during.GetNextMarker() != "0" {
+		t.Fatalf("poll with a pending crawl = paths %v, marker %q", during.GetSourcePaths(), during.GetNextMarker())
+	}
+	if !runtime.backgroundCrawlRunning() {
+		t.Fatal("the poll did not hand the pending crawl to the background")
+	}
+
+	close(release)
+	waitForBackgroundCrawl(t, runtime)
+	after := pollWithin(t, scanner, "0", time.Second)
+	if len(after.GetSourcePaths()) != 1 || filepath.Dir(filepath.Dir(filepath.Dir(after.GetSourcePaths()[0]))) != outputRoot {
+		t.Fatalf("poll after the crawl = paths %v, want the new link", after.GetSourcePaths())
+	}
+}
+
+func pollWithin(t *testing.T, scanner *scanSourceServer, marker string, limit time.Duration) *pluginv1.PollChangesResponse {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), limit)
+	defer cancel()
+	response, err := scanner.PollChanges(ctx, &pluginv1.PollChangesRequest{CapabilityId: "shoko", Marker: marker})
+	if err != nil {
+		t.Fatalf("poll with marker %q: %v", marker, err)
+	}
+	return response
+}
+
+func waitForBackgroundCrawl(t *testing.T, runtime *runtimeServer) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for runtime.backgroundCrawlRunning() {
+		if time.Now().After(deadline) {
+			t.Fatal("background crawl did not finish")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := runtime.takeBackgroundCrawlError(); err != nil {
+		t.Fatal(err)
+	}
+}

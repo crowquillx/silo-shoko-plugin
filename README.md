@@ -15,7 +15,9 @@ Part of [Crowquillx Silo Plugins](https://github.com/crowquillx/crowquillx-silo-
 ```
 
 4. Test the connection, which checks the URL, API key and every mapped folder, then select **Save config**. Enable the plugin's **Shoko VFS changes** Autoscan source and bind the **Reconcile Shoko VFS** scheduled task.
-5. Run **Reconcile Shoko VFS** to generate the library, then create a Silo TV library rooted at the VFS output root. On a large library the task returns before the crawl ends and the crawl keeps running in the background; run the task again to see its status. Keep the Autoscan source enabled to scan future changes.
+5. Run **Reconcile Shoko VFS** to generate the library. On a large library the task returns before the crawl ends and the crawl keeps running in the background; run the task again to see its status. When it reports `complete`, create a Silo TV library rooted at the VFS output root. Silo scans a new library straight away, so a library created before the crawl finishes starts empty: scan it once from its menu after the crawl. Keep the Autoscan source enabled to scan future changes.
+
+The Autoscan source picks up changes from the moment it is added. If it is added after the VFS is built, or its first poll fails, its first successful poll scans the whole library once. Polls never wait for a crawl: a crawl still in progress, including one left unfinished by a restart, continues in the background, and its changes are scanned when it finishes.
 
 ## Library layout
 

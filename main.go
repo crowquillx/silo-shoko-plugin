@@ -896,36 +896,36 @@ func (s *scanSourceServer) PollChanges(ctx context.Context, req *pluginv1.PollCh
 		return nil, err
 	}
 	marker := strings.TrimSpace(req.GetMarker())
-	if marker == "" {
-		marker, err = reconciler.CurrentMarker(ctx)
-		if err != nil {
-			return nil, err
-		}
-	}
 	s.runtime.mu.RLock()
 	engine := s.runtime.engine
 	s.runtime.mu.RUnlock()
+	// Crawl work never runs inside a poll. Writing a large library's links can
+	// take longer than the host's poll deadline, and a poll that times out
+	// leaves the source without a marker. A pending crawl is handed to the
+	// background crawl instead.
 	if engine != nil && !s.runtime.backgroundCrawlRunning() {
 		pending, err := engine.Pending(ctx)
 		if err != nil {
 			return nil, err
 		}
 		if pending {
-			outcome, err := engine.Step(ctx, 4*time.Minute+30*time.Second)
-			if err != nil {
-				return nil, err
-			}
-			logReconcileFailures(outcome.Result)
+			s.runtime.startBackgroundCrawl(engine)
 		}
+	}
+	// A running crawl holds the VFS lock for long stretches and journals nothing
+	// until it commits, so answer straight away and keep the marker.
+	if s.runtime.backgroundCrawlRunning() {
+		return &pluginv1.PollChangesResponse{NextMarker: marker}, nil
 	}
 	// Pick up themes written into the VFS since the last poll, so they reach the
 	// media folders without waiting for the next reconcile.
-	if !s.runtime.backgroundCrawlRunning() {
-		if themes, err := reconciler.SyncThemes(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "shokoanime: theme sync failed: %v\n", err)
-		} else {
-			logThemeFailures(themes)
-		}
+	if themes, err := reconciler.SyncThemes(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "shokoanime: theme sync failed: %v\n", err)
+	} else {
+		logThemeFailures(themes)
+	}
+	if marker == "" {
+		return firstPoll(ctx, reconciler)
 	}
 	paths, nextMarker, err := reconciler.PollChanges(ctx, marker)
 	if err != nil {
@@ -935,6 +935,27 @@ func (s *scanSourceServer) PollChanges(ctx context.Context, req *pluginv1.PollCh
 		SourcePaths: paths,
 		NextMarker:  nextMarker,
 	}, nil
+}
+
+// firstPoll starts the source at the journal's tail. If the VFS already has
+// links, the host may never have scanned them: the library could have been
+// created before the crawl finished, or an earlier first poll may have failed.
+// The whole VFS is then scanned once; files the host already has are unchanged
+// and cheap to scan.
+//
+// Silo scans the parent folder of each reported path and refuses a subtree
+// change for a library root, so the journal file, which sits directly in the
+// root, is reported to get a scan of the whole library.
+func firstPoll(ctx context.Context, reconciler *vfs.Reconciler) (*pluginv1.PollChangesResponse, error) {
+	marker, err := reconciler.CurrentMarker(ctx)
+	if err != nil {
+		return nil, err
+	}
+	response := &pluginv1.PollChangesResponse{NextMarker: marker}
+	if marker != "0" {
+		response.SourcePaths = []string{vfs.ChangeJournalPath(reconciler.Root())}
+	}
+	return response, nil
 }
 
 func loadManifest() (*pluginv1.PluginManifest, error) {
