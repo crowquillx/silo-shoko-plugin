@@ -216,8 +216,8 @@ func (e *Engine) Step(ctx context.Context, budget time.Duration) (Outcome, error
 				}
 			case phaseReady:
 				// Do not begin a large filesystem commit at the tail end of a
-				// scheduled-task budget. PollChanges will pick up the ready state
-				// with its five-minute host deadline.
+				// scheduled-task budget. The commit does not stop at the budget,
+				// so the background crawl, which has no deadline, picks it up.
 				if deadline, ok := stepCtx.Deadline(); ok && time.Until(deadline) < 1500*time.Millisecond {
 					outcome = e.progress(state)
 					return nil
