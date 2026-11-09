@@ -286,6 +286,26 @@ type Episode struct {
 	TMDB json.RawMessage `json:"tmdb,omitempty"`
 }
 
+// TMDBTitles returns the titles of the linked TMDB episodes, in Shoko's order.
+func (e Episode) TMDBTitles() []string {
+	if len(e.TMDB) == 0 {
+		return nil
+	}
+	var data struct {
+		Episodes []struct {
+			Title string `json:"title"`
+		} `json:"episodes"`
+	}
+	if err := json.Unmarshal(e.TMDB, &data); err != nil {
+		return nil
+	}
+	titles := make([]string, 0, len(data.Episodes))
+	for _, episode := range data.Episodes {
+		titles = append(titles, episode.Title)
+	}
+	return titles
+}
+
 // TMDBRating returns the community rating of the first linked TMDB episode
 // that has one.
 func (e Episode) TMDBRating() (Rating, bool) {

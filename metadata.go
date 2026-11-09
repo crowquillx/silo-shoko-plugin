@@ -237,7 +237,41 @@ func anidbRatings(members []shoko.Series) *structpb.Struct {
 	return ratings
 }
 
-// titleAliases turns the main series' AniDB titles into Silo aliases.
+// setTitleLanguage marks the show's title as being in the library's language.
+// The title is Shoko's name for the group or series, which follows Shoko's own
+// language settings. Without a language, Silo instead shows the first alias in
+// the library's language, which is often an AniDB synonym or abbreviation such
+// as "AoT". The original title becomes the AniDB main title.
+func setTitleLanguage(item *pluginv1.MetadataItem, language string, series shoko.Series) {
+	if base := baseLanguage(language); base != "" && strings.TrimSpace(item.Title) != "" {
+		item.TitleLanguage = base
+	}
+	if series.AniDB == nil {
+		return
+	}
+	for _, title := range series.AniDB.Titles {
+		if strings.EqualFold(title.Type, "main") && strings.TrimSpace(title.Name) != "" {
+			item.OriginalTitle = strings.TrimSpace(title.Name)
+			item.OriginalLanguage = baseLanguage(aliasLanguage(title.Language))
+			return
+		}
+	}
+}
+
+// baseLanguage reduces a language tag such as "en-US" or "ja-Latn" to its base
+// language.
+func baseLanguage(tag string) string {
+	base, _, _ := strings.Cut(strings.ToLower(strings.TrimSpace(tag)), "-")
+	base, _, _ = strings.Cut(base, "_")
+	return base
+}
+
+// aliasKindOrder lists official titles first, so a client that shows the first
+// alias in a language shows the official one rather than a synonym.
+var aliasKindOrder = map[string]int{"localized": 0, "original": 1, "alternate": 2}
+
+// titleAliases turns the main series' AniDB titles into Silo aliases, official
+// titles first.
 func titleAliases(series shoko.Series) []*pluginv1.TitleAlias {
 	if series.AniDB == nil {
 		return nil
@@ -265,6 +299,9 @@ func titleAliases(series shoko.Series) []*pluginv1.TitleAlias {
 		seen[key] = struct{}{}
 		aliases = append(aliases, &pluginv1.TitleAlias{Title: name, Language: language, Kind: kind})
 	}
+	sort.SliceStable(aliases, func(i, j int) bool {
+		return aliasKindOrder[aliases[i].GetKind()] < aliasKindOrder[aliases[j].GetKind()]
+	})
 	return aliases
 }
 
@@ -437,7 +474,7 @@ func episodeRecord(season, number int, episode shoko.Episode) *pluginv1.EpisodeR
 	record := &pluginv1.EpisodeRecord{
 		SeasonNumber:  int32(season),
 		EpisodeNumber: int32(number),
-		Title:         episode.Name,
+		Title:         episodeTitle(episode),
 		Overview:      sanitizeDescription(episode.Description),
 		StillPath:     episodeStill(episode.Images),
 		ProviderId:    fmt.Sprintf("episode:%d", episode.IDs.ID),
@@ -454,6 +491,25 @@ func episodeRecord(season, number int, episode shoko.Episode) *pluginv1.EpisodeR
 		}
 	}
 	return record
+}
+
+// placeholderEpisodeTitle matches the names AniDB gives episodes whose real
+// title it does not know yet, such as "Episode 12" or "TBA".
+var placeholderEpisodeTitle = regexp.MustCompile(`(?i)^\s*(episode\s*\d+(\.\d+)?|tba|tbd|to be announced)\s*$`)
+
+// episodeTitle is Shoko's name for the episode, unless that is a placeholder
+// and a linked TMDB episode has a real title.
+func episodeTitle(episode shoko.Episode) string {
+	name := strings.TrimSpace(episode.Name)
+	if name != "" && !placeholderEpisodeTitle.MatchString(name) {
+		return name
+	}
+	for _, title := range episode.TMDBTitles() {
+		if title = strings.TrimSpace(title); title != "" && !placeholderEpisodeTitle.MatchString(title) {
+			return title
+		}
+	}
+	return name
 }
 
 // episodeStill picks an episode's still. Stable servers list stills as

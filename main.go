@@ -464,6 +464,7 @@ func (s *metadataServer) GetMetadata(ctx context.Context, req *pluginv1.GetMetad
 		if err := addShowDetails(ctx, client, item, members, group.IDs.MainSeries, s.clock()); err != nil {
 			return nil, err
 		}
+		setTitleLanguage(item, req.GetLanguage(), mainSeries(members, group.IDs.MainSeries))
 		return &pluginv1.GetMetadataResponse{Item: item}, nil
 	}
 	seriesID := token.SeriesID
@@ -491,6 +492,7 @@ func (s *metadataServer) GetMetadata(ctx context.Context, req *pluginv1.GetMetad
 	if err := addShowDetails(ctx, client, item, []shoko.Series{series}, series.IDs.ID, s.clock()); err != nil {
 		return nil, err
 	}
+	setTitleLanguage(item, req.GetLanguage(), series)
 	return &pluginv1.GetMetadataResponse{Item: item}, nil
 }
 
@@ -1457,7 +1459,7 @@ func episodeSearchResult(episode shoko.Episode, itemType string) *pluginv1.Provi
 	return &pluginv1.ProviderSearchResult{
 		ProviderId:    fmt.Sprintf("episode:%d", episode.IDs.ID),
 		ItemType:      itemType,
-		Title:         episode.Name,
+		Title:         episodeTitle(episode),
 		OriginalTitle: episode.Name,
 		Overview:      sanitizeDescription(episode.Description),
 		ProviderIds:   idsStruct(episodeIDs(episode)),
@@ -1507,7 +1509,7 @@ func episodeMetadata(episode shoko.Episode, itemType string) *pluginv1.MetadataI
 	return &pluginv1.MetadataItem{
 		ProviderId:    fmt.Sprintf("episode:%d", episode.IDs.ID),
 		ItemType:      itemType,
-		Title:         episode.Name,
+		Title:         episodeTitle(episode),
 		OriginalTitle: episode.Name,
 		Overview:      sanitizeDescription(episode.Description),
 		ProviderIds:   idsStruct(episodeIDs(episode)),
