@@ -27,7 +27,7 @@ Regular episodes go in their series' season, and specials, credits, trailers and
 
 ## Metadata
 
-Shows get their dates, status, genres, studios, cast and AniDB rating from all of their Shoko series, and their title aliases from the group's main series. Genres are the tags Shoko classifies as genres. The content rating is the strictest US rating of the linked TMDB shows, or `18+` when AniDB marks a series restricted. Seasons get their series' overview and air date, and episodes their air date, still and TMDB rating.
+Shows get their dates, status, genres, studios, cast and AniDB rating from all of their Shoko series, and their title aliases from the group's main series. A show's title is Shoko's name for the group, so Shoko's language settings decide it; the plugin tells Silo it is in the library's language, so Silo shows it instead of an AniDB synonym. The original title is the AniDB main title. Episodes use Shoko's episode titles, except that AniDB placeholders such as `Episode 12` or `TBA` are replaced by the linked TMDB episode's title when it has a real one. Genres are the tags Shoko classifies as genres. The content rating is the strictest US rating of the linked TMDB shows, or `18+` when AniDB marks a series restricted. Seasons get their series' overview and air date, and episodes their air date, still and TMDB rating.
 
 The AniDB rating appears in Silo once an administrator turns on the AniDB rating source the plugin declares.
 

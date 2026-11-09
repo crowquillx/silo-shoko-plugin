@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -95,7 +97,8 @@ func TestTitleAliasesFromAniDB(t *testing.T) {
 		{Name: " ", Language: "en", Type: "Synonym"},
 	}}}
 	got := titleAliases(series)
-	want := []string{"Shingeki no Kyojin|ja-Latn|original", "Attack on Titan|en|localized", "進撃の巨人|ja|localized", "AoT|en|alternate"}
+	// Official titles come first, then the main title, then synonyms.
+	want := []string{"Attack on Titan|en|localized", "進撃の巨人|ja|localized", "Shingeki no Kyojin|ja-Latn|original", "AoT|en|alternate"}
 	if len(got) != len(want) {
 		t.Fatalf("aliases = %v", got)
 	}
@@ -317,7 +320,12 @@ func TestShowMetadataOnBothShokoGenerations(t *testing.T) {
 			if len(item.GetPeople()) != 2 || item.GetPeople()[0].GetKind() != "actor" || item.GetPeople()[0].GetPhotoPath() == "" || item.GetPeople()[1].GetKind() != "director" {
 				t.Errorf("people = %#v", item.GetPeople())
 			}
-			if aliases := item.GetTitleAliases(); len(aliases) != 2 || aliases[0].GetTitle() != "First" || aliases[0].GetKind() != "original" || !item.GetTitleAliasesComplete() {
+			aliases := item.GetTitleAliases()
+			hasMain := false
+			for _, alias := range aliases {
+				hasMain = hasMain || (alias.GetTitle() == "First" && alias.GetKind() == "original")
+			}
+			if len(aliases) != 2 || !hasMain || !item.GetTitleAliasesComplete() {
 				t.Errorf("aliases = %#v complete=%v", aliases, item.GetTitleAliasesComplete())
 			}
 
@@ -377,4 +385,60 @@ func TestManifestDeclaresAniDBRatingSource(t *testing.T) {
 		t.Fatalf("rating sources = %#v", capability.GetMetadata().AsMap()["rating_sources"])
 	}
 	t.Fatal("no metadata capability")
+}
+
+func TestShowTitleIsMarkedInTheLibraryLanguage(t *testing.T) {
+	series := shoko.Series{AniDB: &shoko.AnimeMetadata{Titles: []shoko.Title{
+		{Name: "Advancing Giants", Language: "en", Type: "Synonym"},
+		{Name: "Shingeki no Kyojin", Language: "x-jat", Type: "Main"},
+		{Name: "Attack on Titan", Language: "en", Type: "Official"},
+		{Name: "AoT", Language: "en", Type: "Short"},
+	}}}
+	item := &pluginv1.MetadataItem{Title: "Attack on Titan", OriginalTitle: "Attack on Titan"}
+
+	setTitleLanguage(item, "en-US", series)
+
+	if item.GetTitleLanguage() != "en" || item.GetOriginalTitle() != "Shingeki no Kyojin" || item.GetOriginalLanguage() != "ja" {
+		t.Fatalf("title %q (%s), original %q (%s)", item.GetTitle(), item.GetTitleLanguage(), item.GetOriginalTitle(), item.GetOriginalLanguage())
+	}
+	aliases := titleAliases(series)
+	if len(aliases) == 0 || aliases[0].GetTitle() != "Attack on Titan" || aliases[0].GetKind() != "localized" {
+		t.Fatalf("first alias = %v, want the official title", aliases)
+	}
+	for i, alias := range aliases[1:] {
+		if aliasKindOrder[alias.GetKind()] < aliasKindOrder[aliases[i].GetKind()] {
+			t.Fatalf("aliases out of order: %v", aliases)
+		}
+	}
+}
+
+func TestShowTitleWithoutALibraryLanguageKeepsNoLanguage(t *testing.T) {
+	item := &pluginv1.MetadataItem{Title: "Bocchi the Rock!"}
+	setTitleLanguage(item, "", shoko.Series{})
+	if item.GetTitleLanguage() != "" {
+		t.Fatalf("title language = %q", item.GetTitleLanguage())
+	}
+}
+
+func TestEpisodeTitleReplacesAniDBPlaceholders(t *testing.T) {
+	withTMDB := func(name, tmdb string) shoko.Episode {
+		return shoko.Episode{Name: name, TMDB: json.RawMessage(`{"Episodes":[{"Title":` + strconv.Quote(tmdb) + `}]}`)}
+	}
+	tests := []struct {
+		episode shoko.Episode
+		want    string
+	}{
+		{withTMDB("A Good Word", "Something Else"), "A Good Word"},
+		{withTMDB("Episode 12", "The Return"), "The Return"},
+		{withTMDB("TBA", "After Dark"), "After Dark"},
+		{withTMDB("Episode 5", "Episode 5"), "Episode 5"},
+		{shoko.Episode{Name: "Episode 3"}, "Episode 3"},
+		{withTMDB("Episode 1.5", "Recap"), "Recap"},
+		{withTMDB("Episode Zero", "Prologue"), "Episode Zero"},
+	}
+	for _, tt := range tests {
+		if got := episodeTitle(tt.episode); got != tt.want {
+			t.Errorf("episodeTitle(%q) = %q, want %q", tt.episode.Name, got, tt.want)
+		}
+	}
 }
