@@ -26,6 +26,7 @@ import (
 	sdkruntime "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/runtime"
 	"github.com/crowquillx/silo-shoko-plugin/internal/config"
 	"github.com/crowquillx/silo-shoko-plugin/internal/identity"
+	"github.com/crowquillx/silo-shoko-plugin/internal/imagestore"
 	"github.com/crowquillx/silo-shoko-plugin/internal/reconcile"
 	"github.com/crowquillx/silo-shoko-plugin/internal/shoko"
 	"github.com/crowquillx/silo-shoko-plugin/internal/topology"
@@ -52,6 +53,8 @@ type runtimeServer struct {
 	crawlCancel   context.CancelFunc
 	crawlErr      error
 	verifiedUntil time.Time
+	// images holds the S3 copies of Shoko images in the S3 image mode.
+	images *imagestore.Store
 
 	// Show posters from the Season Posters Shoko plugin, fetched at most once
 	// per showPosterTTL for the current client.
@@ -123,12 +126,27 @@ func (s *runtimeServer) Configure(_ context.Context, req *pluginv1.ConfigureRequ
 	if err != nil {
 		return nil, err
 	}
+	var images *imagestore.Store
+	if cfg.ImageMode == config.ImageS3 {
+		images, err = imagestore.New(imagestore.Config{
+			Endpoint:        cfg.ImageS3.Endpoint,
+			Region:          cfg.ImageS3.Region,
+			Bucket:          cfg.ImageS3.Bucket,
+			Prefix:          cfg.ImageS3.Prefix,
+			AccessKeyID:     cfg.ImageS3.AccessKeyID,
+			SecretAccessKey: cfg.ImageS3.SecretAccessKey,
+		}, client.Image)
+		if err != nil {
+			return nil, err
+		}
+	}
 	s.cancelBackgroundCrawl()
 	s.mu.Lock()
 	s.cfg = cfg
 	s.client = client
 	s.reconciler = reconciler
 	s.engine = engine
+	s.images = images
 	s.verifiedUntil = time.Time{}
 	s.mu.Unlock()
 	return &pluginv1.ConfigureResponse{}, nil
@@ -264,6 +282,14 @@ func (s *runtimeServer) verifyConnection(ctx context.Context) error {
 		}
 		if info, err := os.Stat(root); err != nil || !info.IsDir() {
 			return fmt.Errorf("shokoanime: mapped path %q for folder %d is not a directory visible to Silo", root, id)
+		}
+	}
+	s.mu.RLock()
+	images := s.images
+	s.mu.RUnlock()
+	if images != nil {
+		if err := images.Check(ctx); err != nil {
+			return fmt.Errorf("shokoanime: %w", err)
 		}
 	}
 	s.mu.Lock()
@@ -635,30 +661,71 @@ func (s *metadataServer) GetImages(ctx context.Context, req *pluginv1.GetImagesR
 	return &pluginv1.GetImagesResponse{}, nil
 }
 
-// ResolveImageURL resolves one scheme-stripped image/<uuid> path to the
-// authenticated Shoko image endpoint. Silo routes shoko:// paths to this
-// capability after removing the scheme. Invalid paths resolve to an empty URL,
-// and malformed input is never reflected into an error or URL.
-func (s *metadataServer) ResolveImageURL(_ context.Context, req *pluginv1.ResolveImageURLRequest) (*pluginv1.ResolveImageURLResponse, error) {
+// ResolveImageURL resolves one scheme-stripped image/<uuid> path to a URL Silo
+// can download: Shoko's own, the public image URL, or a link to the S3 copy,
+// depending on the image mode. Invalid paths resolve to an empty URL, and
+// malformed input is never reflected into an error or URL.
+func (s *metadataServer) ResolveImageURL(ctx context.Context, req *pluginv1.ResolveImageURLRequest) (*pluginv1.ResolveImageURLResponse, error) {
 	cfg, _, _, err := s.runtime.state()
 	if err != nil {
 		return nil, err
 	}
-	return &pluginv1.ResolveImageURLResponse{Url: resolveShokoImagePath(req.GetPath(), cfg.BaseURL)}, nil
+	return &pluginv1.ResolveImageURLResponse{Url: s.runtime.imageURL(ctx, cfg, req.GetPath())}, nil
 }
 
 // ResolveImageURLs resolves a batch of scheme-stripped image paths. Paths that
 // do not strictly match image/<uuid> map to an empty URL.
-func (s *metadataServer) ResolveImageURLs(_ context.Context, req *pluginv1.ResolveImageURLsRequest) (*pluginv1.ResolveImageURLsResponse, error) {
+func (s *metadataServer) ResolveImageURLs(ctx context.Context, req *pluginv1.ResolveImageURLsRequest) (*pluginv1.ResolveImageURLsResponse, error) {
 	cfg, _, _, err := s.runtime.state()
 	if err != nil {
 		return nil, err
 	}
-	urls := make(map[string]string, len(req.GetPaths()))
-	for _, path := range req.GetPaths() {
-		urls[path] = resolveShokoImagePath(path, cfg.BaseURL)
+	paths := req.GetPaths()
+	resolved := make([]string, len(paths))
+	// S3 copies are made on first use, so a batch is resolved a few at a time.
+	limit := make(chan struct{}, imageCopyConcurrency)
+	var wg sync.WaitGroup
+	for i, path := range paths {
+		wg.Add(1)
+		limit <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-limit }()
+			resolved[i] = s.runtime.imageURL(ctx, cfg, path)
+		}()
+	}
+	wg.Wait()
+	urls := make(map[string]string, len(paths))
+	for i, path := range paths {
+		urls[path] = resolved[i]
 	}
 	return &pluginv1.ResolveImageURLsResponse{Urls: urls}, nil
+}
+
+// imageCopyConcurrency bounds how many images one batch copies to S3 at once.
+const imageCopyConcurrency = 4
+
+// imageURL resolves one image path for the configured image mode. When the S3
+// copy fails, Shoko's own URL is returned, so clients that can reach Shoko
+// still show the image.
+func (s *runtimeServer) imageURL(ctx context.Context, cfg config.Connection, barePath string) string {
+	imageID, ok := shokoImageID(barePath)
+	if !ok {
+		return ""
+	}
+	if cfg.ImageMode == config.ImageS3 {
+		s.mu.RLock()
+		images := s.images
+		s.mu.RUnlock()
+		if images != nil {
+			link, err := images.URL(ctx, imageID)
+			if err == nil {
+				return link
+			}
+			fmt.Fprintf(os.Stderr, "shokoanime: could not copy image %s to S3: %v\n", imageID, err)
+		}
+	}
+	return strings.TrimRight(cfg.ImageURLBase(), "/") + shokoImageEndpointPrefix + imageID
 }
 
 // imageRecords converts an entity's image set into resolver-addressed image
@@ -1324,17 +1391,26 @@ func applyArtwork(item *pluginv1.MetadataItem, images shoko.Images) {
 	}
 }
 
-// resolveShokoImagePath strictly resolves the scheme-stripped image path
-// supplied by Silo against the configured Shoko base URL. Anything that is not
-// exactly a path imagePath produces resolves to an empty string. The base URL is
-// validated at configure time and can carry no credentials, query, or
-// fragment.
-func resolveShokoImagePath(barePath, baseURL string) string {
+// shokoImageID strictly extracts the Shoko image ID from a scheme-stripped
+// image path supplied by Silo. Anything that is not exactly a path imagePath
+// produces is rejected.
+func shokoImageID(barePath string) (string, bool) {
 	if !strings.HasPrefix(barePath, shokoImageBarePrefix) {
-		return ""
+		return "", false
 	}
 	imageID := strings.TrimPrefix(barePath, shokoImageBarePrefix)
 	if !shokoImageUUIDPattern.MatchString(imageID) && !shokoStableImagePattern.MatchString(imageID) {
+		return "", false
+	}
+	return imageID, true
+}
+
+// resolveShokoImagePath resolves an image path against a Shoko base URL, which
+// is validated at configure time and can carry no credentials, query, or
+// fragment. Invalid paths resolve to an empty string.
+func resolveShokoImagePath(barePath, baseURL string) string {
+	imageID, ok := shokoImageID(barePath)
+	if !ok {
 		return ""
 	}
 	return strings.TrimRight(baseURL, "/") + shokoImageEndpointPrefix + imageID

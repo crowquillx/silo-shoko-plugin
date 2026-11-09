@@ -679,3 +679,45 @@ func decodePage[T any](raw json.RawMessage) ([]T, int, error) {
 	}
 	return page.List, page.Total, nil
 }
+
+// maxImageBytes bounds one downloaded image. Shoko's largest artwork, such as
+// a 4K backdrop, is a few MiB.
+const maxImageBytes = 32 << 20
+
+// Image downloads one image by its Shoko ID, as image paths name it: a UUID on
+// daily servers, or Source/Type/ID on stable ones. It returns the bytes and the
+// content type Shoko reported.
+func (c *Client) Image(ctx context.Context, imageID string) ([]byte, string, error) {
+	endpoint := "/Image/" + imageID
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.resolve(endpoint, nil), nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("shoko: create request: %w", err)
+	}
+	request.Header.Set("apikey", c.apiKey)
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, "", ctx.Err()
+		}
+		return nil, "", fmt.Errorf("shoko: request failed: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, "", &HTTPError{Endpoint: endpoint, StatusCode: response.StatusCode}
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxImageBytes+1))
+	if err != nil {
+		return nil, "", fmt.Errorf("shoko: read image: %w", err)
+	}
+	if len(body) > maxImageBytes {
+		return nil, "", errors.New("shoko: image exceeds 32 MiB limit")
+	}
+	if len(body) == 0 {
+		return nil, "", fmt.Errorf("shoko: %s returned no data", endpoint)
+	}
+	contentType := response.Header.Get("Content-Type")
+	if !strings.HasPrefix(contentType, "image/") {
+		contentType = http.DetectContentType(body)
+	}
+	return body, contentType, nil
+}

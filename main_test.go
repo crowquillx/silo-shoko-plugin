@@ -349,6 +349,41 @@ func TestMetadataServerResolveImageURLs(t *testing.T) {
 	}
 }
 
+// Silo only downloads artwork from public addresses, so a public image URL,
+// when configured, replaces the private Shoko URL in every resolved image.
+func TestResolveImageURLsUsePublicImageURL(t *testing.T) {
+	client, err := shoko.NewClient(shoko.Config{BaseURL: "http://100.64.0.10:8111", APIKey: "secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconciler, err := vfs.NewReconciler(vfs.Config{Root: filepath.Join(t.TempDir(), "vfs"), AllowedSourceRoots: []string{t.TempDir()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverUnderTest := &metadataServer{runtime: &runtimeServer{
+		client:     client,
+		reconciler: reconciler,
+		cfg:        config.Connection{BaseURL: "http://100.64.0.10:8111", ImageMode: config.ImagePublicURL, ImageBaseURL: "https://shoko-images.example.com/"},
+	}}
+	const uuid = "9f8c7d6e-5b4a-4c3d-8e2f-1a0b9c8d7e6f"
+	want := "https://shoko-images.example.com/api/v3/Image/" + uuid
+
+	single, err := serverUnderTest.ResolveImageURL(context.Background(), &pluginv1.ResolveImageURLRequest{Path: "image/" + uuid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if single.GetUrl() != want {
+		t.Fatalf("ResolveImageURL = %q, want %q", single.GetUrl(), want)
+	}
+	batch, err := serverUnderTest.ResolveImageURLs(context.Background(), &pluginv1.ResolveImageURLsRequest{Paths: []string{"image/" + uuid}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := batch.GetUrls()["image/"+uuid]; got != want {
+		t.Fatalf("ResolveImageURLs = %q, want %q", got, want)
+	}
+}
+
 const seriesWithImagesFixture = `{
   "ids": {"id": 7},
   "name": "Clean Show",

@@ -366,3 +366,31 @@ func TestShowPostersWithoutThePlugin(t *testing.T) {
 		t.Fatalf("posters = %#v, err = %v", posters, err)
 	}
 }
+
+func TestImageDownloadsWithTheAPIKey(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("apikey") != "test-key" || r.URL.Path != "/api/v3/Image/9f8c7d6e-5b4a-4c3d-8e2f-1a0b9c8d7e6f" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "image/webp")
+		fmt.Fprint(w, "image bytes")
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{BaseURL: server.URL, APIKey: "test-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	data, contentType, err := client.Image(context.Background(), "9f8c7d6e-5b4a-4c3d-8e2f-1a0b9c8d7e6f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "image bytes" || contentType != "image/webp" {
+		t.Fatalf("image = %q as %q", data, contentType)
+	}
+	var httpErr *HTTPError
+	if _, _, err := client.Image(context.Background(), "00000000-0000-4000-8000-000000000000"); !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusNotFound {
+		t.Fatalf("missing image err = %v", err)
+	}
+}
