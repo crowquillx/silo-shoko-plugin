@@ -526,3 +526,49 @@ func waitForBackgroundCrawl(t *testing.T, runtime *runtimeServer) {
 		t.Fatal(err)
 	}
 }
+
+// In the S3 image mode, an image that cannot be copied falls back to Shoko's own
+// URL, so clients that can reach Shoko still show it.
+func TestS3ImageModeFallsBackToShokoWhenTheCopyFails(t *testing.T) {
+	brokenS3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer brokenS3.Close()
+	source, _ := mediaFixture(t)
+	value, err := structpb.NewStruct(map[string]any{
+		"base_url":             "http://shoko.invalid:8111",
+		"api_key":              compatAPIKey,
+		"vfs_root":             filepath.Join(t.TempDir(), "vfs"),
+		"managed_folder_map":   fmt.Sprintf(`{"1":%q}`, source),
+		"image_mode":           "s3",
+		"s3_endpoint":          brokenS3.URL,
+		"s3_bucket":            "shoko-images",
+		"s3_access_key_id":     "key",
+		"s3_secret_access_key": "secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &runtimeServer{}
+	if _, err := runtime.Configure(context.Background(), &pluginv1.ConfigureRequest{Config: []*pluginv1.ConfigEntry{{Key: "connection", Value: value}}}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(runtime.cancelBackgroundCrawl)
+	if runtime.images == nil {
+		t.Fatal("the S3 image mode built no image store")
+	}
+
+	const uuid = "9f8c7d6e-5b4a-4c3d-8e2f-1a0b9c8d7e6f"
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	response, err := (&metadataServer{runtime: runtime}).ResolveImageURLs(ctx, &pluginv1.ResolveImageURLsRequest{Paths: []string{"image/" + uuid, "image/bogus"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := response.GetUrls()["image/"+uuid], "http://shoko.invalid:8111/api/v3/Image/"+uuid; got != want {
+		t.Fatalf("url = %q, want %q", got, want)
+	}
+	if got := response.GetUrls()["image/bogus"]; got != "" {
+		t.Fatalf("invalid path resolved to %q", got)
+	}
+}

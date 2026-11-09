@@ -82,7 +82,7 @@
       "key": "connection",
       "title": "ShokoAnime connection",
       "description": "Shoko connection and VFS path policy. The API key is encrypted by Silo.",
-      "json_schema": "{\"type\":\"object\",\"properties\":{\"base_url\":{\"type\":\"string\",\"format\":\"uri\",\"minLength\":1},\"api_key\":{\"type\":\"string\",\"minLength\":1},\"vfs_root\":{\"type\":\"string\",\"minLength\":1},\"managed_folder_map\":{\"type\":\"string\",\"minLength\":2}},\"required\":[\"base_url\",\"api_key\",\"vfs_root\",\"managed_folder_map\"],\"additionalProperties\":false}",
+      "json_schema": "{\"type\":\"object\",\"properties\":{\"base_url\":{\"type\":\"string\",\"format\":\"uri\",\"minLength\":1},\"image_mode\":{\"type\":\"string\",\"enum\":[\"direct\",\"public_url\",\"s3\"]},\"image_base_url\":{\"type\":\"string\"},\"s3_endpoint\":{\"type\":\"string\"},\"s3_region\":{\"type\":\"string\"},\"s3_bucket\":{\"type\":\"string\"},\"s3_prefix\":{\"type\":\"string\"},\"s3_access_key_id\":{\"type\":\"string\"},\"s3_secret_access_key\":{\"type\":\"string\"},\"api_key\":{\"type\":\"string\",\"minLength\":1},\"vfs_root\":{\"type\":\"string\",\"minLength\":1},\"managed_folder_map\":{\"type\":\"string\",\"minLength\":2}},\"required\":[\"base_url\",\"api_key\",\"vfs_root\",\"managed_folder_map\"],\"additionalProperties\":false}",
       "required": true,
       "admin_form": {
         "fields": [
@@ -92,6 +92,128 @@
             "control": "ADMIN_FORM_CONTROL_TEXT",
             "required": true,
             "placeholder": "http://shoko:8111"
+          },
+          {
+            "key": "image_mode",
+            "label": "Artwork source",
+            "description": "Where Silo downloads Shoko artwork from. Silo only caches artwork from public addresses, so if Shoko is on a private network, use a public image URL or an S3 bucket.",
+            "control": "ADMIN_FORM_CONTROL_SELECT",
+            "default_value": "direct",
+            "options": [
+              {
+                "value": "direct",
+                "label": "Shoko Server URL",
+                "description": "Use the Shoko Server URL above. Silo can cache it only if that URL is public."
+              },
+              {
+                "value": "public_url",
+                "label": "Public image URL",
+                "description": "A public URL that serves Shoko's /api/v3/Image/ path."
+              },
+              {
+                "value": "s3",
+                "label": "Copy to S3",
+                "description": "Copy each image into an S3 bucket with a public endpoint, and give Silo a signed link to the copy."
+              }
+            ]
+          },
+          {
+            "key": "image_base_url",
+            "label": "Public image URL",
+            "description": "Serves Shoko's /api/v3/Image/<id> path, for example through a reverse proxy that allows only that path.",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "placeholder": "https://shoko-images.example.com",
+            "show_when": [
+              {
+                "field": "image_mode",
+                "equals": [
+                  "public_url"
+                ]
+              }
+            ]
+          },
+          {
+            "key": "s3_endpoint",
+            "label": "S3 endpoint",
+            "description": "Must be a public address, since Silo downloads the signed links from it.",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "placeholder": "https://s3.example.com",
+            "show_when": [
+              {
+                "field": "image_mode",
+                "equals": [
+                  "s3"
+                ]
+              }
+            ]
+          },
+          {
+            "key": "s3_region",
+            "label": "S3 region",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "placeholder": "us-east-1",
+            "show_when": [
+              {
+                "field": "image_mode",
+                "equals": [
+                  "s3"
+                ]
+              }
+            ]
+          },
+          {
+            "key": "s3_bucket",
+            "label": "S3 bucket",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "show_when": [
+              {
+                "field": "image_mode",
+                "equals": [
+                  "s3"
+                ]
+              }
+            ]
+          },
+          {
+            "key": "s3_prefix",
+            "label": "S3 key prefix",
+            "description": "Optional folder inside the bucket.",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "show_when": [
+              {
+                "field": "image_mode",
+                "equals": [
+                  "s3"
+                ]
+              }
+            ]
+          },
+          {
+            "key": "s3_access_key_id",
+            "label": "S3 access key ID",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "show_when": [
+              {
+                "field": "image_mode",
+                "equals": [
+                  "s3"
+                ]
+              }
+            ]
+          },
+          {
+            "key": "s3_secret_access_key",
+            "label": "S3 secret access key",
+            "control": "ADMIN_FORM_CONTROL_PASSWORD",
+            "secret": true,
+            "show_when": [
+              {
+                "field": "image_mode",
+                "equals": [
+                  "s3"
+                ]
+              }
+            ]
           },
           {
             "key": "api_key",

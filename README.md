@@ -14,7 +14,7 @@ Part of [Crowquillx Silo Plugins](https://github.com/crowquillx/crowquillx-silo-
 {"1": "/media/anime"}
 ```
 
-4. Test the connection, which checks the URL, API key and every mapped folder, then select **Save config**. Enable the plugin's **Shoko VFS changes** Autoscan source and bind the **Reconcile Shoko VFS** scheduled task.
+4. If Shoko is not on a public address, pick an [artwork source](#artwork-source) so Silo can cache Shoko's artwork. Test the connection, which checks the URL, API key, every mapped folder and the S3 bucket if one is set, then select **Save config**. Enable the plugin's **Shoko VFS changes** Autoscan source and bind the **Reconcile Shoko VFS** scheduled task.
 5. Run **Reconcile Shoko VFS** to generate the library. On a large library the task returns before the crawl ends and the crawl keeps running in the background; run the task again to see its status. When it reports `complete`, create a Silo TV library rooted at the VFS output root. Silo scans a new library straight away, so a library created before the crawl finishes starts empty: scan it once from its menu after the crawl. Keep the Autoscan source enabled to scan future changes.
 
 The Autoscan source picks up changes from the moment it is added. If it is added after the VFS is built, or its first poll fails, its first successful poll scans the whole library once. Polls never wait for a crawl: a crawl still in progress, including one left unfinished by a restart, continues in the background, and its changes are scanned when it finishes.
@@ -34,6 +34,20 @@ The AniDB rating appears in Silo once an administrator turns on the AniDB rating
 ## Posters
 
 Each season uses its Shoko series' preferred poster. Shoko gives a group only its main series' poster, so on its own a show repeats its first season's poster. With the [Season Posters](https://github.com/crowquillx/shoko-season-posters) Shoko plugin installed, a show uses the show poster chosen there in its own show poster mode, and keeps the group poster otherwise. The plugin reads that list at most every 10 minutes. A changed poster appears once the show's metadata is refreshed in Silo. Specials keep the group poster.
+
+## Artwork source
+
+Silo caches artwork in its own storage, but it only downloads artwork from public addresses. A Shoko server on a private network, such as a LAN or Tailscale address, is refused, so Silo cannot cache its posters. Clients then get Shoko's private URL and show the artwork only when they can reach Shoko themselves.
+
+**Artwork source** in the plugin settings picks where Silo downloads Shoko artwork from:
+
+- **Shoko Server URL** (the default) uses the Shoko Server URL. Pick it when that URL is public, or when every client can reach Shoko.
+- **Public image URL** uses another URL that serves Shoko's `/api/v3/Image/<id>` path, for example a reverse proxy in front of Shoko. Shoko serves images without an API key, so let the proxy pass only that path; the rest of Shoko's API should stay private.
+- **Copy to S3** copies each image into an S3-compatible bucket, such as Garage, MinIO or AWS, the first time Silo asks for it. Silo then gets a link signed for seven days. The endpoint must be public, and the key needs read and write access to the bucket. Nothing in Shoko needs a public address. Silo's own storage settings are not available to plugins, so the bucket and key are set here.
+
+In the S3 mode, an image that cannot be copied falls back to Shoko's own URL, and the error is logged. The connection test also checks that the bucket exists.
+
+Silo asks the plugin for an image's URL each time it downloads it, so queued downloads use a new artwork source on their next attempt. Downloads that already gave up are retried when an item is refreshed, or for the whole catalog by the **Backfill Metadata Images** task in **Administration → Tasks**.
 
 ## Theme songs
 
