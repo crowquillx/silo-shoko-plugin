@@ -203,6 +203,14 @@ func TestPluginWorksOnBothShokoGenerations(t *testing.T) {
 			if len(images.GetImages()) != 1 || images.GetImages()[0].GetUrl() != generation.wantPoster {
 				t.Fatalf("images = %#v", images.GetImages())
 			}
+			seasonOne := int32(1)
+			gallery, err := metadata.GetImages(ctx, &pluginv1.GetImagesRequest{ProviderId: "group:5", ItemType: "series", ProviderIds: groupIDs, SeasonNumber: &seasonOne})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if records := gallery.GetImages(); len(records) != 1 || records[0].GetUrl() != generation.wantPoster || records[0].SeasonNumber == nil || records[0].GetSeasonNumber() != 1 {
+				t.Fatalf("season gallery = %#v, want the season's poster marked season 1", records)
+			}
 			resolvedImage, err := metadata.ResolveImageURL(ctx, &pluginv1.ResolveImageURLRequest{Path: strings.TrimPrefix(generation.wantPoster, "shoko://")})
 			if err != nil {
 				t.Fatal(err)
@@ -570,5 +578,229 @@ func TestS3ImageModeFallsBackToShokoWhenTheCopyFails(t *testing.T) {
 	}
 	if got := response.GetUrls()["image/bogus"]; got != "" {
 		t.Fatalf("invalid path resolved to %q", got)
+	}
+}
+
+// Silo stops a plugin whose Configure fails, so settings the plugin cannot use
+// are accepted and reported by the calls that need them. Silo's connection
+// check is Configure with the staged settings followed by a title search, and
+// must still fail on them.
+func TestUnusableSettingsAreReportedByCallsNotByConfigure(t *testing.T) {
+	source, _ := mediaFixture(t)
+	folderMap := fmt.Sprintf(`{"1":%q}`, source)
+	vfsRoot := filepath.Join(t.TempDir(), "vfs")
+	complete := func(overrides map[string]any) map[string]any {
+		values := map[string]any{"base_url": "http://127.0.0.1:1", "api_key": compatAPIKey, "vfs_root": vfsRoot, "managed_folder_map": folderMap}
+		for key, value := range overrides {
+			if value == nil {
+				delete(values, key)
+			} else {
+				values[key] = value
+			}
+		}
+		return values
+	}
+	entries := func(values map[string]any) []*pluginv1.ConfigEntry {
+		t.Helper()
+		if values == nil {
+			return nil
+		}
+		value, err := structpb.NewStruct(values)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return []*pluginv1.ConfigEntry{{Key: "connection", Value: value}}
+	}
+	probe := &pluginv1.SearchMetadataRequest{Query: "The Matrix", ItemType: "movie", Year: 1999, Language: "en"}
+	ctx := context.Background()
+
+	tests := []struct {
+		name   string
+		values map[string]any
+		want   string
+	}{
+		{"no settings", nil, "shokoanime: not configured: connection config is required"},
+		{"empty settings", map[string]any{}, "shokoanime: not configured: managed_folder_map is required"},
+		{"missing URL", complete(map[string]any{"base_url": nil}), "shokoanime: not configured: base_url is required"},
+		{"bad URL", complete(map[string]any{"base_url": "shoko:8111"}), "shokoanime: not configured: base_url must be an http or https URL"},
+		{"missing API key", complete(map[string]any{"api_key": ""}), "shokoanime: not configured: api_key is required"},
+		{"missing VFS root", complete(map[string]any{"vfs_root": nil}), "shokoanime: not configured: vfs_root must be an absolute path"},
+		{"malformed folder map", complete(map[string]any{"managed_folder_map": "{"}), "shokoanime: not configured: decode managed_folder_map"},
+		{"overlapping roots", complete(map[string]any{"vfs_root": filepath.Join(source, "vfs")}), "overlaps managed-folder 1 root"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runtime := &runtimeServer{}
+			if _, err := runtime.Configure(ctx, &pluginv1.ConfigureRequest{Config: entries(tt.values)}); err != nil {
+				t.Fatalf("Configure failed, which makes Silo stop the plugin: %v", err)
+			}
+			metadata := &metadataServer{runtime: runtime}
+			calls := map[string]func() error{
+				"connection check": func() error { _, err := metadata.Search(ctx, probe); return err },
+				"metadata": func() error {
+					_, err := metadata.GetMetadata(ctx, &pluginv1.GetMetadataRequest{ItemType: "series", ProviderId: "group:5"})
+					return err
+				},
+				"seasons": func() error {
+					_, err := metadata.GetSeasons(ctx, &pluginv1.GetSeasonsRequest{SeriesProviderId: "group:5"})
+					return err
+				},
+				"episodes": func() error {
+					_, err := metadata.GetEpisodes(ctx, &pluginv1.GetEpisodesRequest{SeriesProviderId: "group:5"})
+					return err
+				},
+				"images": func() error {
+					_, err := metadata.GetImages(ctx, &pluginv1.GetImagesRequest{ProviderId: "group:5"})
+					return err
+				},
+				"image URL": func() error {
+					_, err := metadata.ResolveImageURL(ctx, &pluginv1.ResolveImageURLRequest{Path: "image/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"})
+					return err
+				},
+				"image URLs": func() error {
+					_, err := metadata.ResolveImageURLs(ctx, &pluginv1.ResolveImageURLsRequest{Paths: []string{"image/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}})
+					return err
+				},
+				"task": func() error {
+					_, err := (&scheduledTaskServer{runtime: runtime}).Run(ctx, &pluginv1.RunScheduledTaskRequest{TaskKey: "reconcile"})
+					return err
+				},
+				"dry run": func() error {
+					input, _ := structpb.NewStruct(map[string]any{"dry_run": true})
+					_, err := (&scheduledTaskServer{runtime: runtime}).Run(ctx, &pluginv1.RunScheduledTaskRequest{TaskKey: "reconcile", Input: input})
+					return err
+				},
+				"poll": func() error {
+					_, err := (&scanSourceServer{runtime: runtime}).PollChanges(ctx, &pluginv1.PollChangesRequest{CapabilityId: "shoko"})
+					return err
+				},
+			}
+			for name, call := range calls {
+				if err := call(); err == nil || !strings.Contains(err.Error(), "not configured: ") || !strings.Contains(err.Error(), tt.want) {
+					t.Errorf("%s: err = %v, want %q", name, err, tt.want)
+				}
+			}
+			// A scan of another library's file needs no settings to learn the file
+			// is not Shoko's.
+			pathIDs, err := structpb.NewStruct(map[string]any{"_filepath": "/movies/The Matrix (1999)/The Matrix.mkv"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			other, err := metadata.Search(ctx, &pluginv1.SearchMetadataRequest{Query: "The Matrix", ItemType: "movie", ProviderIds: pathIDs})
+			if err != nil || len(other.GetResults()) != 0 {
+				t.Errorf("search for another library's file = %v, %v; want no results and no error", other.GetResults(), err)
+			}
+			if _, err := os.Stat(vfsRoot); !os.IsNotExist(err) {
+				t.Errorf("unusable settings touched the VFS root: %v", err)
+			}
+		})
+	}
+}
+
+// Settings the plugin cannot use replace working ones rather than leaving the
+// old server in use, and working settings clear the problem.
+func TestConfigureReplacesSettingsEitherWay(t *testing.T) {
+	generation := shokoGenerations[0]
+	server := httptest.NewServer(generation.handler(t))
+	defer server.Close()
+	source, _ := mediaFixture(t)
+	runtime := configuredRuntime(t, server.URL, compatAPIKey, fmt.Sprintf(`{"1":%q}`, source), filepath.Join(t.TempDir(), "vfs"))
+	metadata := &metadataServer{runtime: runtime}
+	probe := &pluginv1.SearchMetadataRequest{Query: "The Matrix", ItemType: "movie", Year: 1999}
+	ctx := context.Background()
+	if _, err := metadata.Search(ctx, probe); err != nil {
+		t.Fatalf("connection check with working settings: %v", err)
+	}
+	working := runtime.cfg
+
+	if _, err := runtime.Configure(ctx, &pluginv1.ConfigureRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := metadata.Search(ctx, probe); err == nil || !strings.Contains(err.Error(), "not configured: connection config is required") {
+		t.Fatalf("connection check after the settings were removed: err = %v", err)
+	}
+
+	value, err := structpb.NewStruct(map[string]any{
+		"base_url":           working.BaseURL,
+		"api_key":            working.APIKey,
+		"vfs_root":           working.VFSRoot,
+		"managed_folder_map": fmt.Sprintf(`{"1":%q}`, source),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Configure(ctx, &pluginv1.ConfigureRequest{Config: []*pluginv1.ConfigEntry{{Key: "connection", Value: value}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := metadata.Search(ctx, probe); err != nil {
+		t.Fatalf("connection check after the settings were restored: %v", err)
+	}
+}
+
+// A marker ahead of the journal means the VFS root was wiped or recreated and
+// the journal started again. The source starts over like a first poll instead
+// of skipping every change until the new journal passes the old marker.
+func TestPollStartsOverWhenTheMarkerIsNotInTheJournal(t *testing.T) {
+	generation := shokoGenerations[1]
+	server := httptest.NewServer(generation.handler(t))
+	defer server.Close()
+	source, _ := mediaFixture(t)
+	outputRoot := filepath.Join(t.TempDir(), "vfs")
+	runtime := configuredRuntime(t, server.URL, compatAPIKey, fmt.Sprintf(`{"1":%q}`, source), outputRoot)
+	task := &scheduledTaskServer{runtime: runtime}
+	scanner := &scanSourceServer{runtime: runtime}
+	ctx := context.Background()
+	reconcileVFS := func() {
+		t.Helper()
+		output, err := task.Run(ctx, &pluginv1.RunScheduledTaskRequest{TaskKey: "reconcile"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if output.GetOutput().AsMap()["complete"] != true {
+			t.Fatalf("task output = %#v", output.GetOutput().AsMap())
+		}
+	}
+	reconcileVFS()
+	tail := pollWithin(t, scanner, "", time.Second).GetNextMarker()
+	if tail == "" || tail == "0" {
+		t.Fatalf("marker after the first build = %q", tail)
+	}
+
+	for _, marker := range []string{"100000", "from-another-version"} {
+		response := pollWithin(t, scanner, marker, time.Second)
+		// The whole VFS is scanned once, through the path that sits in its root.
+		if got := response.GetSourcePaths(); len(got) != 1 || filepath.Dir(got[0]) != outputRoot || response.GetNextMarker() != tail {
+			t.Fatalf("poll with marker %q = paths %v, marker %q; want one path directly in %s and marker %q", marker, got, response.GetNextMarker(), outputRoot, tail)
+		}
+	}
+
+	// The VFS root is deleted: the journal is gone and its sequence restarts.
+	if err := os.RemoveAll(outputRoot); err != nil {
+		t.Fatal(err)
+	}
+	emptied := pollWithin(t, scanner, tail, time.Second)
+	if len(emptied.GetSourcePaths()) != 0 || emptied.GetNextMarker() != "0" {
+		t.Fatalf("poll after the root was deleted = paths %v, marker %q; want none and marker 0", emptied.GetSourcePaths(), emptied.GetNextMarker())
+	}
+	reconcileVFS()
+	rebuilt := pollWithin(t, scanner, emptied.GetNextMarker(), time.Second)
+	if len(rebuilt.GetSourcePaths()) == 0 || rebuilt.GetNextMarker() == "0" {
+		t.Fatalf("poll after the rebuild = paths %v, marker %q; want the rebuilt links", rebuilt.GetSourcePaths(), rebuilt.GetNextMarker())
+	}
+
+	// The same deletion, but the rebuild lands before the next poll: the stale
+	// marker is still ahead of the short new journal.
+	stale := "100000"
+	if err := os.RemoveAll(outputRoot); err != nil {
+		t.Fatal(err)
+	}
+	reconcileVFS()
+	resynced := pollWithin(t, scanner, stale, time.Second)
+	if got := resynced.GetSourcePaths(); len(got) != 1 || filepath.Dir(got[0]) != outputRoot || resynced.GetNextMarker() == stale || resynced.GetNextMarker() == "0" {
+		t.Fatalf("poll after a rebuild = paths %v, marker %q; want a whole-VFS scan and the new tail", got, resynced.GetNextMarker())
+	}
+	settled := pollWithin(t, scanner, resynced.GetNextMarker(), time.Second)
+	if len(settled.GetSourcePaths()) != 0 || settled.GetNextMarker() != resynced.GetNextMarker() {
+		t.Fatalf("next poll = paths %v, marker %q", settled.GetSourcePaths(), settled.GetNextMarker())
 	}
 }

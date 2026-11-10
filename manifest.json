@@ -1,6 +1,6 @@
 {
   "plugin_id": "silo.shokoanime",
-  "version": "0.2.5",
+  "version": "0.3.0",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "supported_platforms": [
@@ -74,7 +74,17 @@
       "type": "scan_source.v1",
       "id": "shoko",
       "display_name": "Shoko VFS changes",
-      "description": "Reports successfully reconciled VFS paths so Silo can scan them automatically."
+      "description": "Reports successfully reconciled VFS paths so Silo can scan them automatically.",
+      "metadata": {
+        "scan_source": {
+          "summary": "Scans the Shoko VFS folders that changed after each reconcile.",
+          "delivery_modes": [
+            "poll"
+          ],
+          "connection": "none",
+          "emits_native_paths": true
+        }
+      }
     }
   ],
   "global_config_schema": [

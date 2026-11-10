@@ -160,13 +160,38 @@ func TestReconcileMovesChangedLogicalPathAndJournalsBothPaths(t *testing.T) {
 	}
 }
 
-func TestPollChangesRejectsInvalidMarker(t *testing.T) {
-	reconciler, err := NewReconciler(Config{Root: filepath.Join(t.TempDir(), "vfs"), AllowedSourceRoots: []string{t.TempDir()}})
+// A marker that is not a position in the journal cannot be answered: the
+// caller has to start over rather than wait for the journal to catch up.
+func TestPollChangesReportsMarkersItCannotUse(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vfs")
+	source := t.TempDir()
+	media := filepath.Join(source, "episode.mkv")
+	if err := os.WriteFile(media, []byte("fixture"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reconciler, err := NewReconciler(Config{Root: root, AllowedSourceRoots: []string{source}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := reconciler.PollChanges(context.Background(), "not-a-marker"); err == nil {
-		t.Fatal("invalid marker accepted")
+	ctx := context.Background()
+	for _, marker := range []string{"not-a-marker", "-1", "1.5", "1"} {
+		if _, _, err := reconciler.PollChanges(ctx, marker); !errors.Is(err, ErrUnusableMarker) {
+			t.Errorf("PollChanges(%q) on an empty journal: err = %v, want ErrUnusableMarker", marker, err)
+		}
+	}
+
+	plan := topology.Plan{Entries: []topology.Entry{{StableKey: "file:9/episode:42", LogicalPath: "Show/Season 01/Episode.mkv", TargetPath: media}}}
+	if _, err := reconciler.Reconcile(ctx, plan, false); err != nil {
+		t.Fatal(err)
+	}
+	// The journal's own tail is a usable marker with nothing after it.
+	paths, next, err := reconciler.PollChanges(ctx, "1")
+	if err != nil || len(paths) != 0 || next != "1" {
+		t.Fatalf("PollChanges at the tail = paths %v, marker %q, err %v", paths, next, err)
+	}
+	paths, next, err = reconciler.PollChanges(ctx, "57")
+	if !errors.Is(err, ErrUnusableMarker) || len(paths) != 0 || next != "" {
+		t.Fatalf("PollChanges ahead of the tail = paths %v, marker %q, err %v; want ErrUnusableMarker and no marker", paths, next, err)
 	}
 }
 

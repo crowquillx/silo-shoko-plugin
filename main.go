@@ -48,6 +48,8 @@ type runtimeServer struct {
 	client     *shoko.Client
 	reconciler *vfs.Reconciler
 	engine     *reconcile.Engine
+	// configErr is why the last settings Silo sent cannot be used, or nil.
+	configErr error
 
 	crawlMu       sync.Mutex
 	crawlCancel   context.CancelFunc
@@ -100,14 +102,46 @@ func (s *runtimeServer) GetManifest(context.Context, *pluginv1.GetManifestReques
 	return &pluginv1.GetManifestResponse{Manifest: s.manifest}, nil
 }
 
+// Configure stores the settings Silo sends. It never fails on settings it
+// cannot use: Silo stops a plugin whose Configure fails, which would keep an
+// installation that is not set up yet from starting at all. The problem is
+// remembered instead, and every call that needs working settings reports it.
+// Settings that cannot be used replace any earlier working ones, so the plugin
+// never keeps running on settings the administrator has since changed.
 func (s *runtimeServer) Configure(_ context.Context, req *pluginv1.ConfigureRequest) (*pluginv1.ConfigureResponse, error) {
-	cfg, err := config.Decode(req.GetConfig())
+	next, err := newConfiguredState(req.GetConfig())
+	s.cancelBackgroundCrawl()
+	s.mu.Lock()
+	s.cfg = next.cfg
+	s.client = next.client
+	s.reconciler = next.reconciler
+	s.engine = next.engine
+	s.images = next.images
+	s.configErr = err
+	s.verifiedUntil = time.Time{}
+	s.mu.Unlock()
+	return &pluginv1.ConfigureResponse{}, nil
+}
+
+// configuredState is everything built from one set of settings.
+type configuredState struct {
+	cfg        config.Connection
+	client     *shoko.Client
+	reconciler *vfs.Reconciler
+	engine     *reconcile.Engine
+	images     *imagestore.Store
+}
+
+// newConfiguredState builds the plugin's state from Silo's settings without
+// contacting Shoko or writing to disk. On an error the state is empty.
+func newConfiguredState(entries []*pluginv1.ConfigEntry) (configuredState, error) {
+	cfg, err := config.Decode(entries)
 	if err != nil {
-		return nil, err
+		return configuredState{}, err
 	}
 	client, err := shoko.NewClient(shoko.Config{BaseURL: cfg.BaseURL, APIKey: cfg.APIKey})
 	if err != nil {
-		return nil, err
+		return configuredState{}, err
 	}
 	sourceRoots := make([]string, 0, len(cfg.ManagedFolderMap))
 	for _, root := range cfg.ManagedFolderMap {
@@ -116,7 +150,7 @@ func (s *runtimeServer) Configure(_ context.Context, req *pluginv1.ConfigureRequ
 	sort.Strings(sourceRoots)
 	reconciler, err := vfs.NewReconciler(vfs.Config{Root: cfg.VFSRoot, AllowedSourceRoots: sourceRoots})
 	if err != nil {
-		return nil, err
+		return configuredState{}, err
 	}
 	engine, err := reconcile.New(reconcile.Config{
 		Client:           client,
@@ -124,7 +158,7 @@ func (s *runtimeServer) Configure(_ context.Context, req *pluginv1.ConfigureRequ
 		ManagedFolderMap: cfg.ManagedFolderMap,
 	})
 	if err != nil {
-		return nil, err
+		return configuredState{}, err
 	}
 	var images *imagestore.Store
 	if cfg.ImageMode == config.ImageS3 {
@@ -137,19 +171,10 @@ func (s *runtimeServer) Configure(_ context.Context, req *pluginv1.ConfigureRequ
 			SecretAccessKey: cfg.ImageS3.SecretAccessKey,
 		}, client.Image)
 		if err != nil {
-			return nil, err
+			return configuredState{}, err
 		}
 	}
-	s.cancelBackgroundCrawl()
-	s.mu.Lock()
-	s.cfg = cfg
-	s.client = client
-	s.reconciler = reconciler
-	s.engine = engine
-	s.images = images
-	s.verifiedUntil = time.Time{}
-	s.mu.Unlock()
-	return &pluginv1.ConfigureResponse{}, nil
+	return configuredState{cfg: cfg, client: client, reconciler: reconciler, engine: engine, images: images}, nil
 }
 
 // Silo gives a scheduled task about ten seconds, far less than a crawl of a real
@@ -298,11 +323,23 @@ func (s *runtimeServer) verifyConnection(ctx context.Context) error {
 	return nil
 }
 
+// notConfiguredLocked returns the error for calls that need working settings,
+// or nil when the plugin has what the call needs. The caller holds s.mu.
+func (s *runtimeServer) notConfiguredLocked(ready bool) error {
+	if s.configErr != nil {
+		return fmt.Errorf("shokoanime: not configured: %s", strings.TrimPrefix(s.configErr.Error(), "shokoanime: "))
+	}
+	if !ready {
+		return errors.New("shokoanime: not configured: Silo has not sent the plugin's settings yet")
+	}
+	return nil
+}
+
 func (s *runtimeServer) state() (config.Connection, *shoko.Client, *vfs.Reconciler, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.client == nil || s.reconciler == nil {
-		return config.Connection{}, nil, nil, fmt.Errorf("shokoanime: plugin is not configured")
+	if err := s.notConfiguredLocked(s.client != nil && s.reconciler != nil); err != nil {
+		return config.Connection{}, nil, nil, err
 	}
 	return s.cfg, s.client, s.reconciler, nil
 }
@@ -310,8 +347,8 @@ func (s *runtimeServer) state() (config.Connection, *shoko.Client, *vfs.Reconcil
 func (s *runtimeServer) reconcilerState() (*vfs.Reconciler, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.reconciler == nil {
-		return nil, fmt.Errorf("shokoanime: plugin is not configured")
+	if err := s.notConfiguredLocked(s.reconciler != nil); err != nil {
+		return nil, err
 	}
 	return s.reconciler, nil
 }
@@ -319,8 +356,8 @@ func (s *runtimeServer) reconcilerState() (*vfs.Reconciler, error) {
 func (s *runtimeServer) engineState() (*reconcile.Engine, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.engine == nil {
-		return nil, fmt.Errorf("shokoanime: plugin is not configured")
+	if err := s.notConfiguredLocked(s.engine != nil); err != nil {
+		return nil, err
 	}
 	return s.engine, nil
 }
@@ -366,21 +403,23 @@ func (s *metadataServer) clock() time.Time {
 }
 
 func (s *metadataServer) Search(ctx context.Context, req *pluginv1.SearchMetadataRequest) (*pluginv1.SearchMetadataResponse, error) {
-	_, client, _, err := s.runtime.state()
-	if err != nil {
-		return nil, err
-	}
 	providerIDs := stringMap(req.GetProviderIds())
 	token := requestToken(providerIDs, providerIDs["_filepath"], req.GetQuery())
 	if !token.Valid() {
-		// Silo's connection test is a title search with no file path or IDs. Scans
-		// always send a file path, so they never wait on Shoko for non-VFS files.
+		// Silo's connection test is a title search with no file path or IDs. It
+		// fails on settings the plugin cannot use as well as on a server it cannot
+		// reach. Scans always send a file path, so they never wait on Shoko for
+		// non-VFS files, and need no settings to learn the file is not Shoko's.
 		if len(providerIDs) == 0 {
 			if err := s.runtime.verifyConnection(ctx); err != nil {
 				return nil, err
 			}
 		}
 		return &pluginv1.SearchMetadataResponse{}, nil
+	}
+	_, client, _, err := s.runtime.state()
+	if err != nil {
+		return nil, err
 	}
 
 	itemType := req.GetItemType()
@@ -556,6 +595,7 @@ func (s *metadataServer) GetSeasons(ctx context.Context, req *pluginv1.GetSeason
 			SeasonNumber: int32(number),
 			Title:        fmt.Sprintf("Season %02d", number),
 			PosterPath:   selectedPosterPath(series.Images),
+			BackdropPath: selectedBackdropPath(series.Images),
 			ProviderId:   fmt.Sprintf("series:%d:season:%d", seriesID, number),
 			ProviderIds:  stringStruct(seasonIDs),
 		}
@@ -637,6 +677,12 @@ func (s *metadataServer) GetImages(ctx context.Context, req *pluginv1.GetImagesR
 			groupID = typedSeasonOwnerID(req.GetProviderId(), "group")
 		}
 	}
+	// Silo asks for one season's artwork with the show's IDs and that season's
+	// number, and keeps only images that carry the number back. The pointer is
+	// checked, not the value, because season zero is the specials season.
+	if req.SeasonNumber != nil {
+		return seasonImages(ctx, client, groupID, seriesID, int(req.GetSeasonNumber()))
+	}
 	// Grouped seasons carry both the parent group and their member series ID.
 	// The member series owns the season artwork, so it must win whenever both
 	// IDs are present.
@@ -661,6 +707,58 @@ func (s *metadataServer) GetImages(ctx context.Context, req *pluginv1.GetImagesR
 		return withShowPoster(records, s.runtime.showPoster(ctx, client, groupID), req.GetLanguage()), nil
 	}
 	return &pluginv1.GetImagesResponse{}, nil
+}
+
+// seasonImages returns the posters and backdrops of one season of a show, each
+// marked with the season number. Seasons are found the way GetSeasons lists
+// them: a group's season is the member series at that position and its specials
+// season shares the group's images, while a series outside a group has season
+// one and a specials season, both with the series' images. A season the show
+// does not have gets no images, so Silo never files another season's artwork
+// under it. The group wins when both IDs are present: the request is about the
+// show, and only the group knows which series is which season.
+func seasonImages(ctx context.Context, client *shoko.Client, groupID, seriesID, season int) (*pluginv1.GetImagesResponse, error) {
+	switch {
+	case groupID > 0 && season == 0:
+		group, err := client.Group(ctx, groupID)
+		if err != nil {
+			return nil, err
+		}
+		return seasonImageRecords(group.Images, season), nil
+	case groupID > 0:
+		members, err := client.GroupSeries(ctx, groupID)
+		if err != nil {
+			return nil, err
+		}
+		layout := topology.NewGroupLayout(members)
+		for _, series := range layout.OrderedMembers {
+			if layout.SeasonNumber(series.IDs.ID) == season {
+				return seasonImageRecords(series.Images, season), nil
+			}
+		}
+	case seriesID > 0 && (season == 0 || season == 1):
+		series, err := client.Series(ctx, seriesID)
+		if err != nil {
+			return nil, err
+		}
+		return seasonImageRecords(series.Images, season), nil
+	}
+	return &pluginv1.GetImagesResponse{}, nil
+}
+
+// seasonImageRecords is imageRecords limited to the kinds Silo keeps for a
+// season, with every record marked as that season's.
+func seasonImageRecords(images shoko.Images, season int) *pluginv1.GetImagesResponse {
+	number := int32(season)
+	response := &pluginv1.GetImagesResponse{}
+	for _, record := range imageRecords(images).GetImages() {
+		if record.GetKind() != "poster" && record.GetKind() != "backdrop" {
+			continue
+		}
+		record.SeasonNumber = &number
+		response.Images = append(response.Images, record)
+	}
+	return response
 }
 
 // ResolveImageURL resolves one scheme-stripped image/<uuid> path to a URL Silo
@@ -1007,6 +1105,13 @@ func (s *scanSourceServer) PollChanges(ctx context.Context, req *pluginv1.PollCh
 		return firstPoll(ctx, reconciler)
 	}
 	paths, nextMarker, err := reconciler.PollChanges(ctx, marker)
+	if errors.Is(err, vfs.ErrUnusableMarker) {
+		// The marker is not a position in this journal, typically because the
+		// VFS root was wiped or recreated and the journal started again. Which
+		// changes the host missed is unknown, so start over like a first poll.
+		fmt.Fprintf(os.Stderr, "shokoanime: restarting the scan source at the journal's tail: %v\n", err)
+		return firstPoll(ctx, reconciler)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1311,6 +1416,7 @@ func groupSeasons(group shoko.Group, members []shoko.Series, episodesBySeries ma
 			Overview:     sanitizeDescription(series.Description),
 			AirDate:      seriesAirDate(series),
 			PosterPath:   poster,
+			BackdropPath: selectedBackdropPath(series.Images),
 			ProviderId:   fmt.Sprintf("series:%d:season:%d", series.IDs.ID, season),
 			ProviderIds:  stringStruct(ids),
 		})
@@ -1324,6 +1430,7 @@ func groupSeasons(group shoko.Group, members []shoko.Series, episodesBySeries ma
 					SeasonNumber: 0,
 					Title:        "Specials",
 					PosterPath:   groupPoster,
+					BackdropPath: selectedBackdropPath(group.Images),
 					ProviderId:   fmt.Sprintf("group:%d:season:0", group.IDs.ID),
 					ProviderIds:  stringStruct(map[string]string{"shoko_group": groupID}),
 				})
@@ -1384,8 +1491,6 @@ func selectImage(images []shoko.Image) *shoko.Image {
 	return fallback
 }
 
-// applyArtwork fills the opaque poster, backdrop, and logo paths on a
-// metadata item from an entity's image set.
 func selectedPosterPath(images shoko.Images) string {
 	if poster := selectImage(images.Posters); poster != nil {
 		return imagePath(*poster)
@@ -1393,11 +1498,18 @@ func selectedPosterPath(images shoko.Images) string {
 	return ""
 }
 
+func selectedBackdropPath(images shoko.Images) string {
+	if backdrop := selectImage(images.Backdrops); backdrop != nil {
+		return imagePath(*backdrop)
+	}
+	return ""
+}
+
+// applyArtwork fills the opaque poster, backdrop, and logo paths on a
+// metadata item from an entity's image set.
 func applyArtwork(item *pluginv1.MetadataItem, images shoko.Images) {
 	item.PosterPath = selectedPosterPath(images)
-	if backdrop := selectImage(images.Backdrops); backdrop != nil {
-		item.BackdropPath = imagePath(*backdrop)
-	}
+	item.BackdropPath = selectedBackdropPath(images)
 	if logo := selectImage(images.Logos); logo != nil {
 		item.LogoPath = imagePath(*logo)
 	}

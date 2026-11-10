@@ -45,6 +45,11 @@ func CrawlStatePath(root string) string {
 	return filepath.Join(filepath.Clean(root), crawlStateName)
 }
 
+// ErrUnusableMarker means a marker is not a position in this journal: it is
+// not a number, or it is ahead of the journal's tail. The changes since it
+// cannot be worked out, so the caller has to resynchronize to CurrentMarker.
+var ErrUnusableMarker = errors.New("vfs: unusable change marker")
+
 type journalState struct {
 	entries []ChangeJournalEntry
 	last    uint64
@@ -53,7 +58,8 @@ type journalState struct {
 // PollChanges returns changed absolute VFS paths after marker. An empty marker
 // intentionally starts at the current journal tail, matching scan_source.v1's
 // first-poll semantics. A non-empty marker is replayable across process
-// restarts because entries are stored under the configured VFS root.
+// restarts because entries are stored under the configured VFS root. A marker
+// that is not a position in this journal fails with ErrUnusableMarker.
 func (r *Reconciler) PollChanges(ctx context.Context, marker string) ([]string, string, error) {
 	var paths []string
 	var next string
@@ -82,10 +88,11 @@ func (r *Reconciler) PollChangesLocked(ctx context.Context, marker string) ([]st
 		return nil, "", err
 	}
 	if parsed > state.last {
-		// Preserve a future marker verbatim rather than regressing it. This is
-		// useful if a host restores a source row and its cursor independently
-		// of the plugin's VFS state.
-		return nil, strings.TrimSpace(marker), nil
+		// The journal has never reached this position, so it is not the journal
+		// the marker came from: the VFS root was wiped or recreated and sequences
+		// started again. Echoing the marker back would skip every change until
+		// the new journal passed it.
+		return nil, "", fmt.Errorf("%w: marker %d is ahead of the journal's tail %d", ErrUnusableMarker, parsed, state.last)
 	}
 
 	paths := make([]string, 0)
@@ -159,7 +166,7 @@ func parseMarker(marker string) (uint64, error) {
 	trimmed := strings.TrimSpace(marker)
 	value, err := strconv.ParseUint(trimmed, 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("vfs: invalid change marker %q: %w", marker, err)
+		return 0, fmt.Errorf("%w: %q is not a journal position", ErrUnusableMarker, marker)
 	}
 	return value, nil
 }

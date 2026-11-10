@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	publicmanifest "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/manifest"
 	"github.com/crowquillx/silo-shoko-plugin/internal/config"
 	"github.com/crowquillx/silo-shoko-plugin/internal/shoko"
 	"github.com/crowquillx/silo-shoko-plugin/internal/topology"
@@ -171,6 +172,35 @@ func TestManifestAdvertisesScanSource(t *testing.T) {
 		}
 	}
 	t.Fatalf("scan_source.v1 capability missing from manifest: %#v", manifest.GetCapabilities())
+}
+
+// Silo builds the Add-source flow from this descriptor: without it the flow
+// offers a connection step the plugin never reads. The paths are native
+// because they are real paths under the VFS root, which Silo sees as-is.
+func TestManifestDescribesTheScanSource(t *testing.T) {
+	manifest, err := publicmanifest.Load(manifestJSON)
+	if err != nil {
+		t.Fatalf("embedded manifest does not load: %v", err)
+	}
+	if err := publicmanifest.Validate(manifest); err != nil {
+		t.Fatalf("embedded manifest is not valid: %v", err)
+	}
+	for _, capability := range manifest.GetCapabilities() {
+		if capability.GetType() != "scan_source.v1" {
+			continue
+		}
+		descriptor, _ := capability.GetMetadata().AsMap()["scan_source"].(map[string]any)
+		modes, _ := descriptor["delivery_modes"].([]any)
+		summary, _ := descriptor["summary"].(string)
+		if len(modes) != 1 || modes[0] != "poll" || descriptor["connection"] != "none" || descriptor["emits_native_paths"] != true || strings.TrimSpace(summary) == "" {
+			t.Fatalf("scan source descriptor = %#v", descriptor)
+		}
+		if len(descriptor) != 4 {
+			t.Fatalf("scan source descriptor has keys Silo does not read: %#v", descriptor)
+		}
+		return
+	}
+	t.Fatal("no scan source capability")
 }
 
 func TestReconcileTaskKeyAcceptsSiloQualifiedKey(t *testing.T) {
