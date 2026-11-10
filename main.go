@@ -658,7 +658,7 @@ func (s *metadataServer) GetImages(ctx context.Context, req *pluginv1.GetImagesR
 		if req.GetItemType() == "season" || strings.Contains(req.GetProviderId(), ":season:") {
 			return records, nil
 		}
-		return withShowPoster(records, s.runtime.showPoster(ctx, client, groupID)), nil
+		return withShowPoster(records, s.runtime.showPoster(ctx, client, groupID), req.GetLanguage()), nil
 	}
 	return &pluginv1.GetImagesResponse{}, nil
 }
@@ -770,11 +770,21 @@ func imageRecords(images shoko.Images) *pluginv1.GetImagesResponse {
 
 // withShowPoster puts a show poster chosen with the Season Posters Shoko plugin
 // first among a group's images, without listing it twice.
-func withShowPoster(response *pluginv1.GetImagesResponse, poster string) *pluginv1.GetImagesResponse {
+//
+// Silo picks a poster tagged with the library's language before any other, so
+// an untagged show poster would lose to every group poster Shoko tags with
+// that language. The show poster is tagged with the requested language, or
+// English, Silo's fallback, when the request has none: it was chosen for this
+// show and must win.
+func withShowPoster(response *pluginv1.GetImagesResponse, poster, language string) *pluginv1.GetImagesResponse {
 	if poster == "" {
 		return response
 	}
-	images := []*pluginv1.ImageRecord{{Kind: "poster", Url: poster}}
+	language = strings.TrimSpace(language)
+	if language == "" {
+		language = "en"
+	}
+	images := []*pluginv1.ImageRecord{{Kind: "poster", Url: poster, Language: language}}
 	for _, image := range response.GetImages() {
 		if image.GetUrl() != poster {
 			images = append(images, image)
