@@ -668,7 +668,9 @@ func TestGroupShowUsesSeasonPostersShowPoster(t *testing.T) {
 			lookups++
 			fmt.Fprintf(w, `{"shows":[{"key":"group:5","groupId":5,"mainSeriesId":7,"imageId":%q}]}`, seasonPostersShowPoster)
 		case "/api/v3/Group/5":
-			fmt.Fprint(w, groupWithImagesFixture)
+			// The group poster is tagged English, as Shoko tags most TMDB
+			// posters, so Silo would prefer it over an untagged show poster.
+			fmt.Fprint(w, strings.Replace(groupWithImagesFixture, `"available": true, "preferred": true`, `"available": true, "preferred": true, "languageCode": "en"`, 1))
 		case "/api/v3/Group/5/Series":
 			fmt.Fprint(w, `[{"ids":{"id":7,"parentGroup":5,"aniDB":100},"name":"Member Series","aniDB":{"id":100,"type":"TV","airDate":"2014-07-06"}}]`)
 		case "/api/v3/Series/7/Tags", "/api/v3/Series/7/Cast", "/api/v3/Series/7/TMDB/Show":
@@ -691,7 +693,7 @@ func TestGroupShowUsesSeasonPostersShowPoster(t *testing.T) {
 		t.Fatalf("show poster = %q, want %q", got, want)
 	}
 
-	images, err := metadata.GetImages(ctx, &pluginv1.GetImagesRequest{ProviderId: "group:5"})
+	images, err := metadata.GetImages(ctx, &pluginv1.GetImagesRequest{ProviderId: "group:5", Language: "en"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -699,6 +701,20 @@ func TestGroupShowUsesSeasonPostersShowPoster(t *testing.T) {
 	if len(records) != 3 || records[0].GetKind() != "poster" || records[0].GetUrl() != want ||
 		records[1].GetUrl() != "shoko://image/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" {
 		t.Fatalf("show images = %#v", records)
+	}
+	if got := records[0].GetLanguage(); got != "en" {
+		t.Fatalf("show poster language = %q, want the library language", got)
+	}
+	if got := siloPosterChoice(records, "en"); got != want {
+		t.Fatalf("Silo would pick %q, want the show poster", got)
+	}
+
+	untagged, err := metadata.GetImages(ctx, &pluginv1.GetImagesRequest{ProviderId: "group:5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := untagged.GetImages()[0].GetLanguage(); got != "en" {
+		t.Fatalf("show poster language without a request language = %q, want en", got)
 	}
 
 	specials, err := metadata.GetImages(ctx, &pluginv1.GetImagesRequest{ProviderId: "group:5:season:0", ItemType: "season"})
@@ -745,4 +761,22 @@ func TestGroupShowKeepsGroupPosterWithoutSeasonPosters(t *testing.T) {
 			}
 		})
 	}
+}
+
+// siloPosterChoice mirrors how Silo picks a poster from a provider's images:
+// the first poster tagged with the library language, then English, then any.
+func siloPosterChoice(records []*pluginv1.ImageRecord, language string) string {
+	for _, want := range []string{language, "en"} {
+		for _, record := range records {
+			if record.GetKind() == "poster" && strings.EqualFold(record.GetLanguage(), want) {
+				return record.GetUrl()
+			}
+		}
+	}
+	for _, record := range records {
+		if record.GetKind() == "poster" {
+			return record.GetUrl()
+		}
+	}
+	return ""
 }
