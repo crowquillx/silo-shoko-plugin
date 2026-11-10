@@ -556,6 +556,7 @@ func (s *metadataServer) GetSeasons(ctx context.Context, req *pluginv1.GetSeason
 			SeasonNumber: int32(number),
 			Title:        fmt.Sprintf("Season %02d", number),
 			PosterPath:   selectedPosterPath(series.Images),
+			BackdropPath: selectedBackdropPath(series.Images),
 			ProviderId:   fmt.Sprintf("series:%d:season:%d", seriesID, number),
 			ProviderIds:  stringStruct(seasonIDs),
 		}
@@ -637,6 +638,12 @@ func (s *metadataServer) GetImages(ctx context.Context, req *pluginv1.GetImagesR
 			groupID = typedSeasonOwnerID(req.GetProviderId(), "group")
 		}
 	}
+	// Silo asks for one season's artwork with the show's IDs and that season's
+	// number, and keeps only images that carry the number back. The pointer is
+	// checked, not the value, because season zero is the specials season.
+	if req.SeasonNumber != nil {
+		return seasonImages(ctx, client, groupID, seriesID, int(req.GetSeasonNumber()))
+	}
 	// Grouped seasons carry both the parent group and their member series ID.
 	// The member series owns the season artwork, so it must win whenever both
 	// IDs are present.
@@ -661,6 +668,58 @@ func (s *metadataServer) GetImages(ctx context.Context, req *pluginv1.GetImagesR
 		return withShowPoster(records, s.runtime.showPoster(ctx, client, groupID), req.GetLanguage()), nil
 	}
 	return &pluginv1.GetImagesResponse{}, nil
+}
+
+// seasonImages returns the posters and backdrops of one season of a show, each
+// marked with the season number. Seasons are found the way GetSeasons lists
+// them: a group's season is the member series at that position and its specials
+// season shares the group's images, while a series outside a group has season
+// one and a specials season, both with the series' images. A season the show
+// does not have gets no images, so Silo never files another season's artwork
+// under it. The group wins when both IDs are present: the request is about the
+// show, and only the group knows which series is which season.
+func seasonImages(ctx context.Context, client *shoko.Client, groupID, seriesID, season int) (*pluginv1.GetImagesResponse, error) {
+	switch {
+	case groupID > 0 && season == 0:
+		group, err := client.Group(ctx, groupID)
+		if err != nil {
+			return nil, err
+		}
+		return seasonImageRecords(group.Images, season), nil
+	case groupID > 0:
+		members, err := client.GroupSeries(ctx, groupID)
+		if err != nil {
+			return nil, err
+		}
+		layout := topology.NewGroupLayout(members)
+		for _, series := range layout.OrderedMembers {
+			if layout.SeasonNumber(series.IDs.ID) == season {
+				return seasonImageRecords(series.Images, season), nil
+			}
+		}
+	case seriesID > 0 && (season == 0 || season == 1):
+		series, err := client.Series(ctx, seriesID)
+		if err != nil {
+			return nil, err
+		}
+		return seasonImageRecords(series.Images, season), nil
+	}
+	return &pluginv1.GetImagesResponse{}, nil
+}
+
+// seasonImageRecords is imageRecords limited to the kinds Silo keeps for a
+// season, with every record marked as that season's.
+func seasonImageRecords(images shoko.Images, season int) *pluginv1.GetImagesResponse {
+	number := int32(season)
+	response := &pluginv1.GetImagesResponse{}
+	for _, record := range imageRecords(images).GetImages() {
+		if record.GetKind() != "poster" && record.GetKind() != "backdrop" {
+			continue
+		}
+		record.SeasonNumber = &number
+		response.Images = append(response.Images, record)
+	}
+	return response
 }
 
 // ResolveImageURL resolves one scheme-stripped image/<uuid> path to a URL Silo
@@ -1311,6 +1370,7 @@ func groupSeasons(group shoko.Group, members []shoko.Series, episodesBySeries ma
 			Overview:     sanitizeDescription(series.Description),
 			AirDate:      seriesAirDate(series),
 			PosterPath:   poster,
+			BackdropPath: selectedBackdropPath(series.Images),
 			ProviderId:   fmt.Sprintf("series:%d:season:%d", series.IDs.ID, season),
 			ProviderIds:  stringStruct(ids),
 		})
@@ -1324,6 +1384,7 @@ func groupSeasons(group shoko.Group, members []shoko.Series, episodesBySeries ma
 					SeasonNumber: 0,
 					Title:        "Specials",
 					PosterPath:   groupPoster,
+					BackdropPath: selectedBackdropPath(group.Images),
 					ProviderId:   fmt.Sprintf("group:%d:season:0", group.IDs.ID),
 					ProviderIds:  stringStruct(map[string]string{"shoko_group": groupID}),
 				})
@@ -1384,8 +1445,6 @@ func selectImage(images []shoko.Image) *shoko.Image {
 	return fallback
 }
 
-// applyArtwork fills the opaque poster, backdrop, and logo paths on a
-// metadata item from an entity's image set.
 func selectedPosterPath(images shoko.Images) string {
 	if poster := selectImage(images.Posters); poster != nil {
 		return imagePath(*poster)
@@ -1393,11 +1452,18 @@ func selectedPosterPath(images shoko.Images) string {
 	return ""
 }
 
+func selectedBackdropPath(images shoko.Images) string {
+	if backdrop := selectImage(images.Backdrops); backdrop != nil {
+		return imagePath(*backdrop)
+	}
+	return ""
+}
+
+// applyArtwork fills the opaque poster, backdrop, and logo paths on a
+// metadata item from an entity's image set.
 func applyArtwork(item *pluginv1.MetadataItem, images shoko.Images) {
 	item.PosterPath = selectedPosterPath(images)
-	if backdrop := selectImage(images.Backdrops); backdrop != nil {
-		item.BackdropPath = imagePath(*backdrop)
-	}
+	item.BackdropPath = selectedBackdropPath(images)
 	if logo := selectImage(images.Logos); logo != nil {
 		item.LogoPath = imagePath(*logo)
 	}

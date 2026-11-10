@@ -203,6 +203,14 @@ func TestPluginWorksOnBothShokoGenerations(t *testing.T) {
 			if len(images.GetImages()) != 1 || images.GetImages()[0].GetUrl() != generation.wantPoster {
 				t.Fatalf("images = %#v", images.GetImages())
 			}
+			seasonOne := int32(1)
+			gallery, err := metadata.GetImages(ctx, &pluginv1.GetImagesRequest{ProviderId: "group:5", ItemType: "series", ProviderIds: groupIDs, SeasonNumber: &seasonOne})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if records := gallery.GetImages(); len(records) != 1 || records[0].GetUrl() != generation.wantPoster || records[0].SeasonNumber == nil || records[0].GetSeasonNumber() != 1 {
+				t.Fatalf("season gallery = %#v, want the season's poster marked season 1", records)
+			}
 			resolvedImage, err := metadata.ResolveImageURL(ctx, &pluginv1.ResolveImageURLRequest{Path: strings.TrimPrefix(generation.wantPoster, "shoko://")})
 			if err != nil {
 				t.Fatal(err)
