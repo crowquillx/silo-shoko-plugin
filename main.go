@@ -48,6 +48,8 @@ type runtimeServer struct {
 	client     *shoko.Client
 	reconciler *vfs.Reconciler
 	engine     *reconcile.Engine
+	// configErr is why the last settings Silo sent cannot be used, or nil.
+	configErr error
 
 	crawlMu       sync.Mutex
 	crawlCancel   context.CancelFunc
@@ -100,14 +102,46 @@ func (s *runtimeServer) GetManifest(context.Context, *pluginv1.GetManifestReques
 	return &pluginv1.GetManifestResponse{Manifest: s.manifest}, nil
 }
 
+// Configure stores the settings Silo sends. It never fails on settings it
+// cannot use: Silo stops a plugin whose Configure fails, which would keep an
+// installation that is not set up yet from starting at all. The problem is
+// remembered instead, and every call that needs working settings reports it.
+// Settings that cannot be used replace any earlier working ones, so the plugin
+// never keeps running on settings the administrator has since changed.
 func (s *runtimeServer) Configure(_ context.Context, req *pluginv1.ConfigureRequest) (*pluginv1.ConfigureResponse, error) {
-	cfg, err := config.Decode(req.GetConfig())
+	next, err := newConfiguredState(req.GetConfig())
+	s.cancelBackgroundCrawl()
+	s.mu.Lock()
+	s.cfg = next.cfg
+	s.client = next.client
+	s.reconciler = next.reconciler
+	s.engine = next.engine
+	s.images = next.images
+	s.configErr = err
+	s.verifiedUntil = time.Time{}
+	s.mu.Unlock()
+	return &pluginv1.ConfigureResponse{}, nil
+}
+
+// configuredState is everything built from one set of settings.
+type configuredState struct {
+	cfg        config.Connection
+	client     *shoko.Client
+	reconciler *vfs.Reconciler
+	engine     *reconcile.Engine
+	images     *imagestore.Store
+}
+
+// newConfiguredState builds the plugin's state from Silo's settings without
+// contacting Shoko or writing to disk. On an error the state is empty.
+func newConfiguredState(entries []*pluginv1.ConfigEntry) (configuredState, error) {
+	cfg, err := config.Decode(entries)
 	if err != nil {
-		return nil, err
+		return configuredState{}, err
 	}
 	client, err := shoko.NewClient(shoko.Config{BaseURL: cfg.BaseURL, APIKey: cfg.APIKey})
 	if err != nil {
-		return nil, err
+		return configuredState{}, err
 	}
 	sourceRoots := make([]string, 0, len(cfg.ManagedFolderMap))
 	for _, root := range cfg.ManagedFolderMap {
@@ -116,7 +150,7 @@ func (s *runtimeServer) Configure(_ context.Context, req *pluginv1.ConfigureRequ
 	sort.Strings(sourceRoots)
 	reconciler, err := vfs.NewReconciler(vfs.Config{Root: cfg.VFSRoot, AllowedSourceRoots: sourceRoots})
 	if err != nil {
-		return nil, err
+		return configuredState{}, err
 	}
 	engine, err := reconcile.New(reconcile.Config{
 		Client:           client,
@@ -124,7 +158,7 @@ func (s *runtimeServer) Configure(_ context.Context, req *pluginv1.ConfigureRequ
 		ManagedFolderMap: cfg.ManagedFolderMap,
 	})
 	if err != nil {
-		return nil, err
+		return configuredState{}, err
 	}
 	var images *imagestore.Store
 	if cfg.ImageMode == config.ImageS3 {
@@ -137,19 +171,10 @@ func (s *runtimeServer) Configure(_ context.Context, req *pluginv1.ConfigureRequ
 			SecretAccessKey: cfg.ImageS3.SecretAccessKey,
 		}, client.Image)
 		if err != nil {
-			return nil, err
+			return configuredState{}, err
 		}
 	}
-	s.cancelBackgroundCrawl()
-	s.mu.Lock()
-	s.cfg = cfg
-	s.client = client
-	s.reconciler = reconciler
-	s.engine = engine
-	s.images = images
-	s.verifiedUntil = time.Time{}
-	s.mu.Unlock()
-	return &pluginv1.ConfigureResponse{}, nil
+	return configuredState{cfg: cfg, client: client, reconciler: reconciler, engine: engine, images: images}, nil
 }
 
 // Silo gives a scheduled task about ten seconds, far less than a crawl of a real
@@ -298,11 +323,23 @@ func (s *runtimeServer) verifyConnection(ctx context.Context) error {
 	return nil
 }
 
+// notConfiguredLocked returns the error for calls that need working settings,
+// or nil when the plugin has what the call needs. The caller holds s.mu.
+func (s *runtimeServer) notConfiguredLocked(ready bool) error {
+	if s.configErr != nil {
+		return fmt.Errorf("shokoanime: not configured: %s", strings.TrimPrefix(s.configErr.Error(), "shokoanime: "))
+	}
+	if !ready {
+		return errors.New("shokoanime: not configured: Silo has not sent the plugin's settings yet")
+	}
+	return nil
+}
+
 func (s *runtimeServer) state() (config.Connection, *shoko.Client, *vfs.Reconciler, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.client == nil || s.reconciler == nil {
-		return config.Connection{}, nil, nil, fmt.Errorf("shokoanime: plugin is not configured")
+	if err := s.notConfiguredLocked(s.client != nil && s.reconciler != nil); err != nil {
+		return config.Connection{}, nil, nil, err
 	}
 	return s.cfg, s.client, s.reconciler, nil
 }
@@ -310,8 +347,8 @@ func (s *runtimeServer) state() (config.Connection, *shoko.Client, *vfs.Reconcil
 func (s *runtimeServer) reconcilerState() (*vfs.Reconciler, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.reconciler == nil {
-		return nil, fmt.Errorf("shokoanime: plugin is not configured")
+	if err := s.notConfiguredLocked(s.reconciler != nil); err != nil {
+		return nil, err
 	}
 	return s.reconciler, nil
 }
@@ -319,8 +356,8 @@ func (s *runtimeServer) reconcilerState() (*vfs.Reconciler, error) {
 func (s *runtimeServer) engineState() (*reconcile.Engine, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.engine == nil {
-		return nil, fmt.Errorf("shokoanime: plugin is not configured")
+	if err := s.notConfiguredLocked(s.engine != nil); err != nil {
+		return nil, err
 	}
 	return s.engine, nil
 }
@@ -366,21 +403,23 @@ func (s *metadataServer) clock() time.Time {
 }
 
 func (s *metadataServer) Search(ctx context.Context, req *pluginv1.SearchMetadataRequest) (*pluginv1.SearchMetadataResponse, error) {
-	_, client, _, err := s.runtime.state()
-	if err != nil {
-		return nil, err
-	}
 	providerIDs := stringMap(req.GetProviderIds())
 	token := requestToken(providerIDs, providerIDs["_filepath"], req.GetQuery())
 	if !token.Valid() {
-		// Silo's connection test is a title search with no file path or IDs. Scans
-		// always send a file path, so they never wait on Shoko for non-VFS files.
+		// Silo's connection test is a title search with no file path or IDs. It
+		// fails on settings the plugin cannot use as well as on a server it cannot
+		// reach. Scans always send a file path, so they never wait on Shoko for
+		// non-VFS files, and need no settings to learn the file is not Shoko's.
 		if len(providerIDs) == 0 {
 			if err := s.runtime.verifyConnection(ctx); err != nil {
 				return nil, err
 			}
 		}
 		return &pluginv1.SearchMetadataResponse{}, nil
+	}
+	_, client, _, err := s.runtime.state()
+	if err != nil {
+		return nil, err
 	}
 
 	itemType := req.GetItemType()
