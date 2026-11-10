@@ -580,3 +580,71 @@ func TestS3ImageModeFallsBackToShokoWhenTheCopyFails(t *testing.T) {
 		t.Fatalf("invalid path resolved to %q", got)
 	}
 }
+
+// A marker ahead of the journal means the VFS root was wiped or recreated and
+// the journal started again. The source starts over like a first poll instead
+// of skipping every change until the new journal passes the old marker.
+func TestPollStartsOverWhenTheMarkerIsNotInTheJournal(t *testing.T) {
+	generation := shokoGenerations[1]
+	server := httptest.NewServer(generation.handler(t))
+	defer server.Close()
+	source, _ := mediaFixture(t)
+	outputRoot := filepath.Join(t.TempDir(), "vfs")
+	runtime := configuredRuntime(t, server.URL, compatAPIKey, fmt.Sprintf(`{"1":%q}`, source), outputRoot)
+	task := &scheduledTaskServer{runtime: runtime}
+	scanner := &scanSourceServer{runtime: runtime}
+	ctx := context.Background()
+	reconcileVFS := func() {
+		t.Helper()
+		output, err := task.Run(ctx, &pluginv1.RunScheduledTaskRequest{TaskKey: "reconcile"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if output.GetOutput().AsMap()["complete"] != true {
+			t.Fatalf("task output = %#v", output.GetOutput().AsMap())
+		}
+	}
+	reconcileVFS()
+	tail := pollWithin(t, scanner, "", time.Second).GetNextMarker()
+	if tail == "" || tail == "0" {
+		t.Fatalf("marker after the first build = %q", tail)
+	}
+
+	for _, marker := range []string{"100000", "from-another-version"} {
+		response := pollWithin(t, scanner, marker, time.Second)
+		// The whole VFS is scanned once, through the path that sits in its root.
+		if got := response.GetSourcePaths(); len(got) != 1 || filepath.Dir(got[0]) != outputRoot || response.GetNextMarker() != tail {
+			t.Fatalf("poll with marker %q = paths %v, marker %q; want one path directly in %s and marker %q", marker, got, response.GetNextMarker(), outputRoot, tail)
+		}
+	}
+
+	// The VFS root is deleted: the journal is gone and its sequence restarts.
+	if err := os.RemoveAll(outputRoot); err != nil {
+		t.Fatal(err)
+	}
+	emptied := pollWithin(t, scanner, tail, time.Second)
+	if len(emptied.GetSourcePaths()) != 0 || emptied.GetNextMarker() != "0" {
+		t.Fatalf("poll after the root was deleted = paths %v, marker %q; want none and marker 0", emptied.GetSourcePaths(), emptied.GetNextMarker())
+	}
+	reconcileVFS()
+	rebuilt := pollWithin(t, scanner, emptied.GetNextMarker(), time.Second)
+	if len(rebuilt.GetSourcePaths()) == 0 || rebuilt.GetNextMarker() == "0" {
+		t.Fatalf("poll after the rebuild = paths %v, marker %q; want the rebuilt links", rebuilt.GetSourcePaths(), rebuilt.GetNextMarker())
+	}
+
+	// The same deletion, but the rebuild lands before the next poll: the stale
+	// marker is still ahead of the short new journal.
+	stale := "100000"
+	if err := os.RemoveAll(outputRoot); err != nil {
+		t.Fatal(err)
+	}
+	reconcileVFS()
+	resynced := pollWithin(t, scanner, stale, time.Second)
+	if got := resynced.GetSourcePaths(); len(got) != 1 || filepath.Dir(got[0]) != outputRoot || resynced.GetNextMarker() == stale || resynced.GetNextMarker() == "0" {
+		t.Fatalf("poll after a rebuild = paths %v, marker %q; want a whole-VFS scan and the new tail", got, resynced.GetNextMarker())
+	}
+	settled := pollWithin(t, scanner, resynced.GetNextMarker(), time.Second)
+	if len(settled.GetSourcePaths()) != 0 || settled.GetNextMarker() != resynced.GetNextMarker() {
+		t.Fatalf("next poll = paths %v, marker %q", settled.GetSourcePaths(), settled.GetNextMarker())
+	}
+}

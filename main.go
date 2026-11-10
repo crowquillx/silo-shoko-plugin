@@ -1066,6 +1066,13 @@ func (s *scanSourceServer) PollChanges(ctx context.Context, req *pluginv1.PollCh
 		return firstPoll(ctx, reconciler)
 	}
 	paths, nextMarker, err := reconciler.PollChanges(ctx, marker)
+	if errors.Is(err, vfs.ErrUnusableMarker) {
+		// The marker is not a position in this journal, typically because the
+		// VFS root was wiped or recreated and the journal started again. Which
+		// changes the host missed is unknown, so start over like a first poll.
+		fmt.Fprintf(os.Stderr, "shokoanime: restarting the scan source at the journal's tail: %v\n", err)
+		return firstPoll(ctx, reconciler)
+	}
 	if err != nil {
 		return nil, err
 	}
