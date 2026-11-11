@@ -39,6 +39,8 @@ type liveFixture struct {
 	refreshed []string
 	lookups   []string
 	posters   string
+	// noRoots makes Silo list no roots, as for a show an autoscan added.
+	noRoots bool
 }
 
 func newLiveFixture(t *testing.T) *liveFixture {
@@ -85,11 +87,22 @@ func newLiveFixture(t *testing.T) *liveFixture {
 		case r.URL.Path == "/api/v2/libraries/roots":
 			query := r.URL.Query().Get("q")
 			fixture.lookups = append(fixture.lookups, r.URL.Query().Get("library_id")+" "+query)
-			if query == "[Shoko Group=3]" {
+			if query == "[Shoko Group=3]" && !fixture.noRoots {
 				fmt.Fprintf(w, `{"items":[{"root_path":%q,"sample_file_path":"x [Shoko Group=3] [Shoko Series=7].mkv","content_id":"silo-show"}]}`, filepath.Join(fixture.root, "Show (2020)"))
 				return
 			}
 			fmt.Fprint(w, `{"items":[]}`)
+		case r.URL.Path == "/api/v1/catalog":
+			fixture.lookups = append(fixture.lookups, "catalog "+r.URL.Query().Get("q"))
+			if r.URL.Query().Get("q") == "Show" && r.URL.Query().Get("type") == "series" {
+				fmt.Fprint(w, `{"items":[{"content_id":"decoy","type":"series"},{"content_id":"silo-show","type":"series"}]}`)
+				return
+			}
+			fmt.Fprint(w, `{"items":[]}`)
+		case r.URL.Path == "/api/v1/catalog/items/decoy":
+			fmt.Fprint(w, `{"content_id":"decoy","folder_paths":["/elsewhere/Show (2020)"]}`)
+		case r.URL.Path == "/api/v1/catalog/items/silo-show":
+			fmt.Fprintf(w, `{"content_id":"silo-show","folder_paths":[%q]}`, filepath.Join(fixture.root, "Show (2020)"))
 		case strings.HasSuffix(r.URL.Path, "/refresh-metadata"):
 			fixture.refreshed = append(fixture.refreshed, strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/admin/items/"), "/refresh-metadata"))
 			w.WriteHeader(http.StatusAccepted)
@@ -119,6 +132,7 @@ func newLiveFixture(t *testing.T) *liveFixture {
 		client:     client,
 		admin:      silocatalog.NewAdmin(silocatalog.AdminConfig{BaseURL: siloServer.URL, APIKey: "sa_admin"}, nil),
 		shows:      make(map[string]string),
+		folders:    make(map[string]showFolder),
 	}
 	fixture.updates.queue = newRefreshQueue(fixture.updates.refreshShow)
 	fixture.updates.queue.settle, fixture.updates.queue.maxWait = 0, 0
@@ -192,6 +206,27 @@ func TestLiveUpdatesRefreshTheShowOfAChangedEpisode(t *testing.T) {
 	// The second refresh used the cached show ID, and only the library
 	// that scans the VFS was searched.
 	if !reflect.DeepEqual(fixture.lookups, []string{"1 [Shoko Group=3]"}) {
+		t.Fatalf("lookups = %v", fixture.lookups)
+	}
+}
+
+// A show an autoscan added is not among Silo's roots; it is found in the
+// catalog by title and told apart by its folder.
+func TestLiveUpdatesFindAShowSiloHasNoRootFor(t *testing.T) {
+	fixture := newLiveFixture(t)
+	fixture.noRoots = true
+	ctx := context.Background()
+	if _, err := fixture.updates.engine.Step(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	fixture.updates.Apply(ctx, live.Batch{Refresh: live.Refresh{Series: []int{7}}})
+	refreshed := fixture.waitForRefreshes(t, 1)
+	if !reflect.DeepEqual(refreshed, []string{"silo-show"}) {
+		t.Fatalf("refreshed = %v", refreshed)
+	}
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if !reflect.DeepEqual(fixture.lookups, []string{"1 [Shoko Group=3]", "catalog Show"}) {
 		t.Fatalf("lookups = %v", fixture.lookups)
 	}
 }

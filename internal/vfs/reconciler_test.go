@@ -440,3 +440,50 @@ func TestWithExclusiveHonorsDeadlineWhileAnotherCallHoldsIt(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestTrustUnchangedChecksOnlyLinksThatChange(t *testing.T) {
+	root := t.TempDir()
+	source := t.TempDir()
+	outside := t.TempDir()
+	touch(t, filepath.Join(source, "a.mkv"))
+	touch(t, filepath.Join(source, "b.mkv"))
+	reconciler := newReconciler(t, root, source)
+	reconcile := func(plan topology.Plan, trust bool) Result {
+		t.Helper()
+		var result Result
+		err := reconciler.WithExclusive(context.Background(), func(locked *Reconciler) error {
+			var err error
+			result, err = locked.ReconcileLockedWith(context.Background(), plan, false, ReconcileOptions{TrustUnchanged: trust})
+			return err
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	a := link("a", "S/Season 01/a.mkv", filepath.Join(source, "a.mkv"))
+	reconcile(topology.Plan{Entries: []topology.Entry{a}}, false)
+	aLink := filepath.Join(root, "S", "Season 01", "a.mkv")
+
+	// A trusted reconcile does not look at an unchanged link, so a link
+	// deleted behind the plugin's back stays missing...
+	if err := os.Remove(aLink); err != nil {
+		t.Fatal(err)
+	}
+	b := link("b", "S/Season 01/b.mkv", filepath.Join(source, "b.mkv"))
+	reconcile(topology.Plan{Entries: []topology.Entry{a, b}}, true)
+	if _, err := os.Lstat(aLink); !os.IsNotExist(err) {
+		t.Fatalf("trusted reconcile checked an unchanged link: %v", err)
+	}
+	resolvesTo(t, filepath.Join(root, "S", "Season 01", "b.mkv"), filepath.Join(source, "b.mkv"))
+	// ...until a full reconcile repairs it.
+	reconcile(topology.Plan{Entries: []topology.Entry{a, b}}, false)
+	resolvesTo(t, aLink, filepath.Join(source, "a.mkv"))
+
+	// A changed target is still validated.
+	bad := link("b", "S/Season 01/b.mkv", filepath.Join(outside, "b.mkv"))
+	result := reconcile(topology.Plan{Entries: []topology.Entry{a, bad}}, true)
+	if len(result.Failures) != 1 {
+		t.Fatalf("trusted reconcile accepted a target outside the roots: %#v", result)
+	}
+}

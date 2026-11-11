@@ -139,7 +139,22 @@ func (r *Reconciler) WithExclusive(ctx context.Context, fn func(*Reconciler) err
 }
 
 // ReconcileLocked applies a plan while the caller holds WithExclusive.
+// ReconcileOptions tune a reconcile.
+type ReconcileOptions struct {
+	// TrustUnchanged skips checking links the manifest already has with the
+	// same path and target: their targets are not validated again and the
+	// links on disk are not read. On a media share where every file lookup
+	// costs milliseconds, checking every link makes a small change take
+	// minutes. A full reconcile, without this option, still checks them all.
+	TrustUnchanged bool
+}
+
 func (r *Reconciler) ReconcileLocked(ctx context.Context, plan topology.Plan, dryRun bool) (Result, error) {
+	return r.ReconcileLockedWith(ctx, plan, dryRun, ReconcileOptions{})
+}
+
+// ReconcileLockedWith is ReconcileLocked with options.
+func (r *Reconciler) ReconcileLockedWith(ctx context.Context, plan topology.Plan, dryRun bool, options ReconcileOptions) (Result, error) {
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
@@ -158,7 +173,11 @@ func (r *Reconciler) ReconcileLocked(ctx context.Context, plan topology.Plan, dr
 			return Result{}, err
 		}
 	}
-	desired, failures, err := r.validatePlan(plan)
+	trusted := Manifest{}
+	if options.TrustUnchanged {
+		trusted = previous
+	}
+	desired, failures, err := r.validatePlan(plan, trusted)
 	if err != nil {
 		return Result{}, err
 	}
@@ -181,7 +200,7 @@ func (r *Reconciler) ReconcileLocked(ctx context.Context, plan topology.Plan, dr
 	}
 	for key, item := range desired {
 		old, existed := previous.Entries[key]
-		if existed && old.LogicalPath == item.LogicalPath && old.TargetPath == item.TargetPath && r.linkMatches(item.LogicalPath, item.TargetPath) {
+		if existed && old.LogicalPath == item.LogicalPath && old.TargetPath == item.TargetPath && (options.TrustUnchanged || r.linkMatches(item.LogicalPath, item.TargetPath)) {
 			result.Actions = append(result.Actions, Action{Kind: "unchanged", LogicalPath: item.LogicalPath, TargetPath: item.TargetPath})
 			continue
 		}
@@ -226,7 +245,7 @@ func (r *Reconciler) ReconcileLocked(ctx context.Context, plan topology.Plan, dr
 	for key, item := range desired {
 		old, existed := previous.Entries[key]
 		sameLogicalPath := existed && old.LogicalPath == item.LogicalPath
-		if sameLogicalPath && old.TargetPath == item.TargetPath && r.linkMatches(item.LogicalPath, item.TargetPath) {
+		if sameLogicalPath && old.TargetPath == item.TargetPath && (options.TrustUnchanged || r.linkMatches(item.LogicalPath, item.TargetPath)) {
 			entries[key] = item
 			written++
 			continue
@@ -273,8 +292,9 @@ func (r *Reconciler) ReconcileLocked(ctx context.Context, plan topology.Plan, dr
 }
 
 // validatePlan returns the links to create. An entry whose target falls outside
-// the allowed source roots is left out and reported as a failure.
-func (r *Reconciler) validatePlan(plan topology.Plan) (map[string]ManifestItem, []Failure, error) {
+// the allowed source roots is left out and reported as a failure. An entry
+// that trusted has with the same path and target counts as validated.
+func (r *Reconciler) validatePlan(plan topology.Plan, trusted Manifest) (map[string]ManifestItem, []Failure, error) {
 	desired := make(map[string]ManifestItem, len(plan.Entries))
 	logicalPaths := make(map[string]string, len(plan.Entries))
 	var failures []Failure
@@ -290,7 +310,12 @@ func (r *Reconciler) validatePlan(plan topology.Plan) (map[string]ManifestItem, 
 			return nil, nil, fmt.Errorf("%w: %q is used by %s and %s", ErrPathConflict, entry.LogicalPath, previousKey, entry.StableKey)
 		}
 		logicalPaths[entry.LogicalPath] = entry.StableKey
-		target, err := validateTarget(entry.TargetPath, r.config.AllowedSourceRoots)
+		var target string
+		if known, ok := trusted.Entries[entry.StableKey]; ok && known.LogicalPath == entry.LogicalPath && known.TargetPath == filepath.Clean(entry.TargetPath) {
+			target = known.TargetPath
+		} else {
+			target, err = validateTarget(entry.TargetPath, r.config.AllowedSourceRoots)
+		}
 		if err != nil {
 			failures = append(failures, Failure{
 				LogicalPath: entry.LogicalPath,

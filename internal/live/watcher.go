@@ -34,6 +34,11 @@ type Config struct {
 	MaxDelay time.Duration
 	// Logf reports connection problems.
 	Logf func(format string, args ...any)
+	// OnEvent, if set, is called for every event Shoko sends.
+	OnEvent func(target string)
+	// OnDisconnect, if set, is called when a connection attempt or an open
+	// connection fails.
+	OnDisconnect func(err error)
 	// Dial overrides signalr.Dial in tests.
 	Dial func(context.Context, signalr.Config) (Stream, error)
 }
@@ -117,6 +122,9 @@ func (w *Watcher) Run(ctx context.Context) {
 			backoff = minBackoff
 		}
 		w.config.Logf("shokoanime: Shoko event connection lost, retrying in %s: %v", backoff, err)
+		if w.config.OnDisconnect != nil {
+			w.config.OnDisconnect(err)
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -153,6 +161,9 @@ func (w *Watcher) listen(ctx context.Context, reconnect bool, onConnect func()) 
 		invocation, err := stream.Next(ctx)
 		if err != nil {
 			return err
+		}
+		if w.config.OnEvent != nil {
+			w.config.OnEvent(invocation.Target)
 		}
 		if invocation.Target == "feed.joined" {
 			// Daily servers say which feeds they joined; a feed missing here

@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"path/filepath"
+	"regexp"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +17,7 @@ import (
 	"github.com/crowquillx/silo-shoko-plugin/internal/reconcile"
 	"github.com/crowquillx/silo-shoko-plugin/internal/shoko"
 	"github.com/crowquillx/silo-shoko-plugin/internal/silocatalog"
+	"github.com/crowquillx/silo-shoko-plugin/internal/topology"
 	"github.com/crowquillx/silo-shoko-plugin/internal/vfs"
 )
 
@@ -34,6 +38,11 @@ const (
 	libraryCacheTTL = 10 * time.Minute
 )
 
+// liveStartDelay is how long a new plugin process waits before following
+// Shoko. Silo starts a short-lived process with the submitted settings to test
+// a connection; it is gone before then, so it never connects or crawls.
+var liveStartDelay = 30 * time.Second
+
 // liveUpdates follows Shoko's events for one set of settings: it applies file
 // and series changes to the VFS, and asks Silo to refresh shows whose
 // metadata or artwork changed.
@@ -45,12 +54,23 @@ type liveUpdates struct {
 	// admin is nil when no Silo admin API key is set, and queue with it.
 	admin *silocatalog.Admin
 	queue *refreshQueue
+	// status is reported in the reconcile task's output.
+	status *liveStatus
 
 	mu          sync.Mutex
 	libraries   []string
 	librariesAt time.Time
-	// shows caches the Silo show ID for each Shoko marker.
-	shows map[string]string
+	// shows caches the Silo show ID for each Shoko marker, and folders what
+	// identifies the show for a marker queued for a refresh.
+	shows   map[string]string
+	folders map[string]showFolder
+}
+
+// showFolder is how a show is found in Silo: the VFS folder Silo has for it,
+// and titles to search the catalog for.
+type showFolder struct {
+	path   string
+	titles []string
 }
 
 func logf(format string, args ...any) {
@@ -58,16 +78,19 @@ func logf(format string, args ...any) {
 }
 
 // startLiveUpdates starts following Shoko for state and returns how to stop.
-func (s *runtimeServer) startLiveUpdates(state configuredState) context.CancelFunc {
+func (s *runtimeServer) startLiveUpdates(state configuredState) (*liveUpdates, context.CancelFunc) {
 	if !liveUpdatesEnabled || !state.cfg.LiveUpdates {
-		return nil
+		return nil, nil
 	}
+	status := &liveStatus{startedAt: time.Now()}
 	updates := &liveUpdates{
 		runtime:    s,
 		engine:     state.engine,
 		reconciler: state.reconciler,
 		client:     state.client,
 		shows:      make(map[string]string),
+		folders:    make(map[string]showFolder),
+		status:     status,
 	}
 	if state.cfg.SiloBaseURL != "" && state.cfg.SiloAPIKey != "" {
 		updates.admin = silocatalog.NewAdmin(silocatalog.AdminConfig{BaseURL: state.cfg.SiloBaseURL, APIKey: state.cfg.SiloAPIKey}, nil)
@@ -78,19 +101,42 @@ func (s *runtimeServer) startLiveUpdates(state configuredState) context.CancelFu
 		BaseURL: state.cfg.BaseURL,
 		APIKey:  state.cfg.APIKey,
 		Logf:    logf,
+		OnEvent: func(target string) {
+			status.update(func(s *liveStatus) {
+				s.events++
+				s.lastEvent, s.lastEventAt = target, time.Now()
+			})
+		},
+		OnDisconnect: func(err error) {
+			status.update(func(s *liveStatus) {
+				s.connected = false
+				s.disconnectedAt = time.Now()
+				s.lastError = err.Error()
+			})
+		},
 	}, updates)
-	go watcher.Run(ctx)
-	if updates.queue != nil {
-		go updates.queue.Run(ctx)
-		go updates.watchShowPosters(ctx)
-	}
-	return cancel
+	go func() {
+		if !sleep(ctx, liveStartDelay) {
+			return
+		}
+		if updates.queue != nil {
+			go updates.queue.Run(ctx)
+			go updates.watchShowPosters(ctx)
+		}
+		watcher.Run(ctx)
+	}()
+	return updates, cancel
 }
 
 // Connected catches up on changes made while the plugin was not listening,
 // which Shoko does not replay, by starting a full crawl. A commit made just
 // before the plugin started listening is recent enough to skip that.
 func (l *liveUpdates) Connected(ctx context.Context, reconnect bool) {
+	l.status.update(func(s *liveStatus) {
+		s.connected = true
+		s.connectedAt = time.Now()
+		s.connections++
+	})
 	info, err := l.engine.Snapshot(ctx)
 	if err != nil {
 		if ctx.Err() == nil {
@@ -115,6 +161,10 @@ func (l *liveUpdates) Connected(ctx context.Context, reconnect bool) {
 // Apply updates the VFS for a batch of changes, then asks Silo to refresh the
 // shows whose metadata or artwork changed.
 func (l *liveUpdates) Apply(ctx context.Context, batch live.Batch) {
+	l.status.update(func(s *liveStatus) {
+		s.batches++
+		s.lastBatchAt = time.Now()
+	})
 	switch {
 	case batch.Recrawl:
 		// A crawl that is running may have read Shoko before the change.
@@ -137,7 +187,17 @@ func (l *liveUpdates) applyVFS(ctx context.Context, changes reconcile.Changes) {
 		if !l.waitForCrawl(ctx) {
 			return
 		}
+		started := time.Now()
 		outcome, err := l.engine.Apply(ctx, changes)
+		l.status.update(func(s *liveStatus) {
+			s.applies++
+			s.lastApplyAt, s.lastApplyTook = time.Now(), time.Since(started)
+			s.lastApplyLinks = changedLinks(outcome.Result)
+			s.lastApplyError = ""
+			if err != nil {
+				s.lastApplyError = err.Error()
+			}
+		})
 		switch {
 		case err == nil:
 			logReconcileFailures(outcome.Result)
@@ -198,59 +258,103 @@ func (l *liveUpdates) vfsBuilt(ctx context.Context) bool {
 // changed group, series or episode. Silo refreshes a show's seasons, episodes
 // and artwork with it.
 func (l *liveUpdates) refreshChanged(ctx context.Context, refresh live.Refresh) {
-	snapshot, err := l.engine.SnapshotData(ctx)
+	shows, err := l.describeShows(ctx)
 	if err != nil {
 		// Without a snapshot there is no telling which shows are in the VFS.
 		return
 	}
-	inVFS := make(map[int]bool)
-	for _, file := range snapshot.Files {
-		for _, reference := range file.SeriesIDs {
-			if reference.SeriesID.ID != nil {
-				inVFS[*reference.SeriesID.ID] = true
-			}
-		}
-	}
+	markers := make(map[string]struct{})
 	seriesIDs := slices.Clone(refresh.Series)
 	for _, id := range refresh.Episodes {
-		if episode, ok := snapshot.Episodes[id]; ok && episode.IDs.ParentSeries > 0 {
-			seriesIDs = append(seriesIDs, episode.IDs.ParentSeries)
+		if parent, ok := shows.episodeSeries[id]; ok {
+			seriesIDs = append(seriesIDs, parent)
 		}
 	}
-	markers := make(map[string]struct{})
 	for _, id := range seriesIDs {
-		series, ok := snapshot.Series[id]
-		if !ok || !inVFS[id] {
-			continue
-		}
-		markers[showMarker(snapshot, id, series)] = struct{}{}
-	}
-	for _, groupID := range refresh.Groups {
-		if _, ok := snapshot.Groups[groupID]; ok && slices.ContainsFunc(snapshot.GroupSeries[groupID], func(id int) bool { return inVFS[id] }) {
-			markers[fmt.Sprintf("[Shoko Group=%d]", groupID)] = struct{}{}
+		if marker, ok := shows.bySeries[id]; ok {
+			markers[marker] = struct{}{}
 		}
 	}
-	for _, marker := range slices.Sorted(maps.Keys(markers)) {
+	for _, id := range refresh.Groups {
+		if marker, ok := shows.byGroup[id]; ok {
+			markers[marker] = struct{}{}
+		}
+	}
+	l.queueRefreshes(shows, slices.Sorted(maps.Keys(markers)))
+}
+
+func (l *liveUpdates) queueRefreshes(shows vfsShows, markers []string) {
+	l.mu.Lock()
+	for _, marker := range markers {
+		l.folders[marker] = shows.folders[marker]
+	}
+	l.mu.Unlock()
+	for _, marker := range markers {
 		l.queue.Add(marker)
 	}
 }
 
-// showMarker is the marker every file name of the series' show carries. A
-// series in no group is its own show.
-func showMarker(snapshot shoko.Snapshot, seriesID int, series shoko.Series) string {
-	groupIDs := make([]int, 0, 1)
-	for groupID, members := range snapshot.GroupSeries {
-		if slices.Contains(members, seriesID) {
-			if _, ok := snapshot.Groups[groupID]; ok {
-				groupIDs = append(groupIDs, groupID)
-			}
+// vfsShows describes the shows in the VFS: the marker every file of a show
+// carries, by the series and groups in it, and each show's folder.
+type vfsShows struct {
+	bySeries      map[int]string
+	byGroup       map[int]string
+	episodeSeries map[int]int
+	folders       map[string]showFolder
+}
+
+func (l *liveUpdates) describeShows(ctx context.Context) (vfsShows, error) {
+	snapshot, err := l.engine.SnapshotData(ctx)
+	if err != nil {
+		return vfsShows{}, err
+	}
+	plan, err := l.engine.Plan(snapshot)
+	if err != nil {
+		return vfsShows{}, err
+	}
+	return describeShows(l.reconciler.Root(), snapshot, plan), nil
+}
+
+func describeShows(root string, snapshot shoko.Snapshot, plan topology.Plan) vfsShows {
+	shows := vfsShows{
+		bySeries:      make(map[int]string),
+		byGroup:       make(map[int]string),
+		episodeSeries: make(map[int]int),
+		folders:       make(map[string]showFolder),
+	}
+	for id, episode := range snapshot.Episodes {
+		if episode.IDs.ParentSeries > 0 {
+			shows.episodeSeries[id] = episode.IDs.ParentSeries
 		}
 	}
-	if len(groupIDs) > 0 {
-		return fmt.Sprintf("[Shoko Group=%d]", slices.Min(groupIDs))
+	for _, entry := range plan.Entries {
+		marker := fmt.Sprintf("[Shoko Series=%d]", entry.ShokoSeriesID)
+		if entry.ShokoGroupID > 0 {
+			marker = fmt.Sprintf("[Shoko Group=%d]", entry.ShokoGroupID)
+			shows.byGroup[entry.ShokoGroupID] = marker
+		}
+		shows.bySeries[entry.ShokoSeriesID] = marker
+		if _, ok := shows.folders[marker]; ok {
+			continue
+		}
+		segment := strings.SplitN(filepath.ToSlash(entry.LogicalPath), "/", 2)[0]
+		titles := make([]string, 0, 3)
+		if group, ok := snapshot.Groups[entry.ShokoGroupID]; ok && group.Name != "" {
+			titles = append(titles, group.Name)
+		}
+		if series, ok := snapshot.Series[entry.ShokoSeriesID]; ok && series.Name != "" && !slices.Contains(titles, series.Name) {
+			titles = append(titles, series.Name)
+		}
+		if bare := yearSuffix.ReplaceAllString(segment, ""); !slices.Contains(titles, bare) {
+			titles = append(titles, bare)
+		}
+		shows.folders[marker] = showFolder{path: filepath.Join(root, segment), titles: titles}
 	}
-	return fmt.Sprintf("[Shoko Series=%d]", series.IDs.ID)
+	return shows
 }
+
+// yearSuffix is the " (2020)" a show folder name ends with.
+var yearSuffix = regexp.MustCompile(` \(\d{4}\)$`)
 
 func (l *liveUpdates) refreshShow(ctx context.Context, marker string) {
 	for attempt := 0; attempt < 2; attempt++ {
@@ -266,6 +370,14 @@ func (l *liveUpdates) refreshShow(ctx context.Context, marker string) {
 			return
 		}
 		found, err := l.admin.Refresh(ctx, contentID)
+		l.status.update(func(s *liveStatus) {
+			s.lastRefreshAt, s.lastRefreshShow, s.lastRefreshError = time.Now(), marker, ""
+			if err != nil {
+				s.lastRefreshError = err.Error()
+			} else if found {
+				s.refreshes++
+			}
+		})
 		if err != nil {
 			if ctx.Err() == nil {
 				logf("shokoanime: could not ask Silo to refresh %s: %v", marker, err)
@@ -294,16 +406,33 @@ func (l *liveUpdates) showContentID(ctx context.Context, marker string) (string,
 	if err != nil {
 		return "", err
 	}
+	l.mu.Lock()
+	folder := l.folders[marker]
+	l.mu.Unlock()
+	remember := func(contentID string) (string, error) {
+		l.mu.Lock()
+		l.shows[marker] = contentID
+		l.mu.Unlock()
+		return contentID, nil
+	}
 	for _, libraryID := range libraries {
 		contentID, found, err := l.admin.ShowContentID(ctx, libraryID, marker)
 		if err != nil {
 			return "", err
 		}
 		if found {
-			l.mu.Lock()
-			l.shows[marker] = contentID
-			l.mu.Unlock()
-			return contentID, nil
+			return remember(contentID)
+		}
+		if folder.path == "" {
+			continue
+		}
+		// Shows an autoscan added are not among the library's roots.
+		contentID, found, err = l.admin.ShowByFolder(ctx, libraryID, folder.path, folder.titles)
+		if err != nil {
+			return "", err
+		}
+		if found {
+			return remember(contentID)
 		}
 	}
 	return "", nil
@@ -355,13 +484,14 @@ func (l *liveUpdates) watchShowPosters(ctx context.Context) {
 				// Show metadata reads the cached list, which would
 				// otherwise hand Silo's refresh the old poster.
 				l.runtime.setShowPosters(l.client, posters)
-				snapshot, err := l.engine.SnapshotData(ctx)
-				if err == nil {
+				if shows, err := l.describeShows(ctx); err == nil {
+					markers := make([]string, 0, len(changed))
 					for _, groupID := range changed {
-						if _, ok := snapshot.Groups[groupID]; ok {
-							l.queue.Add(fmt.Sprintf("[Shoko Group=%d]", groupID))
+						if marker, ok := shows.byGroup[groupID]; ok {
+							markers = append(markers, marker)
 						}
 					}
+					l.queueRefreshes(shows, markers)
 				}
 			}
 		}
@@ -388,4 +518,18 @@ func changedGroups(before, after map[int]string) []int {
 	}
 	slices.Sort(changed)
 	return changed
+}
+
+// report returns the live-update status for the reconcile task's output.
+func (l *liveUpdates) report() map[string]any {
+	if l == nil {
+		return map[string]any{"enabled": false}
+	}
+	pending := 0
+	if l.queue != nil {
+		pending = l.queue.Pending()
+	}
+	report := l.status.report(pending)
+	report["silo_refreshes"] = l.admin != nil
+	return report
 }

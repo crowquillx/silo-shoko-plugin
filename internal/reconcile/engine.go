@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -222,7 +224,7 @@ func (e *Engine) Step(ctx context.Context, budget time.Duration) (Outcome, error
 					outcome = e.progress(state)
 					return nil
 				}
-				plan, result, err := e.commit(stepCtx, locked, state)
+				plan, result, err := e.commit(stepCtx, locked, state, false)
 				if err != nil {
 					if isBudgetExpiry(stepCtx, ctx, err) {
 						outcome = e.progress(state)
@@ -240,6 +242,12 @@ func (e *Engine) Step(ctx context.Context, budget time.Duration) (Outcome, error
 				// final phase, so moving it is enough.
 				if err := os.Rename(vfs.CrawlStatePath(locked.Root()), vfs.SnapshotPath(locked.Root())); err != nil {
 					return fmt.Errorf("reconcile: keep crawl snapshot: %w", err)
+				}
+				// The file was last written before the commit, which can take
+				// minutes; its time is when the snapshot was committed.
+				now := time.Now()
+				if err := os.Chtimes(vfs.SnapshotPath(locked.Root()), now, now); err != nil {
+					return fmt.Errorf("reconcile: date crawl snapshot: %w", err)
 				}
 				outcome = e.progress(state)
 				outcome.Complete = true
@@ -590,7 +598,11 @@ func (e *Engine) fetchEpisodes(ctx context.Context, state *crawlState) error {
 	return ctx.Err()
 }
 
-func (e *Engine) commit(ctx context.Context, locked *vfs.Reconciler, state *crawlState) (topology.Plan, vfs.Result, error) {
+// commit plans the VFS from state and reconciles it. A full commit checks
+// every link and syncs every theme folder; an incremental one, for changes
+// Shoko reported, checks only links that change and syncs themes only in the
+// show and season folders they are in.
+func (e *Engine) commit(ctx context.Context, locked *vfs.Reconciler, state *crawlState, incremental bool) (topology.Plan, vfs.Result, error) {
 	snapshot := shoko.Snapshot{
 		ManagedFolders: cloneFolders(state.ManagedFolders),
 		Files:          append([]shoko.File(nil), state.Files...),
@@ -607,18 +619,39 @@ func (e *Engine) commit(ctx context.Context, locked *vfs.Reconciler, state *craw
 	if err != nil {
 		return topology.Plan{}, vfs.Result{}, err
 	}
-	result, err := locked.ReconcileLocked(ctx, plan, false)
+	result, err := locked.ReconcileLockedWith(ctx, plan, false, vfs.ReconcileOptions{TrustUnchanged: incremental})
 	if err != nil {
 		return plan, result, err
 	}
+	var only map[string]bool
+	if incremental {
+		only = changedFolders(result)
+	}
 	// Theme songs follow the new links. A theme problem never fails the
 	// reconcile itself; it is reported with the result.
-	themes, err := locked.SyncThemesLocked(ctx, &plan.ThemePairs)
+	themes, err := locked.SyncThemesLockedIn(ctx, &plan.ThemePairs, only)
 	if err != nil {
 		themes.Failures = append(themes.Failures, vfs.Failure{Reason: "theme sync: " + err.Error()})
 	}
 	result.Themes = &themes
 	return plan, result, nil
+}
+
+// changedFolders returns the show and season folders of the links a
+// reconcile created, updated or removed, as theme pairs name them.
+func changedFolders(result vfs.Result) map[string]bool {
+	folders := make(map[string]bool)
+	for _, action := range result.Actions {
+		if action.Kind == "unchanged" {
+			continue
+		}
+		dir := filepath.ToSlash(filepath.Dir(action.LogicalPath))
+		for dir != "." && dir != "/" && dir != "" {
+			folders[dir] = true
+			dir = path.Dir(dir)
+		}
+	}
+	return folders
 }
 
 func (e *Engine) progress(state *crawlState) Outcome {

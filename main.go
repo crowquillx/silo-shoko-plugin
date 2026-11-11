@@ -55,9 +55,11 @@ type runtimeServer struct {
 	// lastThemeSync is when a poll last synced theme songs.
 	lastThemeSync time.Time
 
-	// stopLive stops following Shoko's events for the current settings.
+	// stopLive stops following Shoko's events for the current settings, and
+	// live reports on them.
 	liveMu   sync.Mutex
 	stopLive context.CancelFunc
+	live     *liveUpdates
 
 	crawlMu       sync.Mutex
 	crawlCancel   context.CancelFunc
@@ -106,6 +108,14 @@ func (s *runtimeServer) showPoster(ctx context.Context, client *shoko.Client, gr
 	return shokoImageScheme + imageID
 }
 
+// liveReport describes live updates for the reconcile task's output.
+func (s *runtimeServer) liveReport() map[string]any {
+	s.liveMu.Lock()
+	live := s.live
+	s.liveMu.Unlock()
+	return live.report()
+}
+
 // setShowPosters replaces the cached Season Posters list with a newer one.
 func (s *runtimeServer) setShowPosters(client *shoko.Client, posters map[int]string) {
 	s.postersMu.Lock()
@@ -142,8 +152,9 @@ func (s *runtimeServer) Configure(_ context.Context, req *pluginv1.ConfigureRequ
 		s.stopLive()
 		s.stopLive = nil
 	}
+	s.live = nil
 	if err == nil {
-		s.stopLive = s.startLiveUpdates(next)
+		s.live, s.stopLive = s.startLiveUpdates(next)
 	}
 	s.liveMu.Unlock()
 	return &pluginv1.ConfigureResponse{}, nil
@@ -1000,6 +1011,9 @@ func (s *scheduledTaskServer) Run(ctx context.Context, req *pluginv1.RunSchedule
 	output, err := taskOutput(dryRun, complete, phase, filesFetched, seriesFetched, episodesFetched, plan, result)
 	if err != nil {
 		return nil, err
+	}
+	if live, err := structpb.NewValue(s.runtime.liveReport()); err == nil {
+		output.Fields["live"] = live
 	}
 	return &pluginv1.RunScheduledTaskResponse{Output: output}, nil
 }

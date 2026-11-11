@@ -124,6 +124,58 @@ func (a *Admin) ShowContentID(ctx context.Context, libraryID, marker string) (co
 	return "", false, nil
 }
 
+// ShowByFolder finds the show in a library whose folder is folder, by
+// searching the catalog for each of titles and checking each series found.
+// Silo lists a show among a library's roots only after a full library scan,
+// so a show added by an autoscan is found this way instead. found is false
+// when no show has that folder.
+func (a *Admin) ShowByFolder(ctx context.Context, libraryID, folder string, titles []string) (contentID string, found bool, err error) {
+	folder = filepath.Clean(folder)
+	checked := make(map[string]bool)
+	for _, title := range titles {
+		if strings.TrimSpace(title) == "" {
+			continue
+		}
+		query := url.Values{
+			"library_id": {libraryID},
+			"q":          {title},
+			"type":       {"series"},
+			"limit":      {"20"},
+		}
+		var response struct {
+			Items []struct {
+				ContentID string `json:"content_id"`
+				Type      string `json:"type"`
+			} `json:"items"`
+		}
+		if _, err := a.do(ctx, http.MethodGet, "/api/v1/catalog?"+query.Encode(), nil, &response); err != nil {
+			return "", false, err
+		}
+		for _, item := range response.Items {
+			if item.ContentID == "" || item.Type != "series" || checked[item.ContentID] {
+				continue
+			}
+			checked[item.ContentID] = true
+			var detail struct {
+				FolderPaths []string `json:"folder_paths"`
+			}
+			status, err := a.do(ctx, http.MethodGet, "/api/v1/catalog/items/"+url.PathEscape(item.ContentID), nil, &detail)
+			if err != nil {
+				return "", false, err
+			}
+			if status == http.StatusNotFound {
+				continue
+			}
+			for _, path := range detail.FolderPaths {
+				if filepath.Clean(path) == folder {
+					return item.ContentID, true, nil
+				}
+			}
+		}
+	}
+	return "", false, nil
+}
+
 // Refresh queues a metadata refresh of an item. For a show, Silo also
 // refreshes its seasons, episodes and artwork. found is false when Silo has no
 // such item.

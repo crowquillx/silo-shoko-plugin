@@ -292,3 +292,33 @@ func TestSymlinkedThemesAreNotShared(t *testing.T) {
 		t.Fatalf("result = %#v", result)
 	}
 }
+
+func TestThemeSyncLimitedToFoldersSyncsOnlyThose(t *testing.T) {
+	f := newThemeFixture(t)
+	write(t, filepath.Join(f.show, "theme.mp3"), "song")
+	pairs := []topology.ThemePair{f.pair()}
+	syncIn := func(only map[string]bool) ThemeResult {
+		var result ThemeResult
+		err := f.reconciler.WithExclusive(context.Background(), func(locked *Reconciler) error {
+			var err error
+			result, err = locked.SyncThemesLockedIn(context.Background(), &pairs, only)
+			return err
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	if result := syncIn(map[string]bool{"Other (2021)": true}); result.Linked != 0 {
+		t.Fatalf("sync of another folder linked %d themes", result.Linked)
+	}
+	if _, err := os.Lstat(filepath.Join(f.vfsShow, "theme.mp3")); !os.IsNotExist(err) {
+		t.Fatalf("theme appeared without its folder being synced: %v", err)
+	}
+	if result := syncIn(map[string]bool{"Show (2020)": true}); result.Linked != 1 {
+		t.Fatalf("sync of the show folder linked %d themes", result.Linked)
+	}
+	if read(t, filepath.Join(f.vfsShow, "theme.mp3")) != "song" {
+		t.Fatal("theme not shared")
+	}
+}

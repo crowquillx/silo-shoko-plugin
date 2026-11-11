@@ -97,6 +97,15 @@ func (r *Reconciler) SyncThemes(ctx context.Context) (ThemeResult, error) {
 // SyncThemesLocked syncs theme songs while the caller holds WithExclusive. A
 // non-nil pairs replaces the saved pairs, as a reconcile does.
 func (r *Reconciler) SyncThemesLocked(ctx context.Context, pairs *[]topology.ThemePair) (ThemeResult, error) {
+	return r.SyncThemesLockedIn(ctx, pairs, nil)
+}
+
+// SyncThemesLockedIn is SyncThemesLocked limited to the pairs whose VFS
+// folder is in only, such as the show and season folders whose links just
+// changed. Every pair is still saved, and themes of pairs that are gone are
+// still removed. Reading the media folder of every show costs too much on a
+// slow share for each small update; a nil only syncs every pair.
+func (r *Reconciler) SyncThemesLockedIn(ctx context.Context, pairs *[]topology.ThemePair, only map[string]bool) (ThemeResult, error) {
 	var result ThemeResult
 	state, err := r.readThemeState()
 	if err != nil {
@@ -112,6 +121,9 @@ func (r *Reconciler) SyncThemesLocked(ctx context.Context, pairs *[]topology.The
 			return result, err
 		}
 		current[pair.VFSDir] = struct{}{}
+		if only != nil && !only[pair.VFSDir] {
+			continue
+		}
 		changed = append(changed, r.syncThemePair(pair, state, &result)...)
 	}
 	// A pair can disappear when a show folder is renamed. Themes this plugin

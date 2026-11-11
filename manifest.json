@@ -1,6 +1,6 @@
 {
   "plugin_id": "silo.shokoanime",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "supported_platforms": [
@@ -21,7 +21,7 @@
     "display_name": "ShokoAnime VFS",
     "summary": "Builds a Shoko-backed virtual filesystem for Silo libraries.",
     "description_markdown": "Works with both stable (5.x) and daily (6.x) Shoko Server. Reads Shoko Server API v3, reconciles deterministic plugin-owned leaf symlinks, and publishes successful VFS changes for targeted Silo scans. It listens to Shoko's events, so new, moved and deleted files reach the VFS within seconds, and can ask Silo to refresh a show when its metadata or artwork changes in Shoko. It deliberately does not expose remote streams. It changes Shoko data only for profiles that connect the Shoko watch provider, which marks an episode watched in Shoko when the profile finishes playing it. That provider can also import Shoko's watched episodes into Silo, which is off until a profile turns it on.",
-    "setup_markdown": "Configure a Shoko Server URL, API key, a Silo-visible output root, and managed-folder path mappings, then use the connection test: it checks the URL, the API key, and every mapped folder. The plugin and Silo must share the same filesystem namespace. Run the Reconcile Shoko VFS task to build the library: a crawl that outlasts the task keeps running in the background, and the task output reports its progress. Enable the Shoko VFS autoscan source with a 30 to 60 second poll interval so Silo scans changed paths soon after Shoko changes; the reconcile task then only needs to run every few hours or daily as a repair. To have Silo refresh shows whose metadata or artwork changes in Shoko, set the Silo server URL and a Silo administrator's API key for refreshes. To mark finished episodes watched in Shoko, each profile connects the Shoko watch provider with its own Shoko API key (Shoko Web UI: Settings > API Keys) and a Silo API key for the same profile.",
+    "setup_markdown": "Configure a Shoko Server URL, API key, a Silo-visible output root, and managed-folder path mappings, then use the connection test: it checks the URL, the API key, and every mapped folder. The plugin and Silo must share the same filesystem namespace. Run the Reconcile Shoko VFS task to build the library: a crawl that outlasts the task keeps running in the background, and the task output reports its progress. Enable the Shoko VFS autoscan source and set Silo's default autoscan poll interval to 30 to 60 seconds, which also bounds this source, so Silo scans changed paths soon after Shoko changes; the reconcile task then only needs to run every few hours or daily as a repair. To have Silo refresh shows whose metadata or artwork changes in Shoko, set the Silo server URL and a Silo administrator's API key for refreshes. To mark finished episodes watched in Shoko, each profile connects the Shoko watch provider with its own Shoko API key (Shoko Web UI: Settings > API Keys) and a Silo API key for the same profile.",
     "homepage_url": "https://github.com/crowquillx/silo-shoko-plugin",
     "source_url": "https://github.com/crowquillx/silo-shoko-plugin",
     "support_url": "https://github.com/crowquillx/silo-shoko-plugin/issues",

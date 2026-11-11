@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/crowquillx/silo-shoko-plugin/internal/shoko"
+	"github.com/crowquillx/silo-shoko-plugin/internal/topology"
 	"github.com/crowquillx/silo-shoko-plugin/internal/vfs"
 )
 
@@ -54,7 +55,7 @@ func (c *Changes) Merge(other Changes) {
 // SnapshotInfo describes the snapshot of the last committed crawl.
 type SnapshotInfo struct {
 	Exists bool
-	// CommittedAt is when the snapshot was last written.
+	// CommittedAt is when the snapshot was last committed to the VFS.
 	CommittedAt time.Time
 }
 
@@ -73,7 +74,11 @@ func (e *Engine) Snapshot(ctx context.Context) (SnapshotInfo, error) {
 		if err != nil || state == nil || state.Fingerprint != e.fingerprint || state.Phase != phaseReady {
 			return err
 		}
-		info = SnapshotInfo{Exists: true, CommittedAt: state.UpdatedAt}
+		stat, err := os.Stat(vfs.SnapshotPath(locked.Root()))
+		if err != nil {
+			return fmt.Errorf("reconcile: inspect snapshot: %w", err)
+		}
+		info = SnapshotInfo{Exists: true, CommittedAt: stat.ModTime()}
 		return nil
 	})
 	return info, err
@@ -152,7 +157,7 @@ func (e *Engine) Apply(ctx context.Context, changes Changes) (Outcome, error) {
 				stale = true
 				return nil
 			}
-			plan, result, err := e.commit(ctx, locked, state)
+			plan, result, err := e.commit(ctx, locked, state, true)
 			if err != nil {
 				return err
 			}
@@ -515,4 +520,13 @@ func fetchAll[T any](ctx context.Context, limit int, ids []int, get func(context
 		return nil, firstErr
 	}
 	return results, nil
+}
+
+// Plan returns the VFS plan for a snapshot, as a commit would build it.
+func (e *Engine) Plan(snapshot shoko.Snapshot) (topology.Plan, error) {
+	return topology.Build(snapshot, topology.Policy{
+		Mode:             topology.ModeAniDB,
+		VFSRoot:          e.reconciler.Root(),
+		ManagedFolderMap: e.managedFolderMap,
+	})
 }
