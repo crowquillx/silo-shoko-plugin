@@ -35,7 +35,7 @@ The AniDB rating appears in Silo once an administrator turns on the AniDB rating
 
 Each season uses its Shoko series' preferred poster. Shoko gives a group only its main series' poster, so on its own a show repeats its first season's poster. With the [Season Posters](https://github.com/crowquillx/shoko-season-posters) Shoko plugin installed, a show uses the show poster chosen there in its own show poster mode, and keeps the group poster otherwise. The plugin reads that list at most every 10 minutes. A changed poster appears once the show's metadata is refreshed in Silo. Specials keep the group poster. Each season also gets its Shoko series' backdrop, from the next metadata refresh on.
 
-Silo's **Choose Image** list shows no Shoko artwork for a show or a season. Silo asks providers for that list by TMDB, TVDB or IMDb ID only, and Shoko's artwork is found by Shoko ID. The plugin answers a season's artwork request, but Silo does not send one it can use yet.
+Silo's artwork picker shows no Shoko artwork for a show or a season. Silo asks providers for that list by TMDB, TVDB or IMDb ID only, and Shoko's artwork is found by Shoko ID. The plugin answers a season's artwork request, but Silo does not send one it can use yet.
 
 ## Artwork source
 
