@@ -16,7 +16,9 @@ import (
 type Handler interface {
 	// Connected is called after each successful connection. reconnect is
 	// false for the first one. Events sent while the watcher was not
-	// connected are lost, so this is where to catch up on them.
+	// connected are lost, so this is where to catch up on them. It runs
+	// alongside reading events, so it may block, for example on a lock a
+	// crawl holds, without the server's buffer for this client filling up.
 	Connected(ctx context.Context, reconnect bool)
 	// Apply is called with the merged work of a burst of events. Calls never
 	// overlap; events that arrive meanwhile wait for the next call.
@@ -156,7 +158,7 @@ func (w *Watcher) listen(ctx context.Context, reconnect bool, onConnect func()) 
 	} else {
 		w.config.Logf("shokoanime: listening to Shoko events")
 	}
-	w.handler.Connected(ctx, reconnect)
+	go w.handler.Connected(ctx, reconnect)
 	for {
 		invocation, err := stream.Next(ctx)
 		if err != nil {

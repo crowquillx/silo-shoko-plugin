@@ -256,3 +256,47 @@ func itoa(value int) string {
 	data, _ := json.Marshal(value)
 	return string(data)
 }
+
+// A Connected that blocks, as one waiting for a crawl's lock does, must not
+// stop events from being read and applied.
+func TestWatcherReadsEventsWhileConnectedBlocks(t *testing.T) {
+	stream := newFakeStream()
+	release := make(chan struct{})
+	handler := &blockingHandler{release: release, applied: make(chan Batch, 1)}
+	watcher := New(Config{
+		Quiet:    10 * time.Millisecond,
+		MaxDelay: time.Second,
+		Dial: func(context.Context, signalr.Config) (Stream, error) {
+			return stream, nil
+		},
+	}, handler)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer close(release)
+	go watcher.Run(ctx)
+	stream.send("release:saved", `{"FileID":1}`)
+	select {
+	case batch := <-handler.applied:
+		if !reflect.DeepEqual(batch.VFS.Files, []int{1}) {
+			t.Fatalf("batch = %#v", batch)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("events were not handled while Connected blocked")
+	}
+}
+
+type blockingHandler struct {
+	release chan struct{}
+	applied chan Batch
+}
+
+func (h *blockingHandler) Connected(ctx context.Context, _ bool) {
+	select {
+	case <-h.release:
+	case <-ctx.Done():
+	}
+}
+
+func (h *blockingHandler) Apply(_ context.Context, batch Batch) {
+	h.applied <- batch
+}
