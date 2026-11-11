@@ -297,6 +297,7 @@ func (r *Reconciler) ReconcileLockedWith(ctx context.Context, plan topology.Plan
 func (r *Reconciler) validatePlan(plan topology.Plan, trusted Manifest) (map[string]ManifestItem, []Failure, error) {
 	desired := make(map[string]ManifestItem, len(plan.Entries))
 	logicalPaths := make(map[string]string, len(plan.Entries))
+	validator := newTargetValidator(r.config.AllowedSourceRoots)
 	var failures []Failure
 	for _, entry := range plan.Entries {
 		if entry.StableKey == "" || entry.LogicalPath == "" {
@@ -314,7 +315,7 @@ func (r *Reconciler) validatePlan(plan topology.Plan, trusted Manifest) (map[str
 		if known, ok := trusted.Entries[entry.StableKey]; ok && known.LogicalPath == entry.LogicalPath && known.TargetPath == filepath.Clean(entry.TargetPath) {
 			target = known.TargetPath
 		} else {
-			target, err = validateTarget(entry.TargetPath, r.config.AllowedSourceRoots)
+			target, err = validator.validate(entry.TargetPath)
 		}
 		if err != nil {
 			failures = append(failures, Failure{
@@ -347,6 +348,80 @@ func (r *Reconciler) logicalPath(logical string) (string, error) {
 		return "", fmt.Errorf("%w: logical path %q", ErrOutsideRoot, logical)
 	}
 	return filepath.Join(r.config.Root, relative), nil
+}
+
+// targetValidator is validateTarget with the folder resolutions remembered for
+// one reconcile. A library's files share a few thousand folders, and on a
+// network share each lookup of a path component costs milliseconds, so
+// resolving every file's full path again made a full reconcile take minutes.
+// Only each file itself is looked up, to catch one that is a symlink.
+type targetValidator struct {
+	roots    []string
+	resolved map[string]resolution
+}
+
+type resolution struct {
+	path string
+	ok   bool
+}
+
+func newTargetValidator(roots []string) *targetValidator {
+	return &targetValidator{roots: roots, resolved: make(map[string]resolution)}
+}
+
+func (v *targetValidator) evalSymlinks(path string) (string, bool) {
+	if known, ok := v.resolved[path]; ok {
+		return known.path, known.ok
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	v.resolved[path] = resolution{path: resolved, ok: err == nil}
+	return resolved, err == nil
+}
+
+// validate behaves as validateTarget.
+func (v *targetValidator) validate(target string) (string, error) {
+	if target == "" || !filepath.IsAbs(target) {
+		return "", ErrOutsideRoot
+	}
+	target = filepath.Clean(target)
+	for _, root := range v.roots {
+		if !strictUnder(target, root) {
+			continue
+		}
+		var resolved string
+		info, err := os.Lstat(target)
+		switch {
+		case err != nil:
+			// Missing media is still planned, but its existing parent must
+			// resolve inside the root.
+			parent, ok := v.evalSymlinks(filepath.Dir(target))
+			if !ok {
+				return target, nil
+			}
+			resolved = parent
+		case info.Mode()&os.ModeSymlink != 0:
+			path, err := filepath.EvalSymlinks(target)
+			if err != nil {
+				return target, nil
+			}
+			resolved = path
+		default:
+			parent, ok := v.evalSymlinks(filepath.Dir(target))
+			if !ok {
+				return target, nil
+			}
+			resolved = filepath.Join(parent, filepath.Base(target))
+		}
+		resolvedRoot, ok := v.evalSymlinks(root)
+		if !ok {
+			resolvedRoot = root
+		}
+		if !strictUnder(resolved, resolvedRoot) && filepath.Clean(resolved) != filepath.Clean(resolvedRoot) {
+			return "", ErrOutsideRoot
+		}
+		return target, nil
+	}
+	return "", ErrOutsideRoot
 }
 
 func validateTarget(target string, roots []string) (string, error) {

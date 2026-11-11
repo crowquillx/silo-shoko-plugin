@@ -1037,6 +1037,8 @@ func themeOutput(themes *vfs.ThemeResult) map[string]any {
 
 func taskMessage(dryRun, complete bool, filesFetched, entries int, result vfs.Result) string {
 	switch {
+	case !complete && filesFetched == 0:
+		return "A crawl is running in the background. Links are written when it finishes; run the task again to see if it has."
 	case !complete:
 		return fmt.Sprintf("Still crawling Shoko in the background (%d files so far). Links are written when the crawl finishes.", filesFetched)
 	case dryRun:

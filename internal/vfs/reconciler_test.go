@@ -487,3 +487,60 @@ func TestTrustUnchangedChecksOnlyLinksThatChange(t *testing.T) {
 		t.Fatalf("trusted reconcile accepted a target outside the roots: %#v", result)
 	}
 }
+
+// The validator that remembers folder resolutions must judge every target as
+// validateTarget does, escapes through symlinks included.
+func TestTargetValidatorAgreesWithValidateTarget(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "media")
+	outside := filepath.Join(base, "outside")
+	touch(t, filepath.Join(root, "show", "a.mkv"))
+	touch(t, filepath.Join(outside, "secret.mkv"))
+	mustSymlink := func(target, link string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustSymlink(filepath.Join(outside, "secret.mkv"), filepath.Join(root, "show", "escape.mkv"))
+	mustSymlink(outside, filepath.Join(root, "escape-dir"))
+	mustSymlink(filepath.Join(root, "show"), filepath.Join(root, "alias"))
+	linkedRoot := filepath.Join(base, "linked-media")
+	mustSymlink(root, linkedRoot)
+
+	targets := []string{
+		filepath.Join(root, "show", "a.mkv"),
+		filepath.Join(root, "show", "missing.mkv"),
+		filepath.Join(root, "show", "escape.mkv"),
+		filepath.Join(root, "escape-dir", "secret.mkv"),
+		filepath.Join(root, "escape-dir", "missing.mkv"),
+		filepath.Join(root, "alias", "a.mkv"),
+		filepath.Join(root, "no-such-dir", "a.mkv"),
+		filepath.Join(outside, "secret.mkv"),
+		filepath.Join(root, "show", "..", "..", "outside", "secret.mkv"),
+		"relative/a.mkv",
+		"",
+	}
+	for _, roots := range [][]string{{root}, {linkedRoot}} {
+		validator := newTargetValidator(roots)
+		for _, target := range targets {
+			for _, candidate := range []string{target, strings.Replace(target, root, roots[0], 1)} {
+				wantPath, wantErr := validateTarget(candidate, roots)
+				gotPath, gotErr := validator.validate(candidate)
+				if gotPath != wantPath || !errors.Is(gotErr, wantErr) && gotErr != wantErr {
+					t.Errorf("roots %v, target %q: validator = %q, %v; validateTarget = %q, %v", roots, candidate, gotPath, gotErr, wantPath, wantErr)
+				}
+			}
+		}
+	}
+	// The escapes are refused.
+	validator := newTargetValidator([]string{root})
+	for _, target := range []string{filepath.Join(root, "show", "escape.mkv"), filepath.Join(root, "escape-dir", "secret.mkv")} {
+		if _, err := validator.validate(target); !errors.Is(err, ErrOutsideRoot) {
+			t.Errorf("escape %q accepted: %v", target, err)
+		}
+	}
+}

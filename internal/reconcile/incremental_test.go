@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/crowquillx/silo-shoko-plugin/internal/shoko"
 	"github.com/crowquillx/silo-shoko-plugin/internal/vfs"
@@ -471,5 +472,58 @@ func TestApplyKeepsShokosSeasonOrder(t *testing.T) {
 	}
 	if after := vfsLinks(t, outputRoot); strings.Join(after, "\n") != strings.Join(before, "\n") {
 		t.Fatalf("links after Apply = %v, want %v", after, before)
+	}
+}
+
+// A crawl's step budget paces fetching, but a commit that outlasts it must
+// still sync theme songs; the theme sync used to stop at the step's deadline,
+// so on a slow share it never ran and theme pairs were never saved.
+func TestCommitSyncsThemesAfterTheStepBudget(t *testing.T) {
+	media := t.TempDir()
+	outputRoot := filepath.Join(t.TempDir(), "vfs")
+	show := filepath.Join(media, "Show")
+	for _, name := range []string{"01.mkv", "theme.mp3"} {
+		if err := os.MkdirAll(show, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(show, name), []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fake := &fakeShoko{
+		files:       map[int]fakeFile{9: {path: "Show/01.mkv", series: 7, episode: 42}},
+		seriesGroup: map[int]int{7: 3},
+		episodes:    map[int][2]int{42: {7, 1}},
+		requests:    make(map[string]int),
+	}
+	server := httptest.NewServer(http.HandlerFunc(fake.handler))
+	defer server.Close()
+	client, _ := shoko.NewClient(shoko.Config{BaseURL: server.URL, APIKey: "key"})
+	reconciler, err := vfs.NewReconciler(vfs.Config{Root: outputRoot, AllowedSourceRoots: []string{media}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, err := New(Config{Client: client, Reconciler: reconciler, ManagedFolderMap: map[int]string{1: media}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	// A step with under 1.5 seconds left fetches everything but leaves the
+	// commit to the next one.
+	outcome, err := engine.Step(ctx, time.Second)
+	if err != nil || outcome.Complete || outcome.Phase != string(phaseReady) {
+		t.Fatalf("first step = %#v, %v; want the crawl ready to commit", outcome, err)
+	}
+	afterReconcileHook = func() { time.Sleep(2500 * time.Millisecond) }
+	defer func() { afterReconcileHook = nil }()
+	outcome, err = engine.Step(ctx, 2*time.Second)
+	for err == nil && !outcome.Complete {
+		outcome, err = engine.Step(ctx, 2*time.Second)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.Result.Themes == nil || len(outcome.Result.Themes.Failures) != 0 || outcome.Result.Themes.Linked != 1 {
+		t.Fatalf("themes after a commit that outlasted its step = %#v", outcome.Result.Themes)
 	}
 }

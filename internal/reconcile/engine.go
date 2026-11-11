@@ -224,7 +224,11 @@ func (e *Engine) Step(ctx context.Context, budget time.Duration) (Outcome, error
 					outcome = e.progress(state)
 					return nil
 				}
-				plan, result, err := e.commit(stepCtx, locked, state, false)
+				// The commit runs to the end on the caller's context, not the
+				// step's: it can take minutes on a slow share, and work
+				// after the links, such as the theme sync, stops at a
+				// deadline, which would leave it undone every time.
+				plan, result, err := e.commit(ctx, locked, state, false)
 				if err != nil {
 					if isBudgetExpiry(stepCtx, ctx, err) {
 						outcome = e.progress(state)
@@ -623,6 +627,9 @@ func (e *Engine) commit(ctx context.Context, locked *vfs.Reconciler, state *craw
 	if err != nil {
 		return plan, result, err
 	}
+	if afterReconcileHook != nil {
+		afterReconcileHook()
+	}
 	var only map[string]bool
 	if incremental {
 		only = changedFolders(result)
@@ -636,6 +643,10 @@ func (e *Engine) commit(ctx context.Context, locked *vfs.Reconciler, state *craw
 	result.Themes = &themes
 	return plan, result, nil
 }
+
+// afterReconcileHook lets tests act between a commit's reconcile and its theme
+// sync.
+var afterReconcileHook func()
 
 // changedFolders returns the show and season folders of the links a
 // reconcile created, updated or removed, as theme pairs name them.

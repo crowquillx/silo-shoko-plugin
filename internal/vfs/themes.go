@@ -116,6 +116,7 @@ func (r *Reconciler) SyncThemesLockedIn(ctx context.Context, pairs *[]topology.T
 	}
 	current := make(map[string]struct{}, len(state.Pairs))
 	var changed []string
+	resolver := newTargetValidator(r.config.AllowedSourceRoots)
 	for _, pair := range state.Pairs {
 		if err := ctx.Err(); err != nil {
 			return result, err
@@ -124,7 +125,7 @@ func (r *Reconciler) SyncThemesLockedIn(ctx context.Context, pairs *[]topology.T
 		if only != nil && !only[pair.VFSDir] {
 			continue
 		}
-		changed = append(changed, r.syncThemePair(pair, state, &result)...)
+		changed = append(changed, r.syncThemePair(pair, state, &result, resolver)...)
 	}
 	// A pair can disappear when a show folder is renamed. Themes this plugin
 	// placed there go with it; files written into the VFS stay.
@@ -153,7 +154,7 @@ func (r *Reconciler) SyncThemesLockedIn(ctx context.Context, pairs *[]topology.T
 	return result, r.appendJournal(changed)
 }
 
-func (r *Reconciler) syncThemePair(pair topology.ThemePair, state *themeState, result *ThemeResult) []string {
+func (r *Reconciler) syncThemePair(pair topology.ThemePair, state *themeState, result *ThemeResult, resolver *targetValidator) []string {
 	fail := func(key, target string, err error) {
 		result.Failures = append(result.Failures, Failure{LogicalPath: key, TargetPath: target, Reason: err.Error()})
 	}
@@ -161,7 +162,7 @@ func (r *Reconciler) syncThemePair(pair topology.ThemePair, state *themeState, r
 	if err != nil || checkDirectory(vfsDir) != nil {
 		return nil // the VFS folder does not exist yet
 	}
-	sourceDir, err := r.themeSourceDir(pair.SourceDir)
+	sourceDir, err := r.themeSourceDir(pair.SourceDir, resolver)
 	if err != nil {
 		fail(pair.VFSDir, pair.SourceDir, err)
 		return nil
@@ -265,7 +266,7 @@ func (r *Reconciler) syncThemePair(pair topology.ThemePair, state *themeState, r
 
 // themeSourceDir confines a theme folder to the allowed source roots, also
 // after resolving symlinks.
-func (r *Reconciler) themeSourceDir(dir string) (string, error) {
+func (r *Reconciler) themeSourceDir(dir string, resolver *targetValidator) (string, error) {
 	dir = filepath.Clean(dir)
 	if !filepath.IsAbs(dir) {
 		return "", ErrOutsideRoot
@@ -274,12 +275,12 @@ func (r *Reconciler) themeSourceDir(dir string) (string, error) {
 		if !strictUnder(dir, root) {
 			continue
 		}
-		resolved, err := filepath.EvalSymlinks(dir)
-		if err != nil {
+		resolved, ok := resolver.evalSymlinks(dir)
+		if !ok {
 			return dir, nil // missing: the caller skips it
 		}
-		resolvedRoot, err := filepath.EvalSymlinks(root)
-		if err != nil {
+		resolvedRoot, ok := resolver.evalSymlinks(root)
+		if !ok {
 			resolvedRoot = root
 		}
 		if !strictUnder(resolved, resolvedRoot) {
