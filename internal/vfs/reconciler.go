@@ -299,7 +299,7 @@ func (r *Reconciler) validatePlan(plan topology.Plan) (map[string]ManifestItem, 
 			})
 			continue
 		}
-		if filepath.Clean(linkPath) == filepath.Clean(r.manifestPath) || filepath.Clean(linkPath) == filepath.Clean(r.journalPath) || filepath.Clean(linkPath) == filepath.Clean(r.statePath) || filepath.Clean(linkPath) == filepath.Clean(r.lockPath) || filepath.Clean(linkPath) == filepath.Clean(r.themeStatePath()) {
+		if filepath.Clean(linkPath) == filepath.Clean(r.manifestPath) || filepath.Clean(linkPath) == filepath.Clean(r.journalPath) || filepath.Clean(linkPath) == filepath.Clean(r.statePath) || filepath.Clean(linkPath) == filepath.Clean(SnapshotPath(r.config.Root)) || filepath.Clean(linkPath) == filepath.Clean(r.lockPath) || filepath.Clean(linkPath) == filepath.Clean(r.themeStatePath()) {
 			return nil, nil, errors.New("vfs: plan cannot own plugin state file")
 		}
 		item := ManifestItem{LogicalPath: entry.LogicalPath, TargetPath: target}

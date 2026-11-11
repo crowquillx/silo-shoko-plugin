@@ -133,3 +133,41 @@ func TestDecodeImageModes(t *testing.T) {
 		}
 	}
 }
+
+func TestDecodeLiveUpdatesAndSiloRefresh(t *testing.T) {
+	decode := func(extra map[string]any) (Connection, error) {
+		raw := map[string]any{
+			"base_url":           "http://shoko:8111",
+			"api_key":            "secret",
+			"vfs_root":           "/srv/silo/shoko-vfs",
+			"managed_folder_map": `{"1":"/media/anime"}`,
+		}
+		for key, value := range extra {
+			raw[key] = value
+		}
+		return decodeRaw(raw)
+	}
+	cfg, err := decode(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.LiveUpdates || cfg.SiloBaseURL != "" || cfg.SiloAPIKey != "" {
+		t.Fatalf("defaults = %#v", cfg)
+	}
+	cfg, err = decode(map[string]any{"live_updates": false, "silo_base_url": "http://silo:8080/", "silo_api_key": "sa_key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LiveUpdates || cfg.SiloBaseURL != "http://silo:8080" || cfg.SiloAPIKey != "sa_key" {
+		t.Fatalf("decoded = %#v", cfg)
+	}
+	for _, extra := range []map[string]any{
+		{"silo_base_url": "http://silo:8080"},
+		{"silo_api_key": "sa_key"},
+		{"silo_base_url": "silo:8080", "silo_api_key": "sa_key"},
+	} {
+		if _, err := decode(extra); err == nil {
+			t.Fatalf("accepted %v", extra)
+		}
+	}
+}

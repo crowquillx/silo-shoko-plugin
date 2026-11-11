@@ -1,7 +1,8 @@
 // Package silocatalog reads one profile's view of a Silo catalog item: whether
 // the profile has played it and which files back it. The watch-sync
 // capability uses it to find the Shoko episode behind a finished play, since
-// Silo's watch events carry only the Silo item ID. It never writes to Silo.
+// Silo's watch events carry only the Silo item ID. Its only write is Admin's
+// request that Silo refresh an item.
 package silocatalog
 
 import (

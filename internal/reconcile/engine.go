@@ -235,8 +235,11 @@ func (e *Engine) Step(ctx context.Context, budget time.Duration) (Outcome, error
 					}
 					return err
 				}
-				if err := clearState(vfs.CrawlStatePath(locked.Root())); err != nil {
-					return err
+				// The finished crawl becomes the snapshot that later changes
+				// from Shoko are applied to. Its file is already on disk in its
+				// final phase, so moving it is enough.
+				if err := os.Rename(vfs.CrawlStatePath(locked.Root()), vfs.SnapshotPath(locked.Root())); err != nil {
+					return fmt.Errorf("reconcile: keep crawl snapshot: %w", err)
 				}
 				outcome = e.progress(state)
 				outcome.Complete = true

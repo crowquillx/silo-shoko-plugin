@@ -14,10 +14,40 @@ Part of [Crowquillx Silo Plugins](https://github.com/crowquillx/crowquillx-silo-
 {"1": "/media/anime"}
 ```
 
-4. If Shoko is not on a public address, pick an [artwork source](#artwork-source) so Silo can cache Shoko's artwork. Test the connection, which checks the URL, API key, every mapped folder and the S3 bucket if one is set, then select **Save config**. Enable the plugin's **Shoko VFS changes** Autoscan source and bind the **Reconcile Shoko VFS** scheduled task.
-5. Run **Reconcile Shoko VFS** to generate the library. On a large library the task returns before the crawl ends and the crawl keeps running in the background; run the task again to see its status. When it reports `complete`, create a Silo TV library rooted at the VFS output root. Silo scans a new library straight away, so a library created before the crawl finishes starts empty: scan it once from its menu after the crawl. Keep the Autoscan source enabled to scan future changes.
+4. If Shoko is not on a public address, pick an [artwork source](#artwork-source) so Silo can cache Shoko's artwork. To have Silo refresh shows when their metadata or artwork changes in Shoko, also fill in the [Silo refresh settings](#refreshing-silo). Test the connection, which checks the URL, API key, every mapped folder, the S3 bucket if one is set and the Silo settings if they are set, then select **Save config**. Enable the plugin's **Shoko VFS changes** Autoscan source with a poll interval of 30 to 60 seconds, and bind the **Reconcile Shoko VFS** scheduled task to run every few hours or daily.
+5. Run **Reconcile Shoko VFS** to generate the library. On a large library the task returns before the crawl ends and the crawl keeps running in the background; run the task again to see its status. When it reports `complete`, create a Silo TV library rooted at the VFS output root. Silo scans a new library straight away, so a library created before the crawl finishes starts empty: scan it once from its menu after the crawl. Keep the Autoscan source enabled to scan future changes. From then on the plugin [follows Shoko's changes live](#live-updates).
 
 The Autoscan source picks up changes from the moment it is added. If it is added after the VFS is built, or its first poll fails, its first successful poll scans the whole library once. The same happens if the VFS output root is deleted or recreated: the source notices that its place in the change journal is gone and starts over, rather than missing changes. One case is still missed: if the recreated root already holds more changes than the source had read before its next poll, the source cannot tell the journal is new and skips the earliest ones. After recreating the root, scan the library once from its menu. Polls never wait for a crawl: a crawl still in progress, including one left unfinished by a restart, continues in the background, and its changes are scanned when it finishes.
+
+## Live updates
+
+The plugin listens to Shoko Server's events, as Shokofin does, so the VFS follows Shoko within seconds instead of waiting for the reconcile task:
+
+- When Shoko matches a new file to episodes, removes a match, moves, renames or deletes a file, or marks it ignored or a variation, the plugin reads that file again from Shoko, with its series and group, and updates only the links that change. A new episode is in the VFS about 10 seconds after Shoko matches it, and in Silo at the Autoscan source's next poll.
+- When a series' or episode's metadata changes, for example its episode type or number, the plugin reads that series again and moves its links if their names change.
+- On daily Shoko, when a group is renamed, a series moves to another group, or every group is recreated, the plugin renames or moves the show folders affected, or crawls everything after a recreation. Stable Shoko sends no group events, so there a group change reaches the VFS with the next reconcile.
+- Events are gathered into one update once Shoko has been quiet for 10 seconds, or after a minute at most, so a large import does not update the VFS file by file.
+
+Shoko does not replay events it sent while the plugin was not listening. So when the plugin connects again after losing the connection, or starts more than 10 minutes after the last update, it crawls the whole library once in the background. The **Reconcile Shoko VFS** task still crawls everything each time it runs, to repair anything an event missed, so it can run every few hours or daily rather than often.
+
+Updates apply to the data of the last full crawl, which the plugin keeps in the VFS output root. After upgrading from a version without live updates, or changing the managed-folder map, the plugin crawls once when it starts listening to have that data. A new output root is empty until the reconcile task builds it, as on first install.
+
+To turn live updates off, switch off **Follow Shoko changes live**. The VFS then changes only when the reconcile task runs.
+
+### Refreshing Silo
+
+Silo fetches a show's metadata when it first scans it, and later only when asked. To have the plugin ask Silo to refresh a show when Shoko changes it, set **Silo server URL (for refreshes)** to a URL the plugin reaches Silo at, such as `http://localhost:8080`, and **Silo admin API key (for refreshes)** to an API key of a Silo administrator with no scope limits. Silo gives plugins no other way to start a refresh. The plugin then refreshes a show in Silo:
+
+- when Shoko reports a change to the metadata of any of its series or episodes, from AniDB, TMDB or Shoko itself, or a changed link to TMDB or another provider;
+- when an image of one of them is downloaded, removed, or picked as preferred, in Shoko's Web UI or by a plugin such as [Season Posters](https://github.com/crowquillx/shoko-season-posters) setting season posters;
+- on daily Shoko, when its group is renamed, gains or loses a series, or has its artwork changed;
+- when the show poster chosen for it with Season Posters changes. That plugin sends no event for show posters, so its list is compared every 5 minutes.
+
+A Silo show refresh also refreshes its seasons, episodes and artwork. The plugin finds the show by the `[Shoko Group=<id>]` marker in its file names, in the Silo libraries that scan the VFS output root. A show Silo has not scanned yet is skipped, since its first scan fetches its metadata.
+
+Shoko reports one update as several events spread over minutes, such as the AniDB metadata first and then each image as it finishes downloading. So a show is refreshed once it has had no new change for a minute, or 10 minutes after its first change if changes keep coming, and at most once every 5 minutes; a change in that time waits for the next refresh rather than being dropped. Refreshes of different shows are 2 seconds apart, so Shoko's nightly AniDB update, which reports only the shows whose data actually changed, does not flood Silo's job queue.
+
+Silo downloads an image again only when its address changes. New artwork in Shoko always has a new image ID, and so a new address: Shoko reuses an ID only to download the same remote file again.
 
 ## Library layout
 
@@ -33,7 +63,7 @@ The AniDB rating appears in Silo once an administrator turns on the AniDB rating
 
 ## Posters
 
-Each season uses its Shoko series' preferred poster. Shoko gives a group only its main series' poster, so on its own a show repeats its first season's poster. With the [Season Posters](https://github.com/crowquillx/shoko-season-posters) Shoko plugin installed, a show uses the show poster chosen there in its own show poster mode, and keeps the group poster otherwise. The plugin reads that list at most every 10 minutes. A changed poster appears once the show's metadata is refreshed in Silo. Specials keep the group poster. Each season also gets its Shoko series' backdrop, from the next metadata refresh on.
+Each season uses its Shoko series' preferred poster. Shoko gives a group only its main series' poster, so on its own a show repeats its first season's poster. With the [Season Posters](https://github.com/crowquillx/shoko-season-posters) Shoko plugin installed, a show uses the show poster chosen there in its own show poster mode, and keeps the group poster otherwise. The plugin reads that list at most every 10 minutes. A changed poster appears once the show's metadata is refreshed in Silo, which the plugin [asks Silo to do](#refreshing-silo) when the Silo refresh settings are set. Specials keep the group poster. Each season also gets its Shoko series' backdrop, from the next metadata refresh on.
 
 Silo's artwork picker shows no Shoko artwork for a show or a season. Silo asks providers for that list by TMDB, TVDB or IMDb ID only, and Shoko's artwork is found by Shoko ID. The plugin answers a season's artwork request, but Silo does not send one it can use yet.
 
@@ -61,7 +91,7 @@ Theme songs are kept in sync between your media folders and the VFS, in both dir
 
 Nothing in a media folder is ever overwritten or deleted, and a name clash is reported instead. Silo only plays themes that are real files, so they are hardlinked into the VFS, or copied when the VFS and your media are on different filesystems. Media folders need to be writable for themes to be added to them.
 
-A media folder is only paired with a show or season when every Shoko file in it belongs to that show or series, so shared download folders and managed-folder roots are left alone. Themes sync after each reconcile and on every Autoscan poll.
+A media folder is only paired with a show or season when every Shoko file in it belongs to that show or series, so shared download folders and managed-folder roots are left alone. Themes sync after each reconcile, and on Autoscan polls at most every 5 minutes.
 
 Each link name carries the series' AniDB anime ID as `[AniDB Anime=<id>]`. Theme Songs reads it to find each season's anime, since Shoko shows have no TVDB or TMDB IDs for it to map.
 

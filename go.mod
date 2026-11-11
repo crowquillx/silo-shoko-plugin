@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	github.com/Silo-Server/silo-plugin-sdk v0.32.1
 	github.com/minio/minio-go/v7 v7.4.1
+	golang.org/x/net v0.60.0
 	google.golang.org/protobuf v1.36.12
 )
 
@@ -31,7 +32,6 @@ require (
 	github.com/zeebo/xxh3 v1.1.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
-	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect

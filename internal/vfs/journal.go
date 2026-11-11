@@ -18,6 +18,7 @@ const (
 	changeJournalVersion = 1
 	changeJournalName    = ".shokoanime-change-journal.jsonl"
 	crawlStateName       = ".shokoanime-crawl-state.json"
+	snapshotName         = ".shokoanime-snapshot.json"
 	maxJournalLineBytes  = 1 << 20
 )
 
@@ -43,6 +44,13 @@ func ChangeJournalPath(root string) string {
 // as the manifest and change journal.
 func CrawlStatePath(root string) string {
 	return filepath.Join(filepath.Clean(root), crawlStateName)
+}
+
+// SnapshotPath returns where the Shoko data behind the last committed
+// reconcile is kept, so a change Shoko reports can be applied without
+// crawling the whole library again. It is protected by the VFS lock.
+func SnapshotPath(root string) string {
+	return filepath.Join(filepath.Clean(root), snapshotName)
 }
 
 // ErrUnusableMarker means a marker is not a position in this journal: it is

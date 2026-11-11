@@ -1,6 +1,6 @@
 {
   "plugin_id": "silo.shokoanime",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "supported_platforms": [
@@ -20,8 +20,8 @@
   "presentation": {
     "display_name": "ShokoAnime VFS",
     "summary": "Builds a Shoko-backed virtual filesystem for Silo libraries.",
-    "description_markdown": "Works with both stable (5.x) and daily (6.x) Shoko Server. Reads Shoko Server API v3, reconciles deterministic plugin-owned leaf symlinks, and publishes successful VFS changes for targeted Silo scans. It deliberately does not expose remote streams. It changes Shoko data only for profiles that connect the Shoko watch provider, which marks an episode watched in Shoko when the profile finishes playing it. That provider can also import Shoko's watched episodes into Silo, which is off until a profile turns it on.",
-    "setup_markdown": "Configure a Shoko Server URL, API key, a Silo-visible output root, and managed-folder path mappings, then use the connection test: it checks the URL, the API key, and every mapped folder. The plugin and Silo must share the same filesystem namespace. Run the Reconcile Shoko VFS task to build the library: a crawl that outlasts the task keeps running in the background, and the task output reports its progress. Enable the Shoko VFS autoscan source so Silo scans changed paths automatically. To mark finished episodes watched in Shoko, each profile connects the Shoko watch provider with its own Shoko API key (Shoko Web UI: Settings > API Keys) and a Silo API key for the same profile.",
+    "description_markdown": "Works with both stable (5.x) and daily (6.x) Shoko Server. Reads Shoko Server API v3, reconciles deterministic plugin-owned leaf symlinks, and publishes successful VFS changes for targeted Silo scans. It listens to Shoko's events, so new, moved and deleted files reach the VFS within seconds, and can ask Silo to refresh a show when its metadata or artwork changes in Shoko. It deliberately does not expose remote streams. It changes Shoko data only for profiles that connect the Shoko watch provider, which marks an episode watched in Shoko when the profile finishes playing it. That provider can also import Shoko's watched episodes into Silo, which is off until a profile turns it on.",
+    "setup_markdown": "Configure a Shoko Server URL, API key, a Silo-visible output root, and managed-folder path mappings, then use the connection test: it checks the URL, the API key, and every mapped folder. The plugin and Silo must share the same filesystem namespace. Run the Reconcile Shoko VFS task to build the library: a crawl that outlasts the task keeps running in the background, and the task output reports its progress. Enable the Shoko VFS autoscan source with a 30 to 60 second poll interval so Silo scans changed paths soon after Shoko changes; the reconcile task then only needs to run every few hours or daily as a repair. To have Silo refresh shows whose metadata or artwork changes in Shoko, set the Silo server URL and a Silo administrator's API key for refreshes. To mark finished episodes watched in Shoko, each profile connects the Shoko watch provider with its own Shoko API key (Shoko Web UI: Settings > API Keys) and a Silo API key for the same profile.",
     "homepage_url": "https://github.com/crowquillx/silo-shoko-plugin",
     "source_url": "https://github.com/crowquillx/silo-shoko-plugin",
     "support_url": "https://github.com/crowquillx/silo-shoko-plugin/issues",
@@ -160,7 +160,7 @@
       "key": "connection",
       "title": "ShokoAnime connection",
       "description": "Shoko connection and VFS path policy. The API key is encrypted by Silo.",
-      "json_schema": "{\"type\":\"object\",\"properties\":{\"base_url\":{\"type\":\"string\",\"format\":\"uri\",\"minLength\":1},\"image_mode\":{\"type\":\"string\",\"enum\":[\"direct\",\"public_url\",\"s3\"]},\"image_base_url\":{\"type\":\"string\"},\"s3_endpoint\":{\"type\":\"string\"},\"s3_region\":{\"type\":\"string\"},\"s3_bucket\":{\"type\":\"string\"},\"s3_prefix\":{\"type\":\"string\"},\"s3_access_key_id\":{\"type\":\"string\"},\"s3_secret_access_key\":{\"type\":\"string\"},\"api_key\":{\"type\":\"string\",\"minLength\":1},\"vfs_root\":{\"type\":\"string\",\"minLength\":1},\"managed_folder_map\":{\"type\":\"string\",\"minLength\":2}},\"required\":[\"base_url\",\"api_key\",\"vfs_root\",\"managed_folder_map\"],\"additionalProperties\":false}",
+      "json_schema": "{\"type\":\"object\",\"properties\":{\"base_url\":{\"type\":\"string\",\"format\":\"uri\",\"minLength\":1},\"image_mode\":{\"type\":\"string\",\"enum\":[\"direct\",\"public_url\",\"s3\"]},\"image_base_url\":{\"type\":\"string\"},\"s3_endpoint\":{\"type\":\"string\"},\"s3_region\":{\"type\":\"string\"},\"s3_bucket\":{\"type\":\"string\"},\"s3_prefix\":{\"type\":\"string\"},\"s3_access_key_id\":{\"type\":\"string\"},\"s3_secret_access_key\":{\"type\":\"string\"},\"api_key\":{\"type\":\"string\",\"minLength\":1},\"vfs_root\":{\"type\":\"string\",\"minLength\":1},\"managed_folder_map\":{\"type\":\"string\",\"minLength\":2},\"live_updates\":{\"type\":\"boolean\"},\"silo_base_url\":{\"type\":\"string\"},\"silo_api_key\":{\"type\":\"string\"}},\"required\":[\"base_url\",\"api_key\",\"vfs_root\",\"managed_folder_map\"],\"additionalProperties\":false}",
       "required": true,
       "admin_form": {
         "fields": [
@@ -315,6 +315,27 @@
             "multiline": true,
             "rows": 5,
             "placeholder": "{\"1\": \"/media/anime\"}"
+          },
+          {
+            "key": "live_updates",
+            "label": "Follow Shoko changes live",
+            "description": "Listen to Shoko's events and update the VFS within seconds of a file being added, moved, renamed or deleted, instead of waiting for the Reconcile Shoko VFS task.",
+            "control": "ADMIN_FORM_CONTROL_SWITCH",
+            "default_value": true
+          },
+          {
+            "key": "silo_base_url",
+            "label": "Silo server URL (for refreshes)",
+            "description": "Optional. With a Silo admin API key, the plugin asks Silo to refresh a show when its metadata or artwork changes in Shoko. Use the URL the plugin reaches Silo at, such as http://localhost:8080.",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "placeholder": "http://localhost:8080"
+          },
+          {
+            "key": "silo_api_key",
+            "label": "Silo admin API key (for refreshes)",
+            "description": "Optional. An API key of a Silo administrator, with no scope limits. Silo gives plugins no other way to start a refresh.",
+            "control": "ADMIN_FORM_CONTROL_PASSWORD",
+            "secret": true
           }
         ]
       }

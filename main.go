@@ -29,6 +29,7 @@ import (
 	"github.com/crowquillx/silo-shoko-plugin/internal/imagestore"
 	"github.com/crowquillx/silo-shoko-plugin/internal/reconcile"
 	"github.com/crowquillx/silo-shoko-plugin/internal/shoko"
+	"github.com/crowquillx/silo-shoko-plugin/internal/silocatalog"
 	"github.com/crowquillx/silo-shoko-plugin/internal/topology"
 	"github.com/crowquillx/silo-shoko-plugin/internal/vfs"
 )
@@ -50,6 +51,13 @@ type runtimeServer struct {
 	engine     *reconcile.Engine
 	// configErr is why the last settings Silo sent cannot be used, or nil.
 	configErr error
+
+	// lastThemeSync is when a poll last synced theme songs.
+	lastThemeSync time.Time
+
+	// stopLive stops following Shoko's events for the current settings.
+	liveMu   sync.Mutex
+	stopLive context.CancelFunc
 
 	crawlMu       sync.Mutex
 	crawlCancel   context.CancelFunc
@@ -98,6 +106,13 @@ func (s *runtimeServer) showPoster(ctx context.Context, client *shoko.Client, gr
 	return shokoImageScheme + imageID
 }
 
+// setShowPosters replaces the cached Season Posters list with a newer one.
+func (s *runtimeServer) setShowPosters(client *shoko.Client, posters map[int]string) {
+	s.postersMu.Lock()
+	defer s.postersMu.Unlock()
+	s.posters, s.postersClient, s.postersFetched = posters, client, time.Now()
+}
+
 func (s *runtimeServer) GetManifest(context.Context, *pluginv1.GetManifestRequest) (*pluginv1.GetManifestResponse, error) {
 	return &pluginv1.GetManifestResponse{Manifest: s.manifest}, nil
 }
@@ -110,7 +125,6 @@ func (s *runtimeServer) GetManifest(context.Context, *pluginv1.GetManifestReques
 // never keeps running on settings the administrator has since changed.
 func (s *runtimeServer) Configure(_ context.Context, req *pluginv1.ConfigureRequest) (*pluginv1.ConfigureResponse, error) {
 	next, err := newConfiguredState(req.GetConfig())
-	s.cancelBackgroundCrawl()
 	s.mu.Lock()
 	s.cfg = next.cfg
 	s.client = next.client
@@ -120,6 +134,18 @@ func (s *runtimeServer) Configure(_ context.Context, req *pluginv1.ConfigureRequ
 	s.configErr = err
 	s.verifiedUntil = time.Time{}
 	s.mu.Unlock()
+	// A crawl can no longer start for the old settings, so this stops the
+	// last one that could.
+	s.cancelBackgroundCrawl()
+	s.liveMu.Lock()
+	if s.stopLive != nil {
+		s.stopLive()
+		s.stopLive = nil
+	}
+	if err == nil {
+		s.stopLive = s.startLiveUpdates(next)
+	}
+	s.liveMu.Unlock()
 	return &pluginv1.ConfigureResponse{}, nil
 }
 
@@ -186,11 +212,18 @@ const (
 )
 
 // startBackgroundCrawl finishes a crawl after the scheduled task has returned.
-// It does nothing if a crawl is already running.
+// It does nothing if a crawl is already running, or if engine belongs to
+// settings that have since been replaced.
 func (s *runtimeServer) startBackgroundCrawl(engine *reconcile.Engine) {
 	s.crawlMu.Lock()
 	defer s.crawlMu.Unlock()
 	if s.crawlCancel != nil {
+		return
+	}
+	s.mu.RLock()
+	current := s.engine == engine
+	s.mu.RUnlock()
+	if !current {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -315,6 +348,12 @@ func (s *runtimeServer) verifyConnection(ctx context.Context) error {
 	if images != nil {
 		if err := images.Check(ctx); err != nil {
 			return fmt.Errorf("shokoanime: %w", err)
+		}
+	}
+	if cfg.SiloBaseURL != "" {
+		admin := silocatalog.NewAdmin(silocatalog.AdminConfig{BaseURL: cfg.SiloBaseURL, APIKey: cfg.SiloAPIKey}, nil)
+		if _, err := admin.Libraries(ctx); err != nil {
+			return fmt.Errorf("shokoanime: the Silo settings for refreshes do not work: %w", err)
 		}
 	}
 	s.mu.Lock()
@@ -1094,12 +1133,15 @@ func (s *scanSourceServer) PollChanges(ctx context.Context, req *pluginv1.PollCh
 	if s.runtime.backgroundCrawlRunning() {
 		return &pluginv1.PollChangesResponse{NextMarker: marker}, nil
 	}
-	// Pick up themes written into the VFS since the last poll, so they reach the
-	// media folders without waiting for the next reconcile.
-	if themes, err := reconciler.SyncThemes(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "shokoanime: theme sync failed: %v\n", err)
-	} else {
-		logThemeFailures(themes)
+	// Pick up themes written into the VFS since the last sync, so they reach
+	// the media folders without waiting for the next reconcile. A sync reads
+	// every show and season folder, so short poll intervals do not repeat it.
+	if s.runtime.themeSyncDue() {
+		if themes, err := reconciler.SyncThemes(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "shokoanime: theme sync failed: %v\n", err)
+		} else {
+			logThemeFailures(themes)
+		}
 	}
 	if marker == "" {
 		return firstPoll(ctx, reconciler)
@@ -1119,6 +1161,21 @@ func (s *scanSourceServer) PollChanges(ctx context.Context, req *pluginv1.PollCh
 		SourcePaths: paths,
 		NextMarker:  nextMarker,
 	}, nil
+}
+
+// themeSyncInterval is the least time between theme syncs started by polls.
+const themeSyncInterval = 5 * time.Minute
+
+// themeSyncDue reports whether a poll should sync theme songs, and if so
+// records that it does.
+func (s *runtimeServer) themeSyncDue() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.lastThemeSync.IsZero() && time.Since(s.lastThemeSync) < themeSyncInterval {
+		return false
+	}
+	s.lastThemeSync = time.Now()
+	return true
 }
 
 // firstPoll starts the source at the journal's tail. If the VFS already has

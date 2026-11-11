@@ -332,6 +332,24 @@ func (c *Client) FilesForManagedFolderPage(ctx context.Context, folderID, page i
 	return pageFiles, total, nil
 }
 
+// File fetches one file with its episode cross-references, in the same shape
+// as a managed folder's file list.
+func (c *Client) File(ctx context.Context, fileID int) (File, error) {
+	if fileID < 1 {
+		return File{}, errors.New("shoko: file ID must be positive")
+	}
+	var result File
+	err := c.get(ctx, "/File/"+strconv.Itoa(fileID), url.Values{"include": {"XRefs"}}, &result)
+	return result, err
+}
+
+// IsNotFound reports whether err is Shoko answering 404, which for an ID
+// lookup means the item no longer exists.
+func IsNotFound(err error) bool {
+	var httpErr *HTTPError
+	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound
+}
+
 func (c *Client) Series(ctx context.Context, seriesID int) (Series, error) {
 	if seriesID < 1 {
 		return Series{}, errors.New("shoko: series ID must be positive")

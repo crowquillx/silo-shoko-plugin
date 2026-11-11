@@ -30,6 +30,14 @@ type Connection struct {
 	APIKey           string
 	VFSRoot          string
 	ManagedFolderMap map[int]string
+	// LiveUpdates listens to Shoko's events to update the VFS as soon as
+	// Shoko changes, instead of only when the reconcile task runs.
+	LiveUpdates bool
+	// SiloBaseURL and SiloAPIKey, both optional, let the plugin ask Silo to
+	// refresh a show when its Shoko metadata or artwork changes. The key must
+	// belong to an administrator.
+	SiloBaseURL string
+	SiloAPIKey  string
 }
 
 // Decode reads the plugin's global config entry. Unknown entries are ignored
@@ -83,6 +91,9 @@ func decodeRaw(raw map[string]any) (Connection, error) {
 		APIKey:           stringValue(raw, "api_key"),
 		VFSRoot:          stringValue(raw, "vfs_root"),
 		ManagedFolderMap: make(map[int]string),
+		LiveUpdates:      boolValue(raw, "live_updates", true),
+		SiloBaseURL:      strings.TrimRight(stringValue(raw, "silo_base_url"), "/"),
+		SiloAPIKey:       stringValue(raw, "silo_api_key"),
 	}
 	if cfg.ImageMode == "" {
 		cfg.ImageMode = ImageDirect
@@ -99,6 +110,18 @@ func decodeRaw(raw map[string]any) (Connection, error) {
 func stringValue(values map[string]any, key string) string {
 	value, _ := values[key].(string)
 	return strings.TrimSpace(value)
+}
+
+func boolValue(values map[string]any, key string, fallback bool) bool {
+	switch value := values[key].(type) {
+	case bool:
+		return value
+	case string:
+		if parsed, err := strconv.ParseBool(strings.TrimSpace(value)); err == nil {
+			return parsed
+		}
+	}
+	return fallback
 }
 
 func parseManagedFolderMap(value any, out map[int]string) error {
@@ -220,6 +243,14 @@ func (c Connection) Validate() error {
 	}
 	if c.APIKey == "" {
 		return errors.New("shokoanime: api_key is required")
+	}
+	if (c.SiloBaseURL == "") != (c.SiloAPIKey == "") {
+		return errors.New("shokoanime: silo_base_url and silo_api_key are needed together to refresh Silo")
+	}
+	if c.SiloBaseURL != "" {
+		if err := validateServerURL("silo_base_url", c.SiloBaseURL); err != nil {
+			return err
+		}
 	}
 	if c.VFSRoot == "" || !filepath.IsAbs(c.VFSRoot) {
 		return errors.New("shokoanime: vfs_root must be an absolute path")
