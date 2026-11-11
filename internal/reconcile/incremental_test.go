@@ -29,6 +29,9 @@ type fakeShoko struct {
 	// episodes maps an episode ID to its series and number.
 	episodes map[int][2]int
 	requests map[string]int
+	// memberOrder lists series in the order groups list them; series not in
+	// it follow by ID.
+	memberOrder []int
 	// groupNames overrides a group's name, which is Group <id> by default.
 	groupNames map[int]string
 	// beforeFile runs, once, before the first single-file lookup is
@@ -103,8 +106,14 @@ func (f *fakeShoko) handler(w http.ResponseWriter, r *http.Request) {
 		write(f.episodeJSON(id))
 	case parts[0] == "Group" && len(parts) >= 2:
 		members := make([]any, 0)
+		order := append([]int(nil), f.memberOrder...)
 		for _, seriesID := range sortedKeys(f.seriesGroup) {
-			if f.seriesGroup[seriesID] == id {
+			if !containsID(order, seriesID) {
+				order = append(order, seriesID)
+			}
+		}
+		for _, seriesID := range order {
+			if group, ok := f.seriesGroup[seriesID]; ok && group == id {
 				members = append(members, f.seriesJSON(seriesID, id))
 			}
 		}
@@ -410,5 +419,57 @@ func TestApplyReadsAgainWhenAnotherCommitLandsMeanwhile(t *testing.T) {
 	snapshot, err := engine.SnapshotData(ctx)
 	if err != nil || len(snapshot.Files) != 3 {
 		t.Fatalf("snapshot files = %d, %v", len(snapshot.Files), err)
+	}
+}
+
+// Shoko's order of a group's series decides their season numbers, so a
+// group read again must keep it, not sort it.
+func TestApplyKeepsShokosSeasonOrder(t *testing.T) {
+	sourceRoot := filepath.Join(t.TempDir(), "source")
+	outputRoot := filepath.Join(t.TempDir(), "vfs")
+	if err := os.MkdirAll(sourceRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeShoko{
+		files: map[int]fakeFile{
+			9:  {path: "a.mkv", series: 7, episode: 42},
+			10: {path: "b.mkv", series: 8, episode: 43},
+		},
+		seriesGroup: map[int]int{7: 3, 8: 3},
+		episodes:    map[int][2]int{42: {7, 1}, 43: {8, 1}},
+		// Series 8 is the group's first season.
+		memberOrder: []int{8, 7},
+		requests:    make(map[string]int),
+	}
+	server := httptest.NewServer(http.HandlerFunc(fake.handler))
+	defer server.Close()
+	client, _ := shoko.NewClient(shoko.Config{BaseURL: server.URL, APIKey: "key"})
+	reconciler, err := vfs.NewReconciler(vfs.Config{Root: outputRoot, AllowedSourceRoots: []string{sourceRoot}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, err := New(Config{Client: client, Reconciler: reconciler, ManagedFolderMap: map[int]string{1: sourceRoot}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := engine.Step(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	before := vfsLinks(t, outputRoot)
+	if len(before) != 2 || !strings.Contains(before[0], "Season 01/Series 8") {
+		t.Fatalf("links after crawl = %v", before)
+	}
+	for _, changes := range []Changes{{Series: []int{7}}, {Groups: []int{3}}, {Files: []int{9, 10}}} {
+		outcome, err := engine.Apply(ctx, changes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if changed := changedLinks(outcome); changed != 0 {
+			t.Fatalf("Apply(%+v) changed %d links: %#v", changes, changed, outcome.Result.Actions)
+		}
+	}
+	if after := vfsLinks(t, outputRoot); strings.Join(after, "\n") != strings.Join(before, "\n") {
+		t.Fatalf("links after Apply = %v, want %v", after, before)
 	}
 }

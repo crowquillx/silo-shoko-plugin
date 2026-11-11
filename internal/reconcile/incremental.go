@@ -363,14 +363,17 @@ func (e *Engine) refreshGroups(ctx context.Context, state *crawlState, ids map[i
 		}
 		state.Groups[id] = item.value.group
 		state.GroupDone[id] = true
-		// Keep Shoko's order: it decides the group's season numbers.
+		// Keep Shoko's order: it decides the group's season numbers, so
+		// appendUnique, which sorts, must not be used here.
 		members := make([]int, 0, len(item.value.series))
 		for _, series := range item.value.series {
 			if series.IDs.ID <= 0 {
 				continue
 			}
 			state.Series[series.IDs.ID] = series
-			members = appendUnique(members, series.IDs.ID)
+			if !containsID(members, series.IDs.ID) {
+				members = append(members, series.IDs.ID)
+			}
 		}
 		state.GroupSeries[id] = members
 	}
