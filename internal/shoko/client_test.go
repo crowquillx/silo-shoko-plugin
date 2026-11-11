@@ -394,3 +394,43 @@ func TestImageDownloadsWithTheAPIKey(t *testing.T) {
 		t.Fatalf("missing image err = %v", err)
 	}
 }
+
+func TestMarkEpisodeWatchedAndCurrentUser(t *testing.T) {
+	var marked string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("apikey") != "user-key" {
+			t.Fatalf("apikey header = %q", r.Header.Get("apikey"))
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/User/Current":
+			fmt.Fprint(w, `{"ID":5,"Username":"tan","IsAdmin":false}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v3/Episode/42/Watched/true":
+			marked = r.URL.Path
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v3/Episode/43/Watched/true":
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, "no episode, key user-key")
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{BaseURL: server.URL, APIKey: "user-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := client.CurrentUser(context.Background())
+	if err != nil || user.ID != 5 || user.Username != "tan" {
+		t.Fatalf("user = %+v, err = %v", user, err)
+	}
+	if err := client.MarkEpisodeWatched(context.Background(), 42); err != nil || marked == "" {
+		t.Fatalf("marked = %q, err = %v", marked, err)
+	}
+	err = client.MarkEpisodeWatched(context.Background(), 43)
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusNotFound || strings.Contains(err.Error(), "user-key") {
+		t.Fatalf("err = %v", err)
+	}
+	if err := client.MarkEpisodeWatched(context.Background(), 0); err == nil {
+		t.Fatal("episode 0 should be rejected")
+	}
+}

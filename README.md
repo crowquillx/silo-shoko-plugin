@@ -67,6 +67,23 @@ Each link name carries the series' AniDB anime ID as `[AniDB Anime=<id>]`. Theme
 
 A link that cannot be created is skipped and listed under `failures` in the task output, and the rest of the library is still built.
 
+## Watched status
+
+The plugin can mark an episode watched in Shoko when you finish playing it in Silo, as Shokofin does for Jellyfin, and can import the episodes you watched in Shoko into Silo. Both are off until a profile connects the Shoko watch provider, and importing also needs its own switch. Only new completions are sent to Shoko: plays from before the connection, manual watched marks and progress stay in Silo.
+
+1. In Shoko's Web UI, open **Settings → API Keys** and generate a key while signed in as the Shoko user whose watched status you want updated. Each Silo profile can use its own Shoko user.
+2. In the Silo profile, open **Settings → Watch Providers → Shoko → Connect**. Enter the Shoko API key, then a Silo server URL the plugin can reach (such as `http://localhost:8080` when the plugin runs on the Silo host), a Silo API key for the account that owns the profile, and the profile's ID from `GET /api/v1/profiles`.
+
+Silo's watch events name only the Silo item, not the Shoko episode, so on each finished play the plugin reads the item from Silo as that profile and takes the Shoko episode from its VFS file name. Items outside the Shoko VFS are skipped. The plugin uses the Shoko Server URL from its global configuration and marks the episode with `POST /api/v3/Episode/<id>/Watched/true`, which also marks the episode's files watched. Each marked episode is logged.
+
+A play counts as finished when Silo reports it completed. Some players stop at position zero after finishing; such a stop counts when Silo has the item marked played for the profile. If Shoko or Silo cannot be reached when a play finishes, the failure is logged and shown on the connection. Silo retries playback stops from Jellyfin-compatible clients, but not from its own apps, and the plugin does not export watched history, so such a play may need marking in Shoko by hand.
+
+### Importing from Shoko
+
+To bring watched status the other way, turn on **Import watched episodes from Shoko** in the connection's sync options. It is off by default. Silo's own **Import watched** switch for the connection must also be on, which it is for a new connection. On each sync the plugin lists every episode the connection's Shoko user has watched, and Silo marks the matching episodes watched in the profile, using Shoko's last watched date. Importing only adds watches: unwatching an episode in Shoko does not unwatch it in Silo.
+
+Silo matches imported episodes by their TVDB, TMDB or IMDb episode ID. These are the IDs the plugin's metadata gives each Silo episode from Shoko's links, so an episode Shoko has not linked to TVDB, TMDB or IMDb cannot be imported, and the sync reports how many were skipped. An ID that belongs to more than one Silo episode is ambiguous and is skipped as well. This happens when Shoko links two episodes to the same TMDB episode, or when the same show is also in another Silo library the profile can see. Episodes you finished in Silo come back from Shoko on the next sync; Silo recognises them as the plays it sent and does not record them twice.
+
 ## Build
 
 Requires Go 1.26 or newer.

@@ -1,6 +1,6 @@
 {
   "plugin_id": "silo.shokoanime",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "supported_platforms": [
@@ -20,8 +20,8 @@
   "presentation": {
     "display_name": "ShokoAnime VFS",
     "summary": "Builds a Shoko-backed virtual filesystem for Silo libraries.",
-    "description_markdown": "Works with both stable (5.x) and daily (6.x) Shoko Server. Reads Shoko Server API v3, reconciles deterministic plugin-owned leaf symlinks, and publishes successful VFS changes for targeted Silo scans. It deliberately does not expose remote streams or modify Shoko data.",
-    "setup_markdown": "Configure a Shoko Server URL, API key, a Silo-visible output root, and managed-folder path mappings, then use the connection test: it checks the URL, the API key, and every mapped folder. The plugin and Silo must share the same filesystem namespace. Run the Reconcile Shoko VFS task to build the library: a crawl that outlasts the task keeps running in the background, and the task output reports its progress. Enable the Shoko VFS autoscan source so Silo scans changed paths automatically.",
+    "description_markdown": "Works with both stable (5.x) and daily (6.x) Shoko Server. Reads Shoko Server API v3, reconciles deterministic plugin-owned leaf symlinks, and publishes successful VFS changes for targeted Silo scans. It deliberately does not expose remote streams. It changes Shoko data only for profiles that connect the Shoko watch provider, which marks an episode watched in Shoko when the profile finishes playing it. That provider can also import Shoko's watched episodes into Silo, which is off until a profile turns it on.",
+    "setup_markdown": "Configure a Shoko Server URL, API key, a Silo-visible output root, and managed-folder path mappings, then use the connection test: it checks the URL, the API key, and every mapped folder. The plugin and Silo must share the same filesystem namespace. Run the Reconcile Shoko VFS task to build the library: a crawl that outlasts the task keeps running in the background, and the task output reports its progress. Enable the Shoko VFS autoscan source so Silo scans changed paths automatically. To mark finished episodes watched in Shoko, each profile connects the Shoko watch provider with its own Shoko API key (Shoko Web UI: Settings > API Keys) and a Silo API key for the same profile.",
     "homepage_url": "https://github.com/crowquillx/silo-shoko-plugin",
     "source_url": "https://github.com/crowquillx/silo-shoko-plugin",
     "support_url": "https://github.com/crowquillx/silo-shoko-plugin/issues",
@@ -85,6 +85,74 @@
           "emits_native_paths": true
         }
       }
+    },
+    {
+      "type": "watch_sync_provider.v1",
+      "id": "shoko",
+      "display_name": "Shoko",
+      "description": "Marks an episode watched in Shoko when you finish playing it in Silo, and can import your Shoko watched episodes into Silo. Connect with your Shoko API key, from Settings > API Keys in Shoko's Web UI, and a Silo API key and profile ID: the plugin reads each finished item from Silo to find its Shoko episode.",
+      "watch_sync_provider": {
+        "auth_methods": [
+          "WATCH_SYNC_AUTH_METHOD_API_KEY"
+        ],
+        "scrobble_playback": true,
+        "import_watched": true,
+        "supported_media_types": [
+          "WATCH_SYNC_MEDIA_TYPE_MOVIE",
+          "WATCH_SYNC_MEDIA_TYPE_EPISODE"
+        ],
+        "max_batch_size": 1000,
+        "external_id_namespaces": [
+          "imdb",
+          "tmdb",
+          "tvdb"
+        ],
+        "connection_settings": [
+          {
+            "key": "import_watched",
+            "label": "Import watched episodes from Shoko",
+            "description": "Mark episodes watched in this profile that your Shoko user has watched. Silo matches them by the episode's TVDB, TMDB or IMDb link in Shoko, so episodes without one are skipped. Silo's own import switch must also be on.",
+            "type": "WATCH_SYNC_CONNECTION_SETTING_TYPE_BOOLEAN",
+            "default_value": false
+          }
+        ]
+      },
+      "config_schema": [
+        {
+          "key": "silo",
+          "title": "Silo item lookup",
+          "description": "Silo's watch events do not name the Shoko episode, so the plugin reads each finished item from Silo as this profile. Use the account and profile you are connecting.",
+          "required": true,
+          "json_schema": "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"base_url\":{\"type\":\"string\",\"format\":\"uri\",\"minLength\":1},\"api_key\":{\"type\":\"string\",\"format\":\"password\",\"minLength\":1},\"profile_id\":{\"type\":\"string\",\"minLength\":1}},\"required\":[\"base_url\",\"api_key\",\"profile_id\"]}",
+          "admin_form": {
+            "fields": [
+              {
+                "key": "base_url",
+                "label": "Silo server URL",
+                "description": "The Silo server URL as the plugin reaches it, for example http://localhost:8080 when the plugin runs on the Silo host.",
+                "control": "ADMIN_FORM_CONTROL_TEXT",
+                "required": true
+              },
+              {
+                "key": "api_key",
+                "label": "Silo API key",
+                "description": "An API key for the Silo account that owns this profile. Stored with this connection.",
+                "control": "ADMIN_FORM_CONTROL_PASSWORD",
+                "secret": true,
+                "required": true
+              },
+              {
+                "key": "profile_id",
+                "label": "Silo profile ID",
+                "description": "The ID of the profile you are connecting, from GET /api/v1/profiles.",
+                "control": "ADMIN_FORM_CONTROL_TEXT",
+                "required": true
+              }
+            ],
+            "submit_label": "Connect Shoko"
+          }
+        }
+      ]
     }
   ],
   "global_config_schema": [

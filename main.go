@@ -1183,11 +1183,12 @@ func main() {
 	metadata := &metadataServer{runtime: rt}
 	sdkruntime.Serve(sdkruntime.ServeConfig{
 		Servers: sdkruntime.CapabilityServers{
-			Runtime:          rt,
-			MetadataProvider: metadata,
-			ImageResolver:    metadata,
-			ScheduledTask:    &scheduledTaskServer{runtime: rt},
-			ScanSource:       &scanSourceServer{runtime: rt},
+			Runtime:           rt,
+			MetadataProvider:  metadata,
+			ImageResolver:     metadata,
+			ScheduledTask:     &scheduledTaskServer{runtime: rt},
+			ScanSource:        &scanSourceServer{runtime: rt},
+			WatchSyncProvider: &watchSyncServer{runtime: rt},
 		},
 	})
 }

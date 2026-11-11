@@ -42,8 +42,10 @@ func (e *HTTPError) Error() string {
 	return fmt.Sprintf("shoko: %s returned HTTP %d: %s", e.Endpoint, e.StatusCode, e.Detail)
 }
 
-// Config configures a read-only Shoko v3 client. The API key is only used for
-// the request header and is never included in returned errors.
+// Config configures a Shoko v3 client. The API key is only used for the
+// request header and is never included in returned errors. The VFS and
+// metadata paths only read from Shoko; MarkEpisodeWatched is the client's only
+// write, used by the watch-sync capability with a profile's own API key.
 type Config struct {
 	BaseURL    string
 	APIKey     string
@@ -108,7 +110,14 @@ func (c *Client) get(ctx context.Context, endpoint string, query url.Values, dst
 // fetch sends an authenticated GET to target and decodes the JSON response.
 // endpoint names the request in errors.
 func (c *Client) fetch(ctx context.Context, target, endpoint string, dst any) error {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	return c.do(ctx, http.MethodGet, target, endpoint, dst)
+}
+
+// do sends an authenticated request with no body to target and decodes the
+// JSON response into dst, if dst is not nil. endpoint names the request in
+// errors.
+func (c *Client) do(ctx context.Context, method, target, endpoint string, dst any) error {
+	request, err := http.NewRequestWithContext(ctx, method, target, nil)
 	if err != nil {
 		return fmt.Errorf("shoko: create request: %w", err)
 	}
@@ -178,6 +187,47 @@ func (c *Client) ShowPosters(ctx context.Context) (map[int]string, error) {
 		}
 	}
 	return posters, nil
+}
+
+// CurrentUser returns the Shoko user the client's API key belongs to.
+func (c *Client) CurrentUser(ctx context.Context) (User, error) {
+	var result User
+	err := c.get(ctx, "/User/Current", nil, &result)
+	return result, err
+}
+
+// MarkEpisodeWatched marks an episode watched for the Shoko user the client's
+// API key belongs to. Shoko also marks the episode's files watched, which is
+// its default for this endpoint.
+func (c *Client) MarkEpisodeWatched(ctx context.Context, episodeID int) error {
+	if episodeID < 1 {
+		return fmt.Errorf("shoko: invalid episode ID %d", episodeID)
+	}
+	endpoint := "/Episode/" + strconv.Itoa(episodeID) + "/Watched/true"
+	return c.do(ctx, http.MethodPost, c.resolve(endpoint, nil), endpoint, nil)
+}
+
+// MaxPageSize is the largest page Shoko serves.
+const MaxPageSize = pageSize
+
+// WatchedEpisodesPage returns one page of the episodes the API key's user has
+// watched, across the whole server, and the total number of them. Pages start
+// at 1 and hold at most MaxPageSize episodes.
+func (c *Client) WatchedEpisodesPage(ctx context.Context, page, size int) ([]Episode, int, error) {
+	if page < 1 {
+		return nil, 0, errors.New("shoko: page must be positive")
+	}
+	size = min(max(size, 1), MaxPageSize)
+	var result listResult[Episode]
+	query := url.Values{
+		"includeWatched": {"only"},
+		"pageSize":       {strconv.Itoa(size)},
+		"page":           {strconv.Itoa(page)},
+	}
+	if err := c.get(ctx, "/Episode", query, &result); err != nil {
+		return nil, 0, err
+	}
+	return result.List, result.Total, nil
 }
 
 func (c *Client) Version(ctx context.Context) (VersionSet, error) {

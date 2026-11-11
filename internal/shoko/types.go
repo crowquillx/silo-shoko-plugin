@@ -10,6 +10,7 @@ package shoko
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 )
 
@@ -22,6 +23,12 @@ type Version struct {
 
 type VersionSet struct {
 	Server Version `json:"server"`
+}
+
+// User is a Shoko user account, as /User/Current returns it.
+type User struct {
+	ID       int    `json:"id"`
+	Username string `json:"username"`
 }
 
 type listResult[T any] struct {
@@ -284,6 +291,27 @@ type Episode struct {
 	// TMDB is only filled when requested with includeDataFrom=TMDB. It is kept
 	// raw and read leniently so a TMDB shape change cannot break decoding.
 	TMDB json.RawMessage `json:"tmdb,omitempty"`
+	// Watched is when the API key's user last watched the episode, empty when
+	// they have not. It is kept as text and read by WatchedAt, so an
+	// unexpected date format cannot break decoding.
+	Watched string `json:"watched,omitempty"`
+	// WatchCount is how many times the API key's user watched the episode.
+	WatchCount int `json:"watchCount,omitempty"`
+}
+
+// WatchedAt returns when the API key's user last watched the episode.
+func (e Episode) WatchedAt() (time.Time, bool) {
+	value := strings.TrimSpace(e.Watched)
+	if value == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range []string{time.RFC3339Nano, "2006-01-02T15:04:05.9999999", "2006-01-02T15:04:05"} {
+		if parsed, err := time.Parse(layout, value); err == nil {
+			// Shoko reports UTC; a time without a zone is read as UTC.
+			return parsed.UTC(), !parsed.IsZero()
+		}
+	}
+	return time.Time{}, false
 }
 
 // TMDBTitles returns the titles of the linked TMDB episodes, in Shoko's order.
