@@ -19,6 +19,7 @@ const (
 	changeJournalName    = ".shokoanime-change-journal.jsonl"
 	crawlStateName       = ".shokoanime-crawl-state.json"
 	snapshotName         = ".shokoanime-snapshot.json"
+	liveStatusName       = ".shokoanime-live-status.json"
 	maxJournalLineBytes  = 1 << 20
 )
 
@@ -51,6 +52,12 @@ func CrawlStatePath(root string) string {
 // crawling the whole library again. It is protected by the VFS lock.
 func SnapshotPath(root string) string {
 	return filepath.Join(filepath.Clean(root), snapshotName)
+}
+
+// LiveStatusPath returns where the plugin reports how live updates are going,
+// for an administrator to read without running the reconcile task.
+func LiveStatusPath(root string) string {
+	return filepath.Join(filepath.Clean(root), liveStatusName)
 }
 
 // ErrUnusableMarker means a marker is not a position in this journal: it is

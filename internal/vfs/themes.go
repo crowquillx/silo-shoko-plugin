@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/crowquillx/silo-shoko-plugin/internal/topology"
@@ -70,6 +71,24 @@ type themeState struct {
 	Version int                    `json:"version"`
 	Pairs   []topology.ThemePair   `json:"pairs"`
 	Files   map[string]themeRecord `json:"files"`
+	// Seen is each pair's VFS folder signature when it was last synced, so
+	// SyncChangedThemes can skip folders nothing was written into since.
+	Seen map[string]string `json:"seen,omitempty"`
+}
+
+// vfsFolderSignature changes when a file is added to, removed from or renamed
+// in a VFS show or season folder or its theme-music folder, which is how a
+// theme written into the VFS shows. It is "" for a folder that does not exist.
+func vfsFolderSignature(dir string) string {
+	info, err := os.Stat(dir)
+	if err != nil {
+		return ""
+	}
+	signature := strconv.FormatInt(info.ModTime().UnixNano(), 10)
+	if themes, err := os.Stat(filepath.Join(dir, vfsThemeFolder)); err == nil {
+		signature += "/" + strconv.FormatInt(themes.ModTime().UnixNano(), 10)
+	}
+	return signature
 }
 
 // ThemeResult summarises one theme sync.
@@ -126,6 +145,12 @@ func (r *Reconciler) SyncThemesLockedIn(ctx context.Context, pairs *[]topology.T
 			continue
 		}
 		changed = append(changed, r.syncThemePair(pair, state, &result, resolver)...)
+		r.markSeen(state, pair)
+	}
+	for dir := range state.Seen {
+		if _, kept := current[dir]; !kept {
+			delete(state.Seen, dir)
+		}
 	}
 	// A pair can disappear when a show folder is renamed. Themes this plugin
 	// placed there go with it; files written into the VFS stay.
@@ -152,6 +177,54 @@ func (r *Reconciler) SyncThemesLockedIn(ctx context.Context, pairs *[]topology.T
 		return result, err
 	}
 	return result, r.appendJournal(changed)
+}
+
+func (r *Reconciler) markSeen(state *themeState, pair topology.ThemePair) {
+	vfsDir, err := r.logicalPath(pair.VFSDir)
+	if err != nil {
+		return
+	}
+	if state.Seen == nil {
+		state.Seen = make(map[string]string)
+	}
+	state.Seen[pair.VFSDir] = vfsFolderSignature(vfsDir)
+}
+
+// SyncChangedThemes syncs only the pairs whose VFS folder changed since they
+// were last synced, such as one a theme was written into. It is for polls:
+// a full sync reads every show's media folder, which on a slow share takes
+// minutes, while this checks two folder times per pair. Themes added in a
+// media folder are picked up by the next full sync, after a reconcile.
+func (r *Reconciler) SyncChangedThemes(ctx context.Context) (ThemeResult, error) {
+	var result ThemeResult
+	if _, err := os.Lstat(r.config.Root); os.IsNotExist(err) {
+		return result, nil
+	}
+	err := r.WithExclusive(ctx, func(locked *Reconciler) error {
+		state, err := locked.readThemeState()
+		if err != nil {
+			return err
+		}
+		only := make(map[string]bool)
+		for _, pair := range state.Pairs {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			vfsDir, err := locked.logicalPath(pair.VFSDir)
+			if err != nil {
+				continue
+			}
+			if seen, ok := state.Seen[pair.VFSDir]; !ok || seen != vfsFolderSignature(vfsDir) {
+				only[pair.VFSDir] = true
+			}
+		}
+		if len(only) == 0 {
+			return nil
+		}
+		result, err = locked.SyncThemesLockedIn(ctx, nil, only)
+		return err
+	})
+	return result, err
 }
 
 func (r *Reconciler) syncThemePair(pair topology.ThemePair, state *themeState, result *ThemeResult, resolver *targetValidator) []string {

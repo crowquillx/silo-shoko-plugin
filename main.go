@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/protobuf/types/known/structpb"
@@ -52,8 +53,10 @@ type runtimeServer struct {
 	// configErr is why the last settings Silo sent cannot be used, or nil.
 	configErr error
 
-	// lastThemeSync is when a poll last synced theme songs.
+	// lastThemeSync is when a poll last synced theme songs, and themeSyncing
+	// whether that sync is still running.
 	lastThemeSync time.Time
+	themeSyncing  atomic.Bool
 
 	// stopLive stops following Shoko's events for the current settings, and
 	// live reports on them.
@@ -1150,14 +1153,11 @@ func (s *scanSourceServer) PollChanges(ctx context.Context, req *pluginv1.PollCh
 		return &pluginv1.PollChangesResponse{NextMarker: marker}, nil
 	}
 	// Pick up themes written into the VFS since the last sync, so they reach
-	// the media folders without waiting for the next reconcile. A sync reads
-	// every show and season folder, so short poll intervals do not repeat it.
+	// the media folders without waiting for the next reconcile. It runs after
+	// the poll answers, and checks only VFS folders that changed; the paths it
+	// changes are reported by a later poll.
 	if s.runtime.themeSyncDue() {
-		if themes, err := reconciler.SyncThemes(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "shokoanime: theme sync failed: %v\n", err)
-		} else {
-			logThemeFailures(themes)
-		}
+		s.runtime.startThemeSync(reconciler)
 	}
 	if marker == "" {
 		return firstPoll(ctx, reconciler)
@@ -1181,6 +1181,25 @@ func (s *scanSourceServer) PollChanges(ctx context.Context, req *pluginv1.PollCh
 
 // themeSyncInterval is the least time between theme syncs started by polls.
 const themeSyncInterval = 5 * time.Minute
+
+// startThemeSync syncs the themes of changed VFS folders in the background,
+// unless such a sync is still running.
+func (s *runtimeServer) startThemeSync(reconciler *vfs.Reconciler) {
+	if !s.themeSyncing.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer s.themeSyncing.Store(false)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+		themes, err := reconciler.SyncChangedThemes(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "shokoanime: theme sync failed: %v\n", err)
+			return
+		}
+		logThemeFailures(themes)
+	}()
+}
 
 // themeSyncDue reports whether a poll should sync theme songs, and if so
 // records that it does.

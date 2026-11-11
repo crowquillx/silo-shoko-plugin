@@ -322,3 +322,45 @@ func TestThemeSyncLimitedToFoldersSyncsOnlyThose(t *testing.T) {
 		t.Fatal("theme not shared")
 	}
 }
+
+func TestChangedThemeSyncWritesBackWhatWasWrittenIntoTheVFS(t *testing.T) {
+	f := newThemeFixture(t)
+	f.sync(f.pair())
+	changed := func() ThemeResult {
+		t.Helper()
+		result, err := f.reconciler.SyncChangedThemes(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	// Nothing changed in the VFS since the full sync.
+	if result := changed(); result.WrittenBack != 0 || result.Linked != 0 {
+		t.Fatalf("sync of unchanged folders = %#v", result)
+	}
+
+	// A theme added on the media side waits for the next full sync, which
+	// is what keeps polls from reading every media folder...
+	write(t, filepath.Join(f.show, "theme.mp3"), "song")
+	if result := changed(); result.Linked != 0 {
+		t.Fatalf("changed-folder sync read a media folder: %#v", result)
+	}
+	if result := f.sync(); result.Linked != 1 {
+		t.Fatalf("full sync = %#v", result)
+	}
+
+	// ...while one written into the VFS, as Theme Songs does, is written
+	// back, inside a theme-music folder that is new and then one that exists.
+	for _, name := range []string{"animethemes-op1.mp3", "animethemes-ed1.mp3"} {
+		write(t, filepath.Join(f.vfsShow, "theme-music", name), name)
+		if result := changed(); result.WrittenBack != 1 || len(result.Failures) != 0 {
+			t.Fatalf("changed-folder sync after writing %s = %#v", name, result)
+		}
+		if read(t, filepath.Join(f.show, "theme-music", name)) != name {
+			t.Fatalf("%s was not written back", name)
+		}
+	}
+	if result := changed(); result.WrittenBack != 0 || result.Linked != 0 {
+		t.Fatalf("sync after write-back changed something: %#v", result)
+	}
+}

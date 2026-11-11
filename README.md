@@ -34,7 +34,7 @@ Updates apply to the data of the last full crawl, which the plugin keeps in the 
 
 To turn live updates off, switch off **Follow Shoko changes live**. The VFS then changes only when the reconcile task runs. A new plugin process waits 30 seconds before it connects, so the short-lived one Silo starts to test a connection never does.
 
-Silo does not show plugin logs among its own, so the **Reconcile Shoko VFS** task output reports live updates under `live`: whether the plugin is connected to Shoko, the events and batches it has received, how long the last update took and how many links it changed, any error, and the Silo refreshes done and waiting.
+Silo does not show plugin logs among its own, so the plugin reports how live updates are going in `.shokoanime-live-status.json` in the VFS output root, rewritten at most every 15 seconds: whether it is connected to Shoko, the events and batches it has received, how long the last update took and how many links it changed, any error, and the Silo refreshes done and waiting. The **Reconcile Shoko VFS** task output reports the same under `live`, but running the task also starts a full crawl.
 
 ### Refreshing Silo
 
@@ -93,7 +93,7 @@ Theme songs are kept in sync between your media folders and the VFS, in both dir
 
 Nothing in a media folder is ever overwritten or deleted, and a name clash is reported instead. Silo only plays themes that are real files, so they are hardlinked into the VFS, or copied when the VFS and your media are on different filesystems. Media folders need to be writable for themes to be added to them.
 
-A media folder is only paired with a show or season when every Shoko file in it belongs to that show or series, so shared download folders and managed-folder roots are left alone. Themes sync after each reconcile, and on Autoscan polls at most every 5 minutes.
+A media folder is only paired with a show or season when every Shoko file in it belongs to that show or series, so shared download folders and managed-folder roots are left alone. Themes sync after each reconcile. Autoscan polls, at most every 5 minutes and in the background, sync the show and season folders that something was written into, which is how a theme Theme Songs downloads reaches the media folder. A theme added in a media folder appears in the VFS after the next reconcile, since reading every media folder on each poll takes minutes on a slow share.
 
 Each link name carries the series' AniDB anime ID as `[AniDB Anime=<id>]`. Theme Songs reads it to find each season's anime, since Shoko shows have no TVDB or TMDB IDs for it to map.
 

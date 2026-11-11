@@ -1,15 +1,23 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/crowquillx/silo-shoko-plugin/internal/vfs"
 )
 
-// liveStatus records what live updates have done, for the reconcile task's
-// output: Silo keeps plugin logs out of its own log view, so the task output
-// is where an administrator can see whether the plugin follows Shoko.
+// liveStatus records what live updates have done, for the status file and the
+// reconcile task's output: Silo keeps plugin logs out of its own log view, so
+// these are where an administrator can see whether the plugin follows Shoko.
 type liveStatus struct {
 	mu sync.Mutex
+	// dirty is set when something changed since the status file was written.
+	dirty bool
 
 	startedAt      time.Time
 	connected      bool
@@ -44,6 +52,16 @@ func (s *liveStatus) update(fn func(*liveStatus)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	fn(s)
+	s.dirty = true
+}
+
+// takeDirty reports whether the status changed since the last call.
+func (s *liveStatus) takeDirty() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dirty := s.dirty
+	s.dirty = false
+	return dirty
 }
 
 // report returns the status for the task output.
@@ -83,4 +101,49 @@ func (s *liveStatus) report(pending int) map[string]any {
 		"last_refresh_show":  s.lastRefreshShow,
 		"last_refresh_error": s.lastRefreshError,
 	}
+}
+
+// statusWriteInterval bounds how often the status file is rewritten.
+const statusWriteInterval = 15 * time.Second
+
+// writeStatusFiles keeps the live status in the VFS root, where it can be read
+// without running the reconcile task, which starts a full crawl.
+func (l *liveUpdates) writeStatusFiles(ctx context.Context) {
+	ticker := time.NewTicker(statusWriteInterval)
+	defer ticker.Stop()
+	for {
+		if l.status.takeDirty() {
+			report := l.report()
+			report["updated_at"] = time.Now().UTC().Format(time.RFC3339)
+			if err := writeJSONFile(vfs.LiveStatusPath(l.reconciler.Root()), report); err != nil && ctx.Err() == nil {
+				logf("shokoanime: could not write the live status: %v", err)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// writeJSONFile replaces path with value as JSON, atomically.
+func writeJSONFile(path string, value any) error {
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".shokoanime-status-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(append(data, '\n')); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }

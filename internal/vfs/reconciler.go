@@ -325,7 +325,7 @@ func (r *Reconciler) validatePlan(plan topology.Plan, trusted Manifest) (map[str
 			})
 			continue
 		}
-		if filepath.Clean(linkPath) == filepath.Clean(r.manifestPath) || filepath.Clean(linkPath) == filepath.Clean(r.journalPath) || filepath.Clean(linkPath) == filepath.Clean(r.statePath) || filepath.Clean(linkPath) == filepath.Clean(SnapshotPath(r.config.Root)) || filepath.Clean(linkPath) == filepath.Clean(r.lockPath) || filepath.Clean(linkPath) == filepath.Clean(r.themeStatePath()) {
+		if filepath.Clean(linkPath) == filepath.Clean(r.manifestPath) || filepath.Clean(linkPath) == filepath.Clean(r.journalPath) || filepath.Clean(linkPath) == filepath.Clean(r.statePath) || filepath.Clean(linkPath) == filepath.Clean(SnapshotPath(r.config.Root)) || filepath.Clean(linkPath) == filepath.Clean(LiveStatusPath(r.config.Root)) || filepath.Clean(linkPath) == filepath.Clean(r.lockPath) || filepath.Clean(linkPath) == filepath.Clean(r.themeStatePath()) {
 			return nil, nil, errors.New("vfs: plan cannot own plugin state file")
 		}
 		item := ManifestItem{LogicalPath: entry.LogicalPath, TargetPath: target}
@@ -358,6 +358,9 @@ func (r *Reconciler) logicalPath(logical string) (string, error) {
 type targetValidator struct {
 	roots    []string
 	resolved map[string]resolution
+	// listed holds each folder's entries by name with their type bits, or
+	// nil for a folder that could not be read.
+	listed map[string]map[string]fs.FileMode
 }
 
 type resolution struct {
@@ -366,7 +369,36 @@ type resolution struct {
 }
 
 func newTargetValidator(roots []string) *targetValidator {
-	return &targetValidator{roots: roots, resolved: make(map[string]resolution)}
+	return &targetValidator{roots: roots, resolved: make(map[string]resolution), listed: make(map[string]map[string]fs.FileMode)}
+}
+
+// fileType returns the type bits of path, and whether it exists. Listing a
+// folder once answers for every file in it, where looking each file up costs
+// a round trip on a network share.
+func (v *targetValidator) fileType(path string) (fs.FileMode, bool) {
+	dir, name := filepath.Split(path)
+	dir = filepath.Clean(dir)
+	entries, known := v.listed[dir]
+	if !known {
+		list, err := os.ReadDir(dir)
+		if err == nil {
+			entries = make(map[string]fs.FileMode, len(list))
+			for _, entry := range list {
+				entries[entry.Name()] = entry.Type()
+			}
+		}
+		v.listed[dir] = entries
+	}
+	if entries == nil {
+		// The folder cannot be listed, but the file may still be reachable.
+		info, err := os.Lstat(path)
+		if err != nil {
+			return 0, false
+		}
+		return info.Mode().Type(), true
+	}
+	mode, ok := entries[name]
+	return mode, ok
 }
 
 func (v *targetValidator) evalSymlinks(path string) (string, bool) {
@@ -389,9 +421,9 @@ func (v *targetValidator) validate(target string) (string, error) {
 			continue
 		}
 		var resolved string
-		info, err := os.Lstat(target)
+		mode, exists := v.fileType(target)
 		switch {
-		case err != nil:
+		case !exists:
 			// Missing media is still planned, but its existing parent must
 			// resolve inside the root.
 			parent, ok := v.evalSymlinks(filepath.Dir(target))
@@ -399,7 +431,7 @@ func (v *targetValidator) validate(target string) (string, error) {
 				return target, nil
 			}
 			resolved = parent
-		case info.Mode()&os.ModeSymlink != 0:
+		case mode&os.ModeSymlink != 0:
 			path, err := filepath.EvalSymlinks(target)
 			if err != nil {
 				return target, nil

@@ -123,6 +123,7 @@ func (s *runtimeServer) startLiveUpdates(state configuredState) (*liveUpdates, c
 			go updates.queue.Run(ctx)
 			go updates.watchShowPosters(ctx)
 		}
+		go updates.writeStatusFiles(ctx)
 		watcher.Run(ctx)
 	}()
 	return updates, cancel
