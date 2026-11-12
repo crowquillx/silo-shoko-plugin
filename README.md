@@ -23,7 +23,7 @@ The Autoscan source picks up changes from the moment it is added. If it is added
 
 The plugin listens to Shoko Server's events, as Shokofin does, so the VFS follows Shoko within seconds instead of waiting for the reconcile task:
 
-- When Shoko matches a new file to episodes, removes a match, moves, renames or deletes a file, or marks it ignored or a variation, the plugin reads that file again from Shoko, with its series and group, and updates only the links that change. A new episode is in the VFS about 10 seconds after Shoko matches it, and in Silo at the Autoscan source's next poll.
+- When Shoko matches a new file to episodes, removes a match, moves, renames or deletes a file, or marks it ignored or a variation, the plugin reads that file again from Shoko, with its series and group, and updates only the links that change. A file whose content Shoko already knows, such as one removed and added back, keeps its stored match and gets no match event, so it is read again when Shoko finishes hashing it. A new episode is in the VFS about 10 seconds after Shoko matches it, and in Silo at the Autoscan source's next poll.
 - When a series' or episode's metadata changes, for example its episode type or number, the plugin reads that series again and moves its links if their names change.
 - On daily Shoko, when a group is renamed, a series moves to another group, or every group is recreated, the plugin renames or moves the show folders affected, or crawls everything after a recreation. Stable Shoko sends no group events, so there a group change reaches the VFS with the next reconcile.
 - Events are gathered into one update once Shoko has been quiet for 10 seconds, or after a minute at most, so a large import does not update the VFS file by file.

@@ -40,7 +40,16 @@ func TestTranslate(t *testing.T) {
 		{"stable no match", "ShokoEvent:FileNotMatched", `{"FileID":2,"HasCrossReferences":false}`, files(2), true},
 		{"stable rename", "ShokoEvent:FileRenamed", `{"FileID":8,"FileName":"b.mkv"}`, files(8), true},
 		{"file without ID", "release:saved", `{}`, Batch{}, false},
-		{"file hashed", "file:hashed", `{"FileID":5}`, Batch{}, false},
+		{"new file hashed", "file:hashed", `{"FileID":5,"CrossReferences":[]}`, Batch{}, false},
+		{"hashed without cross-references", "file:hashed", `{"FileID":5}`, Batch{}, false},
+		{
+			"known file hashed again", "file:hashed",
+			`{"FileID":18664,"FileLocationID":18665,"ManagedFolderID":1,"RelativePath":"a.mkv","CrossReferences":[{"EpisodeID":27952,"AnidbEpisodeID":301,"SeriesID":397,"AnidbAnimeID":19882,"GroupID":1131}],"UsedExistingHashes":false,"IsNewVideo":true,"IsNewFile":true,"Hashes":[]}`,
+			files(18664), true,
+		},
+		{"hashed file without ID", "file:hashed", `{"CrossReferences":[{"AnidbEpisodeID":1}]}`, Batch{}, false},
+		{"stable known file hashed", "ShokoEvent:FileHashed", `{"FileID":9,"CrossReferences":[{"AnidbEpisodeID":1}]}`, files(9), true},
+		{"stable new file hashed", "ShokoEvent:FileHashed", `{"FileID":9,"CrossReferences":[]}`, Batch{}, false},
 		{
 			"daily series update", "metadata:series.updated", `{"Reason":"Updated","Source":"AniDB","SeriesID":"100","ShokoSeriesIDs":[3]}`,
 			Batch{VFS: reconcile.Changes{Series: []int{3}}, Refresh: Refresh{Series: []int{3}}}, true,
