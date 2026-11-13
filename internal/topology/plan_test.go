@@ -3,6 +3,8 @@ package topology
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -58,6 +60,57 @@ func TestBuildKeepsMultipleEpisodeBindings(t *testing.T) {
 	}
 	if len(plan.Entries) != 2 || plan.Entries[0].TargetPath != plan.Entries[1].TargetPath {
 		t.Fatalf("multiple binding plan = %#v", plan.Entries)
+	}
+}
+
+func TestBuildKeepsVariationsOnlyForEpisodesWithoutAnotherFile(t *testing.T) {
+	file := func(id int, variation bool, episodes ...int) shoko.File {
+		references := make([]shoko.EpisodeCrossReferenceIDs, 0, len(episodes))
+		for _, episode := range episodes {
+			references = append(references, shoko.EpisodeCrossReferenceIDs{ID: intPtr(episode)})
+		}
+		return shoko.File{
+			ID:          id,
+			IsVariation: variation,
+			Locations:   []shoko.Location{{ManagedFolderID: 1, RelativePath: fmt.Sprintf("Show/%d.mkv", id), IsAccessible: true}},
+			SeriesIDs:   []shoko.FileCrossReference{{SeriesID: shoko.SeriesCrossReferenceIDs{ID: intPtr(7)}, EpisodeIDs: references}},
+		}
+	}
+	episodes := map[int]shoko.Episode{}
+	for number := 1; number <= 3; number++ {
+		episodes[40+number] = shoko.Episode{IDs: shoko.IDs{ID: 40 + number, ParentSeries: 7}, AniDB: &shoko.AnimeMetadata{Type: "Episode", EpisodeNumber: number}}
+	}
+	snapshot := shoko.Snapshot{
+		Files: []shoko.File{
+			// Listed first, so the order of files does not decide.
+			file(2, true, 41),     // another version of episode 41
+			file(1, false, 41),    // episode 41's own file
+			file(3, true, 42),     // two parts of episode 42, both
+			file(4, true, 42),     // marked as variations
+			file(5, true, 41, 43), // covers 41 again, and 43, which has no other file
+		},
+		Series:   map[int]shoko.Series{7: {IDs: shoko.IDs{ID: 7}, Name: "My Show"}},
+		Episodes: episodes,
+	}
+	links := func(policy Policy) []string {
+		plan, err := Build(snapshot, policy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := make([]string, 0, len(plan.Entries))
+		for _, entry := range plan.Entries {
+			got = append(got, fmt.Sprintf("%d:%d", entry.ShokoFileID, entry.ShokoEpisodeID))
+		}
+		sort.Strings(got)
+		return got
+	}
+	policy := Policy{VFSRoot: "/vfs", ManagedFolderMap: map[int]string{1: "/media/anime"}}
+	if got, want := links(policy), []string{"1:41", "3:42", "4:42", "5:43"}; !slices.Equal(got, want) {
+		t.Fatalf("links = %v, want %v", got, want)
+	}
+	policy.IncludeVariations = true
+	if got, want := links(policy), []string{"1:41", "2:41", "3:42", "4:42", "5:41", "5:43"}; !slices.Equal(got, want) {
+		t.Fatalf("links with variations = %v, want %v", got, want)
 	}
 }
 

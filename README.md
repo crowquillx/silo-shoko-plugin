@@ -19,11 +19,13 @@ Part of [Crowquillx Silo Plugins](https://github.com/crowquillx/crowquillx-silo-
 
 The Autoscan source picks up changes from the moment it is added. If it is added after the VFS is built, or its first poll fails, its first successful poll scans the whole library once. The same happens if the VFS output root is deleted or recreated: the source notices that its place in the change journal is gone and starts over, rather than missing changes. One case is still missed: if the recreated root already holds more changes than the source had read before its next poll, the source cannot tell the journal is new and skips the earliest ones. After recreating the root, scan the library once from its menu. Polls never wait for a crawl: a crawl still in progress, including one left unfinished by a restart, continues in the background, and its changes are scanned when it finishes.
 
+Ignored files are left out. A file marked as a variation is left out for any episode another file already covers, since it is another version of that episode. It is kept for an episode with no other file, such as the parts of one AniDB episode that is split across files and marked as variations to clear them from Shoko's release review.
+
 ## Live updates
 
 The plugin listens to Shoko Server's events, as Shokofin does, so the VFS follows Shoko within seconds instead of waiting for the reconcile task:
 
-- When Shoko matches a new file to episodes, removes a match, moves, renames or deletes a file, or marks it ignored or a variation, the plugin reads that file again from Shoko, with its series and group, and updates only the links that change. A new episode is in the VFS about 10 seconds after Shoko matches it, and in Silo at the Autoscan source's next poll.
+- When Shoko matches a new file to episodes, removes a match, moves, renames or deletes a file, or marks it ignored or a variation, the plugin reads that file again from Shoko, with its series and group, and updates only the links that change. A file whose content Shoko already knows, such as one removed and added back, keeps its stored match and gets no match event, so it is read again when Shoko finishes hashing it. A new episode is in the VFS about 10 seconds after Shoko matches it, and in Silo at the Autoscan source's next poll.
 - When a series' or episode's metadata changes, for example its episode type or number, the plugin reads that series again and moves its links if their names change.
 - On daily Shoko, when a group is renamed, a series moves to another group, or every group is recreated, the plugin renames or moves the show folders affected, or crawls everything after a recreation. Stable Shoko sends no group events, so there a group change reaches the VFS with the next reconcile.
 - Events are gathered into one update once Shoko has been quiet for 10 seconds, or after a minute at most, so a large import does not update the VFS file by file.

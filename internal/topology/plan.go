@@ -100,65 +100,22 @@ func Build(snapshot shoko.Snapshot, policy Policy) (Plan, error) {
 	plan := Plan{Entries: make([]Entry, 0)}
 	seenKeys := make(map[string]struct{})
 	groupLayouts := newSnapshotGroupLayouts(snapshot)
-	for _, file := range snapshot.Files {
-		if file.IsIgnored && !policy.IncludeIgnored {
-			continue
-		}
-		if file.IsVariation && !policy.IncludeVariations {
-			continue
-		}
-		location, ok, diagnostic := chooseLocation(file, policy.ManagedFolderMap)
-		if !ok {
-			if diagnostic.Message != "" {
-				plan.Diagnostics = append(plan.Diagnostics, diagnostic)
+	// A variation is another version of an episode, so it is left out where
+	// another file already gives that episode a link. But Shoko users also
+	// mark the parts of an episode split across files as variations, to clear
+	// them from Shoko's release review, and those parts are the episode's only
+	// files. So variations are added last, and only for episodes that still
+	// have no link.
+	covered := make(map[int]struct{})
+	for _, variations := range []bool{false, true} {
+		for _, file := range snapshot.Files {
+			if file.IsIgnored && !policy.IncludeIgnored {
+				continue
 			}
-			continue
-		}
-		relative, safe := safeRelativePath(location.RelativePath)
-		if !safe {
-			plan.Diagnostics = append(plan.Diagnostics, Diagnostic{
-				FileID:   file.ID,
-				Message:  fmt.Sprintf("managed-folder relative path %q escapes its source root", location.RelativePath),
-				Severity: "error",
-			})
-			continue
-		}
-		sourceRoot := policy.ManagedFolderMap[location.ManagedFolderID]
-		for _, reference := range file.SeriesIDs {
-			seriesID := 0
-			if reference.SeriesID.ID != nil {
-				seriesID = *reference.SeriesID.ID
+			if file.IsVariation != variations {
+				continue
 			}
-			for _, episodeReference := range reference.EpisodeIDs {
-				episode, episodeID, ok := resolveEpisode(snapshot, seriesID, episodeReference)
-				if !ok {
-					plan.Diagnostics = append(plan.Diagnostics, Diagnostic{
-						FileID:   file.ID,
-						Message:  fmt.Sprintf("could not resolve episode xref (shoko id %d, AniDB id %d)", pointerValue(episodeReference.ID), episodeReference.AniDB),
-						Severity: "warning",
-					})
-					continue
-				}
-				if seriesID == 0 {
-					seriesID = episode.IDs.ParentSeries
-				}
-				series, seriesOK := snapshot.Series[seriesID]
-				if !seriesOK {
-					plan.Diagnostics = append(plan.Diagnostics, Diagnostic{
-						FileID:   file.ID,
-						Message:  fmt.Sprintf("episode %d references missing series %d", episodeID, seriesID),
-						Severity: "warning",
-					})
-					continue
-				}
-				group, groupID, _ := groupForSeries(snapshot, seriesID)
-				entry := makeEntry(sourceRoot, relative, file, series, seriesID, episode, episodeID, group, groupID, groupLayouts[groupID], snapshot)
-				if _, seen := seenKeys[entry.StableKey]; seen {
-					continue
-				}
-				seenKeys[entry.StableKey] = struct{}{}
-				plan.Entries = append(plan.Entries, entry)
-			}
+			plan.addFile(snapshot, policy, file, covered, seenKeys, groupLayouts)
 		}
 	}
 	sort.Slice(plan.Entries, func(i, j int) bool {
@@ -169,6 +126,72 @@ func Build(snapshot shoko.Snapshot, policy Policy) (Plan, error) {
 	})
 	plan.ThemePairs = ThemePairs(plan.Entries)
 	return plan, nil
+}
+
+// addFile adds an entry for each episode the file is linked to. Unless the
+// policy includes variations, a variation is skipped for the episodes in
+// covered: those a file that is not a variation already has a link for.
+func (plan *Plan) addFile(snapshot shoko.Snapshot, policy Policy, file shoko.File, covered map[int]struct{}, seenKeys map[string]struct{}, groupLayouts map[int]GroupLayout) {
+	skipCovered := file.IsVariation && !policy.IncludeVariations
+	location, ok, diagnostic := chooseLocation(file, policy.ManagedFolderMap)
+	if !ok {
+		if diagnostic.Message != "" {
+			plan.Diagnostics = append(plan.Diagnostics, diagnostic)
+		}
+		return
+	}
+	relative, safe := safeRelativePath(location.RelativePath)
+	if !safe {
+		plan.Diagnostics = append(plan.Diagnostics, Diagnostic{
+			FileID:   file.ID,
+			Message:  fmt.Sprintf("managed-folder relative path %q escapes its source root", location.RelativePath),
+			Severity: "error",
+		})
+		return
+	}
+	sourceRoot := policy.ManagedFolderMap[location.ManagedFolderID]
+	for _, reference := range file.SeriesIDs {
+		seriesID := 0
+		if reference.SeriesID.ID != nil {
+			seriesID = *reference.SeriesID.ID
+		}
+		for _, episodeReference := range reference.EpisodeIDs {
+			episode, episodeID, ok := resolveEpisode(snapshot, seriesID, episodeReference)
+			if !ok {
+				plan.Diagnostics = append(plan.Diagnostics, Diagnostic{
+					FileID:   file.ID,
+					Message:  fmt.Sprintf("could not resolve episode xref (shoko id %d, AniDB id %d)", pointerValue(episodeReference.ID), episodeReference.AniDB),
+					Severity: "warning",
+				})
+				continue
+			}
+			if _, done := covered[episodeID]; done && skipCovered {
+				continue
+			}
+			if seriesID == 0 {
+				seriesID = episode.IDs.ParentSeries
+			}
+			series, seriesOK := snapshot.Series[seriesID]
+			if !seriesOK {
+				plan.Diagnostics = append(plan.Diagnostics, Diagnostic{
+					FileID:   file.ID,
+					Message:  fmt.Sprintf("episode %d references missing series %d", episodeID, seriesID),
+					Severity: "warning",
+				})
+				continue
+			}
+			group, groupID, _ := groupForSeries(snapshot, seriesID)
+			entry := makeEntry(sourceRoot, relative, file, series, seriesID, episode, episodeID, group, groupID, groupLayouts[groupID], snapshot)
+			if _, seen := seenKeys[entry.StableKey]; seen {
+				continue
+			}
+			seenKeys[entry.StableKey] = struct{}{}
+			plan.Entries = append(plan.Entries, entry)
+			if !file.IsVariation {
+				covered[episodeID] = struct{}{}
+			}
+		}
+	}
 }
 
 func groupForSeries(snapshot shoko.Snapshot, seriesID int) (shoko.Group, int, bool) {

@@ -75,6 +75,17 @@ var fileEvents = map[string]bool{
 	"ShokoEvent:FileRenamed":    true,
 }
 
+// Events for a file Shoko has just hashed. A new file is matched later, and
+// its release:saved or FileMatched event covers it. But a file whose content
+// Shoko already knows, such as one removed and then added back, keeps its
+// stored release and is matched as it is hashed, and Shoko sends no other
+// event for it. So a hashed file counts as changed when it already has
+// episodes.
+var hashedEvents = map[string]bool{
+	"file:hashed":           true,
+	"ShokoEvent:FileHashed": true,
+}
+
 // Daily servers name metadata events after their reason, such as
 // metadata:series.imageupdated, so they are matched by prefix. Stable servers
 // send one event per kind with the reason in it.
@@ -94,6 +105,11 @@ var otherMetadataSuffixes = map[string]bool{
 
 type fileEvent struct {
 	FileID *int `json:"FileID"`
+}
+
+type hashedEvent struct {
+	FileID          *int              `json:"FileID"`
+	CrossReferences []json.RawMessage `json:"CrossReferences"`
 }
 
 type metadataEvent struct {
@@ -132,6 +148,13 @@ func Translate(target string, arguments []json.RawMessage) (Batch, bool) {
 	case fileEvents[target]:
 		var event fileEvent
 		if json.Unmarshal(argument, &event) != nil || event.FileID == nil || *event.FileID <= 0 {
+			return Batch{}, false
+		}
+		batch.VFS.Files = []int{*event.FileID}
+
+	case hashedEvents[target]:
+		var event hashedEvent
+		if json.Unmarshal(argument, &event) != nil || event.FileID == nil || *event.FileID <= 0 || len(event.CrossReferences) == 0 {
 			return Batch{}, false
 		}
 		batch.VFS.Files = []int{*event.FileID}
