@@ -107,7 +107,24 @@ func configuredRuntime(t *testing.T, baseURL, apiKey, folderMap, vfsRoot string)
 		t.Fatal(err)
 	}
 	t.Cleanup(runtime.cancelBackgroundCrawl)
+	// Registered after the test's temporary directories, so it runs before
+	// they are removed.
+	t.Cleanup(func() { waitForThemeSync(t, runtime) })
 	return runtime
+}
+
+// waitForThemeSync waits until no theme sync started by a scan-source poll is
+// running. Polls start it in the background, and it writes into the VFS root,
+// so a test that removes the root must wait for it first.
+func waitForThemeSync(t *testing.T, runtime *runtimeServer) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for runtime.themeSyncing.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("theme sync still running after 10s")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 func mediaFixture(t *testing.T) (source, media string) {
@@ -775,6 +792,8 @@ func TestPollStartsOverWhenTheMarkerIsNotInTheJournal(t *testing.T) {
 	}
 
 	// The VFS root is deleted: the journal is gone and its sequence restarts.
+	// The first poll started a theme sync that writes into the root.
+	waitForThemeSync(t, runtime)
 	if err := os.RemoveAll(outputRoot); err != nil {
 		t.Fatal(err)
 	}
@@ -791,6 +810,7 @@ func TestPollStartsOverWhenTheMarkerIsNotInTheJournal(t *testing.T) {
 	// The same deletion, but the rebuild lands before the next poll: the stale
 	// marker is still ahead of the short new journal.
 	stale := "100000"
+	waitForThemeSync(t, runtime)
 	if err := os.RemoveAll(outputRoot); err != nil {
 		t.Fatal(err)
 	}
