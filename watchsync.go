@@ -31,7 +31,8 @@ const (
 )
 
 // watchSyncServer marks episodes watched in Shoko when a profile finishes
-// playing them in Silo, and, when the connection turns it on, lists the
+// playing them in Silo or when Silo exports the profile's watch history, and,
+// when the connection turns it on, lists the
 // episodes the Shoko user watched for Silo to import. Each profile connects
 // its own Shoko API key, so both act for that profile's Shoko user. Silo's
 // watch events name only the Silo item, so the plugin asks Silo, as that
@@ -60,9 +61,12 @@ func (s *watchSyncServer) ExchangeAPIKey(ctx context.Context, req *pluginv1.Watc
 		APIKey:    strings.TrimSpace(config.GetSecretValues()[siloAPIKeyKey]),
 		ProfileID: strings.TrimSpace(config.GetValues()[siloProfileIDKey]),
 	}
-	if err := silocatalog.NewClient(silo, s.httpClient).ValidateProfile(ctx); err != nil {
+	// The form takes the profile's name or ID; the connection keeps the ID.
+	profileID, err := silocatalog.NewClient(silo, s.httpClient).ResolveProfile(ctx)
+	if err != nil {
 		return &pluginv1.WatchSyncCredentialResponse{Fault: siloFault(err)}, nil
 	}
+	silo.ProfileID = profileID
 	client, fault := s.shokoClient(apiKey)
 	if fault != nil {
 		return &pluginv1.WatchSyncCredentialResponse{Fault: fault}, nil
@@ -126,8 +130,10 @@ func (s *watchSyncServer) ApplyEvents(ctx context.Context, req *pluginv1.WatchSy
 		return client, fault
 	}
 	results := make([]*pluginv1.WatchSyncApplyResult, 0, len(req.GetEvents()))
+	// An exported history often holds several plays of one episode.
+	watched := make(map[int]bool)
 	for _, event := range req.GetEvents() {
-		result := applyWatchEvent(ctx, silo, shokoClient, event)
+		result := applyWatchEvent(ctx, silo, shokoClient, watched, event)
 		if fault := result.GetFault(); fault.GetCode() == pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_CREDENTIAL {
 			// A rejected key fails every event. Reporting it for the whole
 			// batch makes Silo keep the events and ask for a reconnect.
@@ -257,20 +263,37 @@ func applyWatchEvent(
 	ctx context.Context,
 	silo *silocatalog.Client,
 	shokoClient func() (*shoko.Client, *pluginv1.WatchSyncFault),
+	watched map[int]bool,
 	event *pluginv1.WatchSyncEvent,
 ) *pluginv1.WatchSyncApplyResult {
 	result := &pluginv1.WatchSyncApplyResult{
 		EventId: event.GetEventId(),
 		Status:  pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_NO_CHANGE,
 	}
-	if event.GetOperation() != pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_SCROBBLE_STOP {
-		return result
-	}
 	switch event.GetMedia().GetMediaType() {
 	case pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE, pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE:
 	default:
 		return result
 	}
+	switch event.GetOperation() {
+	case pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_SCROBBLE_STOP:
+		return applyFinishedPlay(ctx, silo, shokoClient, watched, event, result)
+	case pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_MARK_WATCHED:
+		return applyExportedPlay(ctx, silo, shokoClient, watched, event, result)
+	}
+	return result
+}
+
+// applyFinishedPlay marks the item's Shoko episodes watched when a play in
+// Silo finishes. Each finished play counts, so a rewatch is recorded too.
+func applyFinishedPlay(
+	ctx context.Context,
+	silo *silocatalog.Client,
+	shokoClient func() (*shoko.Client, *pluginv1.WatchSyncFault),
+	watched map[int]bool,
+	event *pluginv1.WatchSyncEvent,
+	result *pluginv1.WatchSyncApplyResult,
+) *pluginv1.WatchSyncApplyResult {
 	// Some players report a finished play as a stop at position zero. Silo
 	// still marks the item played, so such a stop counts when the profile's
 	// saved state says the item is played.
@@ -290,30 +313,98 @@ func applyWatchEvent(
 		// Not a Shoko VFS item, such as a play from another library.
 		return result
 	}
+	return markEpisodes(ctx, shokoClient, watched, episodes, false, result)
+}
+
+// applyExportedPlay marks the item's Shoko episodes watched for a play in the
+// profile's Silo history, which Silo sends once per play when it exports the
+// history. Shoko cannot take the play's date and would record it as watched
+// now, so an episode Shoko already has watched keeps its own date.
+func applyExportedPlay(
+	ctx context.Context,
+	silo *silocatalog.Client,
+	shokoClient func() (*shoko.Client, *pluginv1.WatchSyncFault),
+	watched map[int]bool,
+	event *pluginv1.WatchSyncEvent,
+	result *pluginv1.WatchSyncApplyResult,
+) *pluginv1.WatchSyncApplyResult {
+	item, found, err := silo.Item(ctx, event.GetMedia().GetMediaItemId())
+	if err != nil {
+		return faultResult(result, siloFault(err))
+	}
+	if !found {
+		return faultResult(result, &pluginv1.WatchSyncFault{
+			Code:        pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_PERMANENT,
+			SafeMessage: "the item is no longer in Silo",
+		})
+	}
+	episodes := shokoEpisodeIDs(item.Files)
+	if len(episodes) == 0 {
+		// Reported as not found rather than sent, so the sync's count of
+		// sent plays covers only the plays Shoko knows.
+		return faultResult(result, &pluginv1.WatchSyncFault{
+			Code:        pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_PERMANENT,
+			SafeMessage: "the item is not from the Shoko VFS",
+		})
+	}
+	return markEpisodes(ctx, shokoClient, watched, episodes, true, result)
+}
+
+// markEpisodes marks episodes watched in Shoko. watched remembers, for one
+// batch, the episodes known to be watched; with skipWatched, those and any
+// Shoko already has watched are left alone.
+func markEpisodes(
+	ctx context.Context,
+	shokoClient func() (*shoko.Client, *pluginv1.WatchSyncFault),
+	watched map[int]bool,
+	episodes []int,
+	skipWatched bool,
+	result *pluginv1.WatchSyncApplyResult,
+) *pluginv1.WatchSyncApplyResult {
 	client, fault := shokoClient()
 	if fault != nil {
 		return faultResult(result, fault)
 	}
+	marked := false
 	for _, episodeID := range episodes {
-		if err := client.MarkEpisodeWatched(ctx, episodeID); err != nil {
-			fault := shokoFault(err)
-			var httpErr *shoko.HTTPError
-			if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound {
-				fault.SafeMessage = fmt.Sprintf("Shoko has no episode %d; reconcile the Shoko VFS", episodeID)
+		if skipWatched {
+			known, ok := watched[episodeID]
+			if !ok {
+				var err error
+				known, err = client.EpisodeWatched(ctx, episodeID)
+				if err != nil {
+					return faultResult(result, episodeFault(episodeID, err, "read"))
+				}
+				watched[episodeID] = known
 			}
-			fmt.Fprintf(os.Stderr, "shokoanime: could not mark Shoko episode %d watched: %s\n", episodeID, fault.GetSafeMessage())
-			return faultResult(result, fault)
+			if known {
+				continue
+			}
 		}
+		if err := client.MarkEpisodeWatched(ctx, episodeID); err != nil {
+			return faultResult(result, episodeFault(episodeID, err, "mark"))
+		}
+		watched[episodeID] = true
+		marked = true
 		fmt.Fprintf(os.Stderr, "shokoanime: marked Shoko episode %d watched\n", episodeID)
 	}
-	result.Status = pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_APPLIED
+	if marked {
+		result.Status = pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_APPLIED
+	}
 	return result
 }
 
-// shokoEpisodeIDs returns the distinct Shoko episodes named by the VFS file
-// names of an item's versions, in ascending order. Every version of an item
-// is the same episode, but a version Silo found elsewhere has no marker and
-// is skipped.
+// episodeFault maps a failed read or write of one Shoko episode to a fault.
+func episodeFault(episodeID int, err error, action string) *pluginv1.WatchSyncFault {
+	fault := shokoFault(err)
+	var httpErr *shoko.HTTPError
+	if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound {
+		fault.SafeMessage = fmt.Sprintf("Shoko has no episode %d; reconcile the Shoko VFS", episodeID)
+	}
+	fmt.Fprintf(os.Stderr, "shokoanime: could not %s Shoko episode %d: %s\n", action, episodeID, fault.GetSafeMessage())
+	return fault
+}
+
 func shokoEpisodeIDs(files []string) []int {
 	seen := map[int]struct{}{}
 	var ids []int

@@ -58,33 +58,55 @@ func TestItemNotFoundAndMismatch(t *testing.T) {
 	}
 }
 
-func TestValidateProfile(t *testing.T) {
+const notFoundProblem = `{"type":"https://siloserver.org/docs/api/v2/problems/not_found","title":"Not found","status":404,"detail":"Profile not found"}`
+
+func TestResolveProfile(t *testing.T) {
+	const listing = `{"items":[{"id":"p0","name":"Guest"},{"id":"p1","name":"Tan"}]}`
 	for name, tc := range map[string]struct {
-		status int
-		body   string
-		want   Kind
-		ok     bool
+		wanted string
+		// list answers the request without X-Profile-Id, act the one with it.
+		listStatus int
+		listBody   string
+		actStatus  int
+		actBody    string
+		want       Kind
+		wantID     string
+		message    string
 	}{
-		"listed":       {http.StatusOK, `{"items":[{"id":"p0"},{"id":"p1"}]}`, 0, true},
-		"not listed":   {http.StatusOK, `{"items":[{"id":"p0"}]}`, PermissionDenied, false},
-		"bad key":      {http.StatusUnauthorized, ``, InvalidCredential, false},
-		"bad profile":  {http.StatusNotFound, `{"type":"https://siloserver.org/docs/api/v2/problems/not_found","title":"Not found","status":404,"detail":"Profile not found"}`, InvalidConfig, false},
-		"not silo":     {http.StatusNotFound, `nope`, Permanent, false},
-		"server error": {http.StatusBadGateway, ``, Temporary, false},
-		"api gone":     {http.StatusGone, `{"error":"client_upgrade_required"}`, Permanent, false},
+		"by ID":           {wanted: "p1", listStatus: 200, listBody: listing, actStatus: 200, actBody: listing, wantID: "p1"},
+		"by name":         {wanted: "tan", listStatus: 200, listBody: listing, actStatus: 200, actBody: listing, wantID: "p1"},
+		"ID beats name":   {wanted: "p0", listStatus: 200, listBody: `{"items":[{"id":"p0","name":"p1"},{"id":"p1","name":"p0"}]}`, actStatus: 200, actBody: listing, wantID: "p0"},
+		"unknown":         {wanted: "1", listStatus: 200, listBody: listing, want: InvalidConfig, message: `no profile "1" on this Silo API key's account; its profiles are: Guest, Tan`},
+		"shared name":     {wanted: "Tan", listStatus: 200, listBody: `{"items":[{"id":"a","name":"Tan"},{"id":"b","name":"tan"}]}`, want: InvalidConfig, message: `several profiles are named "Tan"; enter the ID of the one you are connecting: Tan (a), tan (b)`},
+		"no profiles":     {wanted: "Tan", listStatus: 200, listBody: `{"items":[]}`, want: InvalidConfig},
+		"bad key":         {wanted: "p1", listStatus: http.StatusUnauthorized, want: InvalidCredential},
+		"not silo":        {wanted: "p1", listStatus: http.StatusNotFound, listBody: `nope`, want: Permanent},
+		"api gone":        {wanted: "p1", listStatus: http.StatusGone, listBody: `{"error":"client_upgrade_required"}`, want: Permanent},
+		"server error":    {wanted: "p1", listStatus: http.StatusBadGateway, want: Temporary},
+		"locked profile":  {wanted: "Tan", listStatus: 200, listBody: listing, actStatus: http.StatusForbidden, want: PermissionDenied},
+		"profile refused": {wanted: "Tan", listStatus: 200, listBody: listing, actStatus: http.StatusNotFound, actBody: notFoundProblem, want: InvalidConfig},
 	} {
 		t.Run(name, func(t *testing.T) {
-			client := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path != "/api/v2/profiles" {
 					t.Errorf("path = %q", r.URL.Path)
 				}
-				w.WriteHeader(tc.status)
-				fmt.Fprint(w, tc.body)
-			})
-			err := client.ValidateProfile(context.Background())
-			if tc.ok {
-				if err != nil {
-					t.Fatal(err)
+				status, body := tc.listStatus, tc.listBody
+				if profile := r.Header.Get("X-Profile-Id"); profile != "" {
+					if profile != "p0" && profile != "p1" {
+						t.Errorf("acted as %q", profile)
+					}
+					status, body = tc.actStatus, tc.actBody
+				}
+				w.WriteHeader(status)
+				fmt.Fprint(w, body)
+			}))
+			t.Cleanup(server.Close)
+			client := NewClient(Config{BaseURL: server.URL, APIKey: "key", ProfileID: " " + tc.wanted + " "}, nil)
+			id, err := client.ResolveProfile(context.Background())
+			if tc.wantID != "" {
+				if err != nil || id != tc.wantID {
+					t.Fatalf("id = %q, err = %v, want %q", id, err, tc.wantID)
 				}
 				return
 			}
@@ -92,7 +114,22 @@ func TestValidateProfile(t *testing.T) {
 			if !errors.As(err, &siloErr) || siloErr.Kind != tc.want {
 				t.Fatalf("err = %v, want kind %d", err, tc.want)
 			}
+			if tc.message != "" && err.Error() != tc.message {
+				t.Fatalf("message = %q, want %q", err.Error(), tc.message)
+			}
 		})
+	}
+}
+
+func TestDisplayNameIsOneSafeLine(t *testing.T) {
+	if got := displayName(" A\nB\x1b "); got != "AB" {
+		t.Fatalf("got %q", got)
+	}
+	if got := displayName(strings.Repeat("x", 70)); got != strings.Repeat("x", 64)+"…" {
+		t.Fatalf("got %q", got)
+	}
+	if got := displayName(" "); got != "(unnamed)" {
+		t.Fatalf("got %q", got)
 	}
 }
 

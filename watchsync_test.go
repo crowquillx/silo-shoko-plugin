@@ -37,10 +37,13 @@ type fakeBackends struct {
 	// watched holds the watched-episode list pages by page number.
 	watched      map[string]string
 	watchedQuery []string
+	// shokoWatched holds the episodes the Shoko user has watched, by ID.
+	shokoWatched map[string]bool
+	episodeReads int
 }
 
 func newFakeBackends(t *testing.T) (*fakeBackends, *httptest.Server) {
-	backends := &fakeBackends{t: t, items: map[string]string{}, watched: map[string]string{}}
+	backends := &fakeBackends{t: t, items: map[string]string{}, watched: map[string]string{}, shokoWatched: map[string]bool{}}
 	server := httptest.NewServer(http.HandlerFunc(backends.serve))
 	t.Cleanup(server.Close)
 	return backends, server
@@ -52,12 +55,22 @@ func (b *fakeBackends) serve(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case strings.HasPrefix(r.URL.Path, "/api/v2/"):
 		b.siloHit++
-		if r.Header.Get("Authorization") != "Bearer "+testSiloKey || r.Header.Get("X-Profile-Id") != testProfileID {
+		if r.Header.Get("Authorization") != "Bearer "+testSiloKey {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
 		if r.URL.Path == "/api/v2/profiles" {
-			fmt.Fprintf(w, `{"items":[{"id":%q}]}`, testProfileID)
+			// Without X-Profile-Id, Silo lists every profile of the account.
+			if profile := r.Header.Get("X-Profile-Id"); profile != "" && profile != testProfileID {
+				w.WriteHeader(http.StatusNotFound)
+				fmt.Fprint(w, `{"type":"https://siloserver.org/docs/api/v2/problems/not_found","status":404,"detail":"Profile not found"}`)
+				return
+			}
+			fmt.Fprintf(w, `{"items":[{"id":"other","name":"Guest"},{"id":%q,"name":"Tan"}]}`, testProfileID)
+			return
+		}
+		if r.Header.Get("X-Profile-Id") != testProfileID {
+			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
 		id := strings.TrimPrefix(r.URL.Path, "/api/v2/catalog/items/")
@@ -84,6 +97,16 @@ func (b *fakeBackends) serve(w http.ResponseWriter, r *http.Request) {
 				body = `{"total":0,"list":[]}`
 			}
 			fmt.Fprint(w, body)
+			return
+		}
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v3/Episode/") {
+			b.episodeReads++
+			id := strings.TrimPrefix(r.URL.Path, "/api/v3/Episode/")
+			if b.shokoWatched[id] {
+				fmt.Fprint(w, `{"watched":"2024-05-01T10:00:00Z","watchCount":1}`)
+				return
+			}
+			fmt.Fprint(w, `{}`)
 			return
 		}
 		if r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/v3/Episode/") && strings.HasSuffix(r.URL.Path, "/Watched/true") {
@@ -197,7 +220,7 @@ func TestManifestAdvertisesShokoWatchSync(t *testing.T) {
 		}
 		// Exporting watched history would send every play the profile ever
 		// finished to Shoko on connect, not only new completions.
-		if descriptor.GetExportWatched() || !descriptor.GetImportWatched() {
+		if !descriptor.GetExportWatched() || !descriptor.GetImportWatched() {
 			t.Fatalf("watch sync capability must scrobble and import, not export: %v", descriptor)
 		}
 		// Silo's import switch is on for every new connection, so the
@@ -269,11 +292,6 @@ func TestApplyEventsIgnoresUnfinishedPlays(t *testing.T) {
 			Operation: pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_SCROBBLE_PAUSE,
 			Media:     &pluginv1.WatchSyncMedia{MediaItemId: "item-1", MediaType: pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE},
 		},
-		"manual mark": {
-			EventId:   "history-1",
-			Operation: pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_MARK_WATCHED,
-			Media:     &pluginv1.WatchSyncMedia{MediaItemId: "item-1", MediaType: pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE},
-		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			result := applyOne(t, srv, server.URL, event)
@@ -322,6 +340,77 @@ func TestApplyEventsSkipsItemsOutsideTheShokoVFS(t *testing.T) {
 	}
 	if got := backends.markedEpisodes(); len(got) != 0 {
 		t.Fatalf("marked = %v, want none", got)
+	}
+}
+
+func exportEvent(historyID, itemID string) *pluginv1.WatchSyncEvent {
+	return &pluginv1.WatchSyncEvent{
+		EventId:        historyID,
+		Operation:      pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_MARK_WATCHED,
+		Origin:         pluginv1.WatchSyncOrigin_WATCH_SYNC_ORIGIN_RECONCILIATION,
+		WatchHistoryId: historyID,
+		Media: &pluginv1.WatchSyncMedia{
+			MediaItemId: itemID,
+			MediaType:   pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE,
+		},
+	}
+}
+
+func TestApplyEventsExportsWatchHistory(t *testing.T) {
+	backends, server := newFakeBackends(t)
+	backends.items["new"] = itemJSON("new", true, testVFSFile)
+	backends.items["seen"] = itemJSON("seen", true, strings.Replace(testVFSFile, "Episode=42", "Episode=43", 1))
+	backends.items["movie"] = itemJSON("movie", true, "/media/movies/Some Movie (2020)/Some Movie (2020).mkv")
+	backends.shokoWatched["43"] = true
+	srv := configuredWatchSync(t, server.URL)
+
+	events := []*pluginv1.WatchSyncEvent{
+		exportEvent("h1", "new"),
+		exportEvent("h2", "new"), // a second play of the same episode
+		exportEvent("h3", "seen"),
+		exportEvent("h4", "movie"),
+		exportEvent("h5", "deleted"),
+	}
+	response, err := srv.ApplyEvents(context.Background(), &pluginv1.WatchSyncApplyEventsRequest{Context: watchContext(server.URL), Events: events})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.GetFault() != nil {
+		t.Fatalf("batch fault = %v", response.GetFault())
+	}
+	want := map[string]pluginv1.WatchSyncApplyStatus{
+		"h1": pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_APPLIED,
+		"h2": pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_NO_CHANGE,
+		"h3": pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_NO_CHANGE,
+		"h4": pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_REJECTED,
+		"h5": pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_REJECTED,
+	}
+	if len(response.GetResults()) != len(want) {
+		t.Fatalf("results = %v", response.GetResults())
+	}
+	for _, result := range response.GetResults() {
+		if result.GetStatus() != want[result.GetEventId()] {
+			t.Errorf("%s: status = %v, fault = %v", result.GetEventId(), result.GetStatus(), result.GetFault())
+		}
+	}
+	// Episode 43 keeps Shoko's own watched date, and 42 is marked once.
+	if got := backends.markedEpisodes(); !reflect.DeepEqual(got, []string{"42"}) {
+		t.Fatalf("marked = %v, want [42]", got)
+	}
+	if backends.episodeReads != 2 {
+		t.Fatalf("Shoko episode reads = %d, want 2", backends.episodeReads)
+	}
+}
+
+func TestApplyEventsRetriesExportWhenShokoIsDown(t *testing.T) {
+	backends, server := newFakeBackends(t)
+	backends.items["new"] = itemJSON("new", true, testVFSFile)
+	backends.shokoUp = http.StatusServiceUnavailable
+	srv := configuredWatchSync(t, server.URL)
+
+	result := applyOne(t, srv, server.URL, exportEvent("h1", "new"))
+	if result.GetStatus() != pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_RETRY {
+		t.Fatalf("status = %v, fault = %v", result.GetStatus(), result.GetFault())
 	}
 }
 
@@ -414,6 +503,42 @@ func TestExchangeAPIKeyChecksShokoAndSilo(t *testing.T) {
 		if response.GetFault().GetCode() != pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_CREDENTIAL || response.GetCredentials() != nil {
 			t.Fatalf("%s: response = %v", name, response)
 		}
+	}
+}
+
+func TestExchangeAPIKeyFindsTheProfileByName(t *testing.T) {
+	_, server := newFakeBackends(t)
+	srv := configuredWatchSync(t, server.URL)
+	exchange := func(profile string) *pluginv1.WatchSyncCredentialResponse {
+		response, err := srv.ExchangeAPIKey(context.Background(), &pluginv1.WatchSyncExchangeAPIKeyRequest{
+			CapabilityId: watchSyncCapability,
+			ApiKey:       testShokoUserKey,
+			ProviderConfig: &pluginv1.WatchSyncProviderConfig{
+				Values:       map[string]string{siloBaseURLKey: server.URL, siloProfileIDKey: profile},
+				SecretValues: map[string]string{siloAPIKeyKey: testSiloKey},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+
+	response := exchange(" tan ")
+	if response.GetFault() != nil {
+		t.Fatalf("fault = %v", response.GetFault())
+	}
+	if got := response.GetCredentials().GetSecretAttributes()[siloProfileIDKey]; got != testProfileID {
+		t.Fatalf("stored profile = %q, want %q", got, testProfileID)
+	}
+
+	response = exchange("1")
+	fault := response.GetFault()
+	if fault.GetCode() != pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_REQUEST || response.GetCredentials() != nil {
+		t.Fatalf("response = %v", response)
+	}
+	if !strings.Contains(fault.GetSafeMessage(), "Guest, Tan") {
+		t.Fatalf("message = %q, want the account's profile names", fault.GetSafeMessage())
 	}
 }
 

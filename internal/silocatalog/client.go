@@ -8,11 +8,13 @@ package silocatalog
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const (
@@ -32,8 +34,10 @@ const (
 	Permanent
 )
 
-// Error carries only fixed messages. Silo response bodies, URLs and transport
-// errors may contain credentials, so none of them reach the message.
+// Error carries only fixed messages, apart from the account's own profile
+// names and IDs, which ResolveProfile lists to help pick one. Silo response
+// bodies, URLs and transport errors may contain credentials, so none of them
+// reach the message.
 type Error struct {
 	Kind    Kind
 	message string
@@ -60,7 +64,7 @@ func (c Config) Validate() error {
 		return &Error{InvalidConfig, "a Silo API key is required"}
 	}
 	if strings.TrimSpace(c.ProfileID) == "" || strings.ContainsAny(c.ProfileID, "\r\n") {
-		return &Error{InvalidConfig, "a Silo profile ID is required"}
+		return &Error{InvalidConfig, "a Silo profile name or ID is required"}
 	}
 	return nil
 }
@@ -87,35 +91,118 @@ func NewClient(config Config, httpClient *http.Client) *Client {
 	return &Client{config: config, http: httpClient}
 }
 
-// ValidateProfile checks that the API key works and can act as the profile.
-func (c *Client) ValidateProfile(ctx context.Context) error {
+// Profile is one profile of the Silo account an API key belongs to.
+type Profile struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// ResolveProfile finds the profile the config names, by ID or, ignoring
+// case, by name, and checks that the API key can act as it. It returns the
+// profile's ID and makes the client act as it. Silo's profile IDs are opaque
+// UUIDs that its web app never shows, so people know their profile by name.
+func (c *Client) ResolveProfile(ctx context.Context) (string, error) {
 	if err := c.config.Validate(); err != nil {
-		return err
+		return "", err
 	}
+	// Listing without X-Profile-Id returns every profile of the account,
+	// whatever the config names.
+	profiles, err := c.profiles(ctx, false)
+	if err != nil {
+		return "", err
+	}
+	id, err := matchProfile(profiles, c.config.ProfileID)
+	if err != nil {
+		return "", err
+	}
+	c.config.ProfileID = id
+	// Acting as the profile can still fail, such as for a PIN-locked one.
+	if _, err := c.profiles(ctx, true); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func (c *Client) profiles(ctx context.Context, asProfile bool) ([]Profile, error) {
 	var response struct {
-		Items []struct {
-			ID string `json:"id"`
-		} `json:"items"`
+		Items []Profile `json:"items"`
 		problem
 	}
-	status, err := c.get(ctx, "/api/v2/profiles", &response)
+	status, err := c.request(ctx, "/api/v2/profiles", asProfile, &response)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if status == http.StatusNotFound {
 		// Silo answers an unknown X-Profile-Id with its own not_found
 		// problem; any other 404 means the URL does not lead to Silo's API.
-		if response.isNotFound() && strings.Contains(strings.ToLower(response.Detail), "profile") {
-			return &Error{InvalidConfig, "the Silo profile ID was not found for this API key's account; check the profile ID"}
+		if asProfile && response.isNotFound() && strings.Contains(strings.ToLower(response.Detail), "profile") {
+			return nil, &Error{InvalidConfig, "the Silo profile was not found for this API key's account; check the profile"}
 		}
-		return &Error{Permanent, "Silo's profile list was not found; check the Silo server URL"}
+		return nil, &Error{Permanent, "Silo's profile list was not found; check the Silo server URL"}
 	}
-	for _, profile := range response.Items {
-		if profile.ID == c.config.ProfileID {
-			return nil
+	return response.Items, nil
+}
+
+// matchProfile returns the ID of the profile that wanted names: an exact ID
+// match wins, then a single profile whose name matches ignoring case.
+func matchProfile(profiles []Profile, wanted string) (string, error) {
+	for _, profile := range profiles {
+		if profile.ID == wanted {
+			return profile.ID, nil
 		}
 	}
-	return &Error{PermissionDenied, "the Silo API key cannot access the selected profile; reconnect with the right account and profile"}
+	var named []Profile
+	for _, profile := range profiles {
+		if strings.EqualFold(strings.TrimSpace(profile.Name), wanted) {
+			named = append(named, profile)
+		}
+	}
+	switch len(named) {
+	case 1:
+		return named[0].ID, nil
+	case 0:
+		if len(profiles) == 0 {
+			return "", &Error{InvalidConfig, "this Silo API key's account has no profiles"}
+		}
+		names := make([]string, 0, len(profiles))
+		for _, profile := range profiles {
+			names = append(names, displayName(profile.Name))
+		}
+		return "", &Error{InvalidConfig, fmt.Sprintf("no profile %q on this Silo API key's account; its profiles are: %s", displayName(wanted), listed(names))}
+	default:
+		entries := make([]string, 0, len(named))
+		for _, profile := range named {
+			entries = append(entries, displayName(profile.Name)+" ("+displayName(profile.ID)+")")
+		}
+		return "", &Error{InvalidConfig, fmt.Sprintf("several profiles are named %q; enter the ID of the one you are connecting: %s", displayName(wanted), listed(entries))}
+	}
+}
+
+// maxListedProfiles bounds how many profiles an error message names.
+const maxListedProfiles = 12
+
+func listed(entries []string) string {
+	if len(entries) > maxListedProfiles {
+		return strings.Join(entries[:maxListedProfiles], ", ") + fmt.Sprintf(" and %d more", len(entries)-maxListedProfiles)
+	}
+	return strings.Join(entries, ", ")
+}
+
+// displayName makes a profile name or ID safe to show in a one-line message.
+func displayName(name string) string {
+	name = strings.TrimSpace(strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, name))
+	if runes := []rune(name); len(runes) > 64 {
+		name = string(runes[:64]) + "…"
+	}
+	if name == "" {
+		return "(unnamed)"
+	}
+	return name
 }
 
 // Item is what the plugin needs to know about one catalog item.
@@ -183,6 +270,11 @@ func (p problem) isNotFound() bool {
 }
 
 func (c *Client) get(ctx context.Context, apiPath string, target any) (int, error) {
+	return c.request(ctx, apiPath, true, target)
+}
+
+// request sends a GET, acting as the profile when asProfile is set.
+func (c *Client) request(ctx context.Context, apiPath string, asProfile bool, target any) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.config.BaseURL+apiPath, nil)
@@ -190,7 +282,9 @@ func (c *Client) get(ctx context.Context, apiPath string, target any) (int, erro
 		return 0, &Error{InvalidConfig, "the Silo server URL is invalid"}
 	}
 	request.Header.Set("Authorization", "Bearer "+c.config.APIKey)
-	request.Header.Set("X-Profile-Id", c.config.ProfileID)
+	if asProfile {
+		request.Header.Set("X-Profile-Id", c.config.ProfileID)
+	}
 	request.Header.Set("Accept", "application/json")
 	response, err := c.http.Do(request)
 	if err != nil {

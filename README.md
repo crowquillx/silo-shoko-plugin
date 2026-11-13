@@ -103,14 +103,18 @@ A link that cannot be created is skipped and listed under `failures` in the task
 
 ## Watched status
 
-The plugin can mark an episode watched in Shoko when you finish playing it in Silo, as Shokofin does for Jellyfin, and can import the episodes you watched in Shoko into Silo. Both are off until a profile connects the Shoko watch provider, and importing also needs its own switch. Only new completions are sent to Shoko: plays from before the connection, manual watched marks and progress stay in Silo.
+The plugin can mark an episode watched in Shoko when you finish playing it in Silo, as Shokofin does for Jellyfin, export the episodes you already watched in Silo to Shoko, and import the episodes you watched in Shoko into Silo. All are off until a profile connects the Shoko watch provider, and importing also needs its own switch. Progress and manual watched marks without a play stay in Silo.
 
 1. In Shoko's Web UI, open **Settings → API Keys** and generate a key while signed in as the Shoko user whose watched status you want updated. Each Silo profile can use its own Shoko user.
-2. In the Silo profile, open **Settings → Watch Providers → Shoko → Connect**. Enter the Shoko API key, then a Silo server URL the plugin can reach (such as `http://localhost:8080` when the plugin runs on the Silo host), a Silo API key for the account that owns the profile, and the profile's ID from `GET /api/v2/profiles`.
+2. In the Silo profile, open **Settings → Watch Providers → Shoko → Connect**. Enter the Shoko API key, then a Silo server URL the plugin can reach (such as `http://localhost:8080` when the plugin runs on the Silo host), a Silo API key for the account that owns the profile, and the profile's name as Silo shows it. The plugin looks the name up on that account and keeps the profile's ID with the connection; the ID itself also works, and if two profiles share a name the error lists their IDs.
 
 Silo's watch events name only the Silo item, not the Shoko episode, so on each finished play the plugin reads the item from Silo as that profile and takes the Shoko episode from its VFS file name. Items outside the Shoko VFS are skipped. The plugin uses the Shoko Server URL from its global configuration and marks the episode with `POST /api/v3/Episode/<id>/Watched/true`, which also marks the episode's files watched. Each marked episode is logged.
 
-A play counts as finished when Silo reports it completed. Some players stop at position zero after finishing; such a stop counts when Silo has the item marked played for the profile. If Shoko or Silo cannot be reached when a play finishes, the failure is logged and shown on the connection. Silo retries playback stops from Jellyfin-compatible clients, but not from its own apps, and the plugin does not export watched history, so such a play may need marking in Shoko by hand.
+A play counts as finished when Silo reports it completed. Some players stop at position zero after finishing; such a stop counts when Silo has the item marked played for the profile. If Shoko or Silo cannot be reached when a play finishes, the failure is logged and shown on the connection. Silo retries playback stops from Jellyfin-compatible clients, but not from its own apps; the next history export sends such a play.
+
+### Exporting to Shoko
+
+Silo's **Export watched** switch for the connection, on for a new connection, sends the profile's watch history to Shoko. Each sync sends up to 100 plays that Shoko has not received yet, so a long history takes several syncs; failed plays are retried on later syncs. The plugin finds each play's Shoko episode from the item's VFS file name, as for a finished play. Shoko takes no date when it marks an episode, so an exported episode is recorded as watched on the day of the sync; an episode Shoko already has watched is left alone and keeps its date. Plays of items outside the Shoko VFS are counted as not found rather than sent.
 
 ### Importing from Shoko
 

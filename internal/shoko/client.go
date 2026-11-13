@@ -207,6 +207,19 @@ func (c *Client) MarkEpisodeWatched(ctx context.Context, episodeID int) error {
 	return c.do(ctx, http.MethodPost, c.resolve(endpoint, nil), endpoint, nil)
 }
 
+// EpisodeWatched reports whether the API key's user has watched an episode.
+func (c *Client) EpisodeWatched(ctx context.Context, episodeID int) (bool, error) {
+	if episodeID < 1 {
+		return false, fmt.Errorf("shoko: invalid episode ID %d", episodeID)
+	}
+	var episode Episode
+	if err := c.get(ctx, "/Episode/"+strconv.Itoa(episodeID), nil, &episode); err != nil {
+		return false, err
+	}
+	_, watched := episode.WatchedAt()
+	return watched, nil
+}
+
 // MaxPageSize is the largest page Shoko serves.
 const MaxPageSize = pageSize
 
