@@ -92,19 +92,19 @@ func newLiveFixture(t *testing.T) *liveFixture {
 				return
 			}
 			fmt.Fprint(w, `{"items":[]}`)
-		case r.URL.Path == "/api/v1/catalog":
+		case r.URL.Path == "/api/v2/catalog":
 			fixture.lookups = append(fixture.lookups, "catalog "+r.URL.Query().Get("q"))
 			if r.URL.Query().Get("q") == "Show" && r.URL.Query().Get("type") == "series" {
 				fmt.Fprint(w, `{"items":[{"content_id":"decoy","type":"series"},{"content_id":"silo-show","type":"series"}]}`)
 				return
 			}
 			fmt.Fprint(w, `{"items":[]}`)
-		case r.URL.Path == "/api/v1/catalog/items/decoy":
+		case r.URL.Path == "/api/v2/catalog/items/decoy":
 			fmt.Fprint(w, `{"content_id":"decoy","folder_paths":["/elsewhere/Show (2020)"]}`)
-		case r.URL.Path == "/api/v1/catalog/items/silo-show":
+		case r.URL.Path == "/api/v2/catalog/items/silo-show":
 			fmt.Fprintf(w, `{"content_id":"silo-show","folder_paths":[%q]}`, filepath.Join(fixture.root, "Show (2020)"))
 		case strings.HasSuffix(r.URL.Path, "/refresh-metadata"):
-			fixture.refreshed = append(fixture.refreshed, strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/admin/items/"), "/refresh-metadata"))
+			fixture.refreshed = append(fixture.refreshed, strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v2/admin/items/"), "/refresh-metadata"))
 			w.WriteHeader(http.StatusAccepted)
 		default:
 			http.NotFound(w, r)

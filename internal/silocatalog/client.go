@@ -93,25 +93,24 @@ func (c *Client) ValidateProfile(ctx context.Context) error {
 		return err
 	}
 	var response struct {
-		Profiles []struct {
+		Items []struct {
 			ID string `json:"id"`
-		} `json:"profiles"`
-		Error   string `json:"error"`
-		Message string `json:"message"`
+		} `json:"items"`
+		problem
 	}
-	status, err := c.get(ctx, "/api/v1/profiles", &response)
+	status, err := c.get(ctx, "/api/v2/profiles", &response)
 	if err != nil {
 		return err
 	}
 	if status == http.StatusNotFound {
-		// Silo answers an unknown X-Profile-Id with its own not_found error;
-		// any other 404 means the URL does not lead to Silo's API.
-		if response.Error == "not_found" && strings.Contains(strings.ToLower(response.Message), "profile") {
+		// Silo answers an unknown X-Profile-Id with its own not_found
+		// problem; any other 404 means the URL does not lead to Silo's API.
+		if response.isNotFound() && strings.Contains(strings.ToLower(response.Detail), "profile") {
 			return &Error{InvalidConfig, "the Silo profile ID was not found for this API key's account; check the profile ID"}
 		}
 		return &Error{Permanent, "Silo's profile list was not found; check the Silo server URL"}
 	}
-	for _, profile := range response.Profiles {
+	for _, profile := range response.Items {
 		if profile.ID == c.config.ProfileID {
 			return nil
 		}
@@ -149,7 +148,7 @@ func (c *Client) Item(ctx context.Context, mediaItemID string) (item Item, found
 			FilePath string `json:"file_path"`
 		} `json:"versions"`
 	}
-	status, err := c.get(ctx, "/api/v1/catalog/items/"+url.PathEscape(mediaItemID), &detail)
+	status, err := c.get(ctx, "/api/v2/catalog/items/"+url.PathEscape(mediaItemID), &detail)
 	if err != nil {
 		return Item{}, false, err
 	}
@@ -170,6 +169,17 @@ func (c *Client) Item(ctx context.Context, mediaItemID string) (item Item, found
 		}
 	}
 	return item, true, nil
+}
+
+// problem is the part of Silo's RFC 9457 problem response the plugin reads to
+// tell Silo's own errors apart. It is never shown.
+type problem struct {
+	Type   string `json:"type"`
+	Detail string `json:"detail"`
+}
+
+func (p problem) isNotFound() bool {
+	return p.Type == "not_found" || strings.HasSuffix(p.Type, "/not_found")
 }
 
 func (c *Client) get(ctx context.Context, apiPath string, target any) (int, error) {
@@ -195,6 +205,8 @@ func (c *Client) get(ctx context.Context, apiPath string, target any) (int, erro
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
 		_ = json.Unmarshal(body, target)
 		return response.StatusCode, nil
+	case http.StatusGone:
+		return response.StatusCode, &Error{Permanent, "this Silo server does not serve the API the plugin uses; update the plugin"}
 	case http.StatusUnauthorized:
 		return response.StatusCode, &Error{InvalidCredential, "Silo rejected the Silo API key; reconnect with a valid key"}
 	case http.StatusForbidden:

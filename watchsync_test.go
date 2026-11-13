@@ -50,21 +50,21 @@ func (b *fakeBackends) serve(w http.ResponseWriter, r *http.Request) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	switch {
-	case strings.HasPrefix(r.URL.Path, "/api/v1/"):
+	case strings.HasPrefix(r.URL.Path, "/api/v2/"):
 		b.siloHit++
 		if r.Header.Get("Authorization") != "Bearer "+testSiloKey || r.Header.Get("X-Profile-Id") != testProfileID {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		if r.URL.Path == "/api/v1/profiles" {
-			fmt.Fprintf(w, `{"profiles":[{"id":%q}]}`, testProfileID)
+		if r.URL.Path == "/api/v2/profiles" {
+			fmt.Fprintf(w, `{"items":[{"id":%q}]}`, testProfileID)
 			return
 		}
-		id := strings.TrimPrefix(r.URL.Path, "/api/v1/catalog/items/")
+		id := strings.TrimPrefix(r.URL.Path, "/api/v2/catalog/items/")
 		body, ok := b.items[id]
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
-			fmt.Fprint(w, `{"error":"not_found","message":"item not found"}`)
+			fmt.Fprint(w, `{"type":"https://siloserver.org/docs/api/v2/problems/not_found","title":"Not found","status":404,"detail":"item not found"}`)
 			return
 		}
 		fmt.Fprint(w, body)

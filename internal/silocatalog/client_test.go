@@ -23,7 +23,7 @@ func TestItemSendsProfileAndReadsFiles(t *testing.T) {
 		if r.Header.Get("Authorization") != "Bearer key" || r.Header.Get("X-Profile-Id") != "p1" {
 			t.Errorf("headers = %v", r.Header)
 		}
-		if r.URL.EscapedPath() != "/api/v1/catalog/items/a%2Fb" {
+		if r.URL.EscapedPath() != "/api/v2/catalog/items/a%2Fb" {
 			t.Errorf("path = %q", r.URL.EscapedPath())
 		}
 		fmt.Fprint(w, `{"content_id":"a/b","user_state":{"played":true},"versions":[{"file_name":"x [Shoko Episode=1].mkv","file_path":"/vfs/x [Shoko Episode=1].mkv"},{"file_name":"y [Shoko Episode=2].mkv"},{}]}`)
@@ -65,16 +65,17 @@ func TestValidateProfile(t *testing.T) {
 		want   Kind
 		ok     bool
 	}{
-		"listed":       {http.StatusOK, `{"profiles":[{"id":"p0"},{"id":"p1"}]}`, 0, true},
-		"not listed":   {http.StatusOK, `{"profiles":[{"id":"p0"}]}`, PermissionDenied, false},
+		"listed":       {http.StatusOK, `{"items":[{"id":"p0"},{"id":"p1"}]}`, 0, true},
+		"not listed":   {http.StatusOK, `{"items":[{"id":"p0"}]}`, PermissionDenied, false},
 		"bad key":      {http.StatusUnauthorized, ``, InvalidCredential, false},
-		"bad profile":  {http.StatusNotFound, `{"error":"not_found","message":"Profile not found"}`, InvalidConfig, false},
+		"bad profile":  {http.StatusNotFound, `{"type":"https://siloserver.org/docs/api/v2/problems/not_found","title":"Not found","status":404,"detail":"Profile not found"}`, InvalidConfig, false},
 		"not silo":     {http.StatusNotFound, `nope`, Permanent, false},
 		"server error": {http.StatusBadGateway, ``, Temporary, false},
+		"api gone":     {http.StatusGone, `{"error":"client_upgrade_required"}`, Permanent, false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			client := testClient(t, func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path != "/api/v1/profiles" {
+				if r.URL.Path != "/api/v2/profiles" {
 					t.Errorf("path = %q", r.URL.Path)
 				}
 				w.WriteHeader(tc.status)

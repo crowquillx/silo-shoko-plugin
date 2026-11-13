@@ -43,7 +43,7 @@ func TestAdminFindsAndRefreshesAShow(t *testing.T) {
 				{"root_path":"/srv/vfs/Other (2020)","sample_file_path":"/srv/vfs/Other (2020)/Season 01/x [Shoko Group=120] [Shoko Series=1].mkv","content_id":"wrong"},
 				{"root_path":"/srv/vfs/Show (2020)","sample_file_path":"/srv/vfs/Show (2020)/Season 01/x [Shoko Group=12] [Shoko Series=2].mkv","content_id":"show-12"}
 			],"total":2}`))
-		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/admin/items/show-12/refresh-metadata":
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v2/admin/items/show-12/refresh-metadata":
 			var body map[string]string
 			if json.NewDecoder(r.Body).Decode(&body) != nil || body["mode"] != "quick" {
 				w.WriteHeader(http.StatusBadRequest)

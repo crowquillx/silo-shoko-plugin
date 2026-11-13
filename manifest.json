@@ -1,6 +1,6 @@
 {
   "plugin_id": "silo.shokoanime",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "supported_platforms": [
@@ -144,7 +144,7 @@
               {
                 "key": "profile_id",
                 "label": "Silo profile ID",
-                "description": "The ID of the profile you are connecting, from GET /api/v1/profiles.",
+                "description": "The ID of the profile you are connecting, from GET /api/v2/profiles.",
                 "control": "ADMIN_FORM_CONTROL_TEXT",
                 "required": true
               }

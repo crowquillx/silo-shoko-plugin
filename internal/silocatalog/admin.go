@@ -148,7 +148,7 @@ func (a *Admin) ShowByFolder(ctx context.Context, libraryID, folder string, titl
 				Type      string `json:"type"`
 			} `json:"items"`
 		}
-		if _, err := a.do(ctx, http.MethodGet, "/api/v1/catalog?"+query.Encode(), nil, &response); err != nil {
+		if _, err := a.do(ctx, http.MethodGet, "/api/v2/catalog?"+query.Encode(), nil, &response); err != nil {
 			return "", false, err
 		}
 		for _, item := range response.Items {
@@ -159,7 +159,7 @@ func (a *Admin) ShowByFolder(ctx context.Context, libraryID, folder string, titl
 			var detail struct {
 				FolderPaths []string `json:"folder_paths"`
 			}
-			status, err := a.do(ctx, http.MethodGet, "/api/v1/catalog/items/"+url.PathEscape(item.ContentID), nil, &detail)
+			status, err := a.do(ctx, http.MethodGet, "/api/v2/catalog/items/"+url.PathEscape(item.ContentID), nil, &detail)
 			if err != nil {
 				return "", false, err
 			}
@@ -180,7 +180,7 @@ func (a *Admin) ShowByFolder(ctx context.Context, libraryID, folder string, titl
 // refreshes its seasons, episodes and artwork. found is false when Silo has no
 // such item.
 func (a *Admin) Refresh(ctx context.Context, contentID string) (found bool, err error) {
-	status, err := a.do(ctx, http.MethodPost, "/api/v1/admin/items/"+url.PathEscape(contentID)+"/refresh-metadata", map[string]string{"mode": "quick"}, nil)
+	status, err := a.do(ctx, http.MethodPost, "/api/v2/admin/items/"+url.PathEscape(contentID)+"/refresh-metadata", map[string]string{"mode": "quick"}, nil)
 	if err != nil {
 		return false, err
 	}
