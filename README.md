@@ -19,6 +19,8 @@ Part of [Crowquillx Silo Plugins](https://github.com/crowquillx/crowquillx-silo-
 
 The Autoscan source picks up changes from the moment it is added. If it is added after the VFS is built, or its first poll fails, its first successful poll scans the whole library once. The same happens if the VFS output root is deleted or recreated: the source notices that its place in the change journal is gone and starts over, rather than missing changes. One case is still missed: if the recreated root already holds more changes than the source had read before its next poll, the source cannot tell the journal is new and skips the earliest ones. After recreating the root, scan the library once from its menu. Polls never wait for a crawl: a crawl still in progress, including one left unfinished by a restart, continues in the background, and its changes are scanned when it finishes.
 
+Ignored files are left out. A file marked as a variation is left out for any episode another file already covers, since it is another version of that episode. It is kept for an episode with no other file, such as the parts of one AniDB episode that is split across files and marked as variations to clear them from Shoko's release review.
+
 ## Live updates
 
 The plugin listens to Shoko Server's events, as Shokofin does, so the VFS follows Shoko within seconds instead of waiting for the reconcile task:
