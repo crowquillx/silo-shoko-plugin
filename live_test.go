@@ -293,6 +293,15 @@ func TestChangedGroups(t *testing.T) {
 	}
 }
 
+// A show whose specials poster alone changed is refreshed too.
+func TestChangedGroupsNoticesSpecialsPosters(t *testing.T) {
+	before := map[int]shoko.ShowPoster{1: {Show: "a"}, 2: {Show: "b", Specials: "s"}}
+	after := map[int]shoko.ShowPoster{1: {Show: "a", Specials: "t"}, 2: {Show: "b", Specials: "s"}}
+	if got := changedGroups(before, after); !reflect.DeepEqual(got, []int{1}) {
+		t.Fatalf("changedGroups = %v", got)
+	}
+}
+
 func TestMovedSeriesNamesOnlySeriesWhoseLinksMoved(t *testing.T) {
 	outcome := reconcile.Outcome{
 		Plan: topology.Plan{Entries: []topology.Entry{

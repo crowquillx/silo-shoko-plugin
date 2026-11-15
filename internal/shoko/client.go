@@ -160,30 +160,38 @@ func (c *Client) do(ctx context.Context, method, target, endpoint string, dst an
 // (https://github.com/crowquillx/shoko-season-posters).
 const showPostersPath = "/api/plugin/season-posters/show-posters"
 
-// ShowPosters returns the show posters chosen with the Season Posters Shoko
-// plugin, as Shoko image IDs keyed by group ID. Shoko gives a group only its
-// main series' poster, so this is the only way for a show to have its own. A
-// server without the plugin answers 404, which yields an empty map and no
-// error.
-func (c *Client) ShowPosters(ctx context.Context) (map[int]string, error) {
+// ShowPoster is what the Season Posters Shoko plugin chose for one group: the
+// show's own poster and its specials season's poster, as Shoko image IDs.
+// Either can be empty.
+type ShowPoster struct {
+	Show     string
+	Specials string
+}
+
+// ShowPosters returns the posters chosen with the Season Posters Shoko plugin,
+// keyed by group ID. Shoko gives a group only its main series' poster, so this
+// is the only way for a show, or its specials season, to have its own. A server
+// without the plugin answers 404, which yields an empty map and no error.
+func (c *Client) ShowPosters(ctx context.Context) (map[int]ShowPoster, error) {
 	var result struct {
 		Shows []struct {
-			GroupID *int   `json:"groupId"`
-			ImageID string `json:"imageId"`
+			GroupID         *int   `json:"groupId"`
+			ImageID         string `json:"imageId"`
+			SpecialsImageID string `json:"specialsImageId"`
 		} `json:"shows"`
 	}
 	err := c.fetch(ctx, c.resolvePath(showPostersPath, nil), showPostersPath, &result)
 	var httpErr *HTTPError
 	if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound {
-		return map[int]string{}, nil
+		return map[int]ShowPoster{}, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	posters := make(map[int]string, len(result.Shows))
+	posters := make(map[int]ShowPoster, len(result.Shows))
 	for _, show := range result.Shows {
-		if show.GroupID != nil && *show.GroupID > 0 && show.ImageID != "" {
-			posters[*show.GroupID] = show.ImageID
+		if show.GroupID != nil && *show.GroupID > 0 && (show.ImageID != "" || show.SpecialsImageID != "") {
+			posters[*show.GroupID] = ShowPoster{Show: show.ImageID, Specials: show.SpecialsImageID}
 		}
 	}
 	return posters, nil

@@ -22,6 +22,8 @@ func TestMovieGroupGivesEachMovieASeason(t *testing.T) {
 	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/api/plugin/season-posters/show-posters":
+			http.NotFound(w, r) // Season Posters is not installed.
 		case "/api/v3/Group/5":
 			fmt.Fprintf(w, `{"ids":{"id":5,"mainSeries":10},"name":"Movie Collection","images":{"posters":[{"uid":%q,"available":true,"preferred":true}]}}`, groupPoster)
 		case "/api/v3/Group/5/Series":
@@ -85,7 +87,7 @@ func TestGroupSeasonsUseEachTVSeriesPoster(t *testing.T) {
 		{IDs: shoko.IDs{ID: 10}, Name: "First", AniDB: &shoko.AnimeMetadata{Type: "TV", AirDate: "2010-01-01"}, Images: shoko.Images{Posters: []shoko.Image{{UID: "11111111-1111-4111-8111-111111111111", Available: true}}}},
 		{IDs: shoko.IDs{ID: 20}, Name: "Second", AniDB: &shoko.AnimeMetadata{Type: "TV", AirDate: "2020-01-01"}, Images: shoko.Images{Posters: []shoko.Image{{UID: "22222222-2222-4222-8222-222222222222", Available: true}}}},
 	}
-	response := groupSeasons(shoko.Group{IDs: shoko.GroupIDs{ID: 5}, Name: "Group"}, members, nil)
+	response := groupSeasons(shoko.Group{IDs: shoko.GroupIDs{ID: 5}, Name: "Group"}, members, nil, "")
 	if len(response.GetSeasons()) != 2 {
 		t.Fatalf("seasons = %#v", response.GetSeasons())
 	}
@@ -105,11 +107,11 @@ func TestGroupSeasonsListSpecialsOnlyWhenTheyExist(t *testing.T) {
 	regular := shoko.Episode{IDs: shoko.IDs{ID: 1}, AniDB: &shoko.AnimeMetadata{Type: "Episode", EpisodeNumber: 1}}
 	special := shoko.Episode{IDs: shoko.IDs{ID: 2}, AniDB: &shoko.AnimeMetadata{Type: "Special", EpisodeNumber: 1}}
 
-	without := groupSeasons(group, []shoko.Series{tv}, map[int][]shoko.Episode{10: {regular}})
+	without := groupSeasons(group, []shoko.Series{tv}, map[int][]shoko.Episode{10: {regular}}, "")
 	if len(without.GetSeasons()) != 1 {
 		t.Fatalf("seasons without specials = %#v", without.GetSeasons())
 	}
-	with := groupSeasons(group, []shoko.Series{tv}, map[int][]shoko.Episode{10: {regular, special}})
+	with := groupSeasons(group, []shoko.Series{tv}, map[int][]shoko.Episode{10: {regular, special}}, "")
 	if len(with.GetSeasons()) != 2 || with.GetSeasons()[1].GetSeasonNumber() != 0 || with.GetSeasons()[1].GetTitle() != "Specials" {
 		t.Fatalf("seasons with specials = %#v", with.GetSeasons())
 	}
@@ -121,7 +123,7 @@ func TestGroupSeasonsFollowShokoOrderAcrossTypes(t *testing.T) {
 		{IDs: shoko.IDs{ID: 10}, Name: "The Show", AniDB: &shoko.AnimeMetadata{Type: "TV"}},
 		{IDs: shoko.IDs{ID: 20}, Name: "The Movie", AniDB: &shoko.AnimeMetadata{Type: "Movie"}},
 	}
-	seasons := groupSeasons(shoko.Group{IDs: shoko.GroupIDs{ID: 5}, Name: "Group"}, members, nil).GetSeasons()
+	seasons := groupSeasons(shoko.Group{IDs: shoko.GroupIDs{ID: 5}, Name: "Group"}, members, nil, "").GetSeasons()
 	if len(seasons) != len(members) {
 		t.Fatalf("seasons = %#v", seasons)
 	}
@@ -148,6 +150,8 @@ func TestSeasonArtworkGallery(t *testing.T) {
 	image := func(uid string) string { return fmt.Sprintf(`{"uid":%q,"available":true}`, uid) }
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/api/plugin/season-posters/show-posters":
+			http.NotFound(w, r) // Season Posters is not installed.
 		case "/api/v3/Group/5":
 			fmt.Fprintf(w, `{"ids":{"id":5,"mainSeries":10},"name":"Group","images":{"posters":[%s],"backdrops":[%s]}}`, image(groupPoster), image(groupBackdrop))
 		case "/api/v3/Group/5/Series":
@@ -254,7 +258,7 @@ func TestSeasonsCarryTheirOwnBackdrop(t *testing.T) {
 	}
 	group := shoko.Group{IDs: shoko.GroupIDs{ID: 5}, Name: "Group", Images: shoko.Images{Backdrops: []shoko.Image{{UID: groupBackdrop, Available: true}}}}
 	special := shoko.Episode{IDs: shoko.IDs{ID: 2}, AniDB: &shoko.AnimeMetadata{Type: "Special", EpisodeNumber: 1}}
-	seasons := groupSeasons(group, members, map[int][]shoko.Episode{10: {special}}).GetSeasons()
+	seasons := groupSeasons(group, members, map[int][]shoko.Episode{10: {special}}, "").GetSeasons()
 	// A series without a backdrop has none: the show's backdrop is not its own.
 	want := []string{shokoImageScheme + firstBackdrop, shokoImageScheme + secondBackdrop, "", shokoImageScheme + groupBackdrop}
 	if len(seasons) != len(want) {
@@ -293,5 +297,21 @@ func TestSeasonsCarryTheirOwnBackdrop(t *testing.T) {
 	}
 	if got := lone.GetSeasons(); len(got) != 1 || got[0].GetBackdropPath() != shokoImageScheme+firstBackdrop {
 		t.Fatalf("seasons of a series outside a group = %#v", got)
+	}
+}
+
+// A specials poster chosen with the Season Posters Shoko plugin replaces the
+// group poster, which repeats season 1's, for the specials season only.
+func TestGroupSeasonsUseTheSeasonPostersSpecialsPoster(t *testing.T) {
+	tv := shoko.Series{IDs: shoko.IDs{ID: 10}, Name: "Show", AniDB: &shoko.AnimeMetadata{Type: "TV", AirDate: "2010-01-01"}}
+	group := shoko.Group{IDs: shoko.GroupIDs{ID: 5}, Name: "Group"}
+	special := shoko.Episode{IDs: shoko.IDs{ID: 2}, AniDB: &shoko.AnimeMetadata{Type: "Special", EpisodeNumber: 1}}
+
+	seasons := groupSeasons(group, []shoko.Series{tv}, map[int][]shoko.Episode{10: {special}}, "shoko://image/dddddddd-dddd-4ddd-8ddd-dddddddddddd").GetSeasons()
+	if len(seasons) != 2 || seasons[1].GetSeasonNumber() != 0 || seasons[1].GetPosterPath() != "shoko://image/dddddddd-dddd-4ddd-8ddd-dddddddddddd" {
+		t.Fatalf("seasons = %#v", seasons)
+	}
+	if seasons[0].GetPosterPath() == seasons[1].GetPosterPath() {
+		t.Fatalf("season 1 took the specials poster: %#v", seasons[0])
 	}
 }

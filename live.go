@@ -590,10 +590,10 @@ func (l *liveUpdates) siloLibraries(ctx context.Context) ([]string, error) {
 	return libraries, nil
 }
 
-// watchShowPosters asks Silo to refresh a show when the poster chosen for it
-// with the Season Posters Shoko plugin changes.
+// watchShowPosters asks Silo to refresh a show when the show or specials
+// poster chosen for it with the Season Posters Shoko plugin changes.
 func (l *liveUpdates) watchShowPosters(ctx context.Context) {
-	var last map[int]string
+	var last map[int]shoko.ShowPoster
 	ticker := time.NewTicker(posterCheckInterval)
 	defer ticker.Stop()
 	for {
@@ -633,8 +633,9 @@ func (l *liveUpdates) watchShowPosters(ctx context.Context) {
 	}
 }
 
-// changedGroups returns the groups whose poster was added, changed or removed.
-func changedGroups(before, after map[int]string) []int {
+// changedGroups returns the groups whose show or specials poster was added,
+// changed or removed.
+func changedGroups[T comparable](before, after map[int]T) []int {
 	changed := make([]int, 0)
 	for groupID, imageID := range after {
 		if before[groupID] != imageID {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	_ "embed"
@@ -74,7 +75,7 @@ type runtimeServer struct {
 	// Show posters from the Season Posters Shoko plugin, fetched at most once
 	// per showPosterTTL for the current client.
 	postersMu      sync.Mutex
-	posters        map[int]string
+	posters        map[int]shoko.ShowPoster
 	postersClient  *shoko.Client
 	postersFetched time.Time
 }
@@ -88,6 +89,17 @@ const showPosterTTL = 10 * time.Minute
 // Season Posters Shoko plugin, or "" when there is none. A failed lookup is
 // logged and treated as none, so show metadata never depends on that plugin.
 func (s *runtimeServer) showPoster(ctx context.Context, client *shoko.Client, groupID int) string {
+	return seasonPostersPath(s.seasonPosters(ctx, client, groupID).Show)
+}
+
+// specialsPoster returns the opaque path of the specials season poster chosen
+// for a group with the Season Posters Shoko plugin, or "" when there is none,
+// in which case the specials season keeps the group's poster.
+func (s *runtimeServer) specialsPoster(ctx context.Context, client *shoko.Client, groupID int) string {
+	return seasonPostersPath(s.seasonPosters(ctx, client, groupID).Specials)
+}
+
+func (s *runtimeServer) seasonPosters(ctx context.Context, client *shoko.Client, groupID int) shoko.ShowPoster {
 	s.postersMu.Lock()
 	defer s.postersMu.Unlock()
 	now := time.Now()
@@ -97,14 +109,19 @@ func (s *runtimeServer) showPoster(ctx context.Context, client *shoko.Client, gr
 		cancel()
 		if err != nil {
 			if ctx.Err() != nil {
-				return ""
+				return shoko.ShowPoster{}
 			}
 			fmt.Fprintf(os.Stderr, "shokoanime: using group posters, Season Posters lookup failed: %v\n", err)
 			posters = nil
 		}
 		s.posters, s.postersClient, s.postersFetched = posters, client, now
 	}
-	imageID := s.posters[groupID]
+	return s.posters[groupID]
+}
+
+// seasonPostersPath returns the opaque path of an image ID from the Season
+// Posters list, or "" when it is not a Shoko image UUID.
+func seasonPostersPath(imageID string) string {
 	if !shokoImageUUIDPattern.MatchString(imageID) {
 		return ""
 	}
@@ -120,7 +137,7 @@ func (s *runtimeServer) liveReport() map[string]any {
 }
 
 // setShowPosters replaces the cached Season Posters list with a newer one.
-func (s *runtimeServer) setShowPosters(client *shoko.Client, posters map[int]string) {
+func (s *runtimeServer) setShowPosters(client *shoko.Client, posters map[int]shoko.ShowPoster) {
 	s.postersMu.Lock()
 	defer s.postersMu.Unlock()
 	s.posters, s.postersClient, s.postersFetched = posters, client, time.Now()
@@ -608,7 +625,7 @@ func (s *metadataServer) GetSeasons(ctx context.Context, req *pluginv1.GetSeason
 		if err != nil {
 			return nil, err
 		}
-		return groupSeasons(group, members, episodesBySeries), nil
+		return groupSeasons(group, members, episodesBySeries, s.runtime.specialsPoster(ctx, client, group.IDs.ID)), nil
 	}
 	seriesID := token.SeriesID
 	if seriesID == 0 {
@@ -734,7 +751,7 @@ func (s *metadataServer) GetImages(ctx context.Context, req *pluginv1.GetImagesR
 	// number, and keeps only images that carry the number back. The pointer is
 	// checked, not the value, because season zero is the specials season.
 	if req.SeasonNumber != nil {
-		return s.runtime.seasonImages(ctx, client, groupID, seriesID, int(req.GetSeasonNumber()))
+		return s.runtime.seasonImages(ctx, client, groupID, seriesID, int(req.GetSeasonNumber()), req.GetLanguage())
 	}
 	// Grouped seasons carry both the parent group and their member series ID.
 	// The member series owns the season artwork, so it must win whenever both
@@ -752,10 +769,11 @@ func (s *metadataServer) GetImages(ctx context.Context, req *pluginv1.GetImagesR
 			return nil, err
 		}
 		records := imageRecords(group.Images)
-		// The specials season shares the group's images; only the show itself
-		// takes a show poster chosen with Season Posters.
+		// The specials season shares the group's images, but takes its own
+		// poster when one was chosen for it with Season Posters, and the show
+		// itself takes the show poster chosen there.
 		if req.GetItemType() == "season" || strings.Contains(req.GetProviderId(), ":season:") {
-			return records, nil
+			return withShowPoster(records, s.runtime.specialsPoster(ctx, client, groupID), req.GetLanguage()), nil
 		}
 		return withShowPoster(records, s.runtime.showPoster(ctx, client, groupID), req.GetLanguage()), nil
 	}
@@ -770,14 +788,21 @@ func (s *metadataServer) GetImages(ctx context.Context, req *pluginv1.GetImagesR
 // does not have gets no images, so Silo never files another season's artwork
 // under it. The group wins when both IDs are present: the request is about the
 // show, and only the group knows which series is which season.
-func (s *runtimeServer) seasonImages(ctx context.Context, client *shoko.Client, groupID, seriesID, season int) (*pluginv1.GetImagesResponse, error) {
+func (s *runtimeServer) seasonImages(ctx context.Context, client *shoko.Client, groupID, seriesID, season int, language string) (*pluginv1.GetImagesResponse, error) {
 	switch {
 	case groupID > 0 && season == 0:
 		group, err := client.Group(ctx, groupID)
 		if err != nil {
 			return nil, err
 		}
-		return seasonImageRecords(group.Images, season), nil
+		records := withShowPoster(seasonImageRecords(group.Images, season), s.specialsPoster(ctx, client, groupID), language)
+		for _, record := range records.GetImages() {
+			if record.SeasonNumber == nil {
+				number := int32(season)
+				record.SeasonNumber = &number
+			}
+		}
+		return records, nil
 	case groupID > 0:
 		members, err := s.seasonMembers(ctx, client, groupID)
 		if err != nil {
@@ -1535,7 +1560,9 @@ func groupEpisodes(ctx context.Context, list func(context.Context, int) ([]shoko
 	return episodesBySeries, nil
 }
 
-func groupSeasons(group shoko.Group, members []shoko.Series, episodesBySeries map[int][]shoko.Episode) *pluginv1.GetSeasonsResponse {
+// groupSeasons lists a group's seasons. specialsPoster is the specials season's
+// poster chosen with the Season Posters Shoko plugin, or "" to use the group's.
+func groupSeasons(group shoko.Group, members []shoko.Series, episodesBySeries map[int][]shoko.Episode, specialsPoster string) *pluginv1.GetSeasonsResponse {
 	layout := topology.NewGroupLayout(members)
 	response := &pluginv1.GetSeasonsResponse{Seasons: make([]*pluginv1.SeasonRecord, 0, len(layout.OrderedMembers)+1)}
 	groupID := strconv.Itoa(group.IDs.ID)
@@ -1569,7 +1596,7 @@ func groupSeasons(group shoko.Group, members []shoko.Series, episodesBySeries ma
 				response.Seasons = append(response.Seasons, &pluginv1.SeasonRecord{
 					SeasonNumber: 0,
 					Title:        "Specials",
-					PosterPath:   groupPoster,
+					PosterPath:   cmp.Or(specialsPoster, groupPoster),
 					BackdropPath: selectedBackdropPath(group.Images),
 					ProviderId:   fmt.Sprintf("group:%d:season:0", group.IDs.ID),
 					ProviderIds:  stringStruct(map[string]string{"shoko_group": groupID}),

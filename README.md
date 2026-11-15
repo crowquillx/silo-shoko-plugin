@@ -47,7 +47,7 @@ Silo fetches a show's metadata when it first scans it, and later only when asked
 - when Shoko reports a change to the metadata of any of its series or episodes, from AniDB, TMDB or Shoko itself, or a changed link to TMDB or another provider;
 - when an image of one of them is downloaded, removed, or picked as preferred, in Shoko's Web UI or by a plugin such as [Season Posters](https://github.com/crowquillx/shoko-season-posters) setting season posters;
 - on daily Shoko, when its group is renamed, gains or loses a series, or has its artwork changed;
-- when the show poster chosen for it with Season Posters changes. That plugin sends no event for show posters, so its list is compared every 5 minutes.
+- when the show or specials poster chosen for it with Season Posters changes. That plugin sends no event for these, so its list is compared every 5 minutes.
 
 A Silo show refresh also refreshes its seasons, episodes and artwork. The plugin finds the show in the Silo libraries that scan the VFS output root: by the `[Shoko Group=<id>]` marker in its file names among the library's roots, or, for a show Silo added through an autoscan, which is not listed among the roots until a full library scan, by searching the catalog for its title and checking that its folder is the show's VFS folder. A show Silo has not scanned yet is skipped, since its first scan fetches its metadata.
 
@@ -69,7 +69,7 @@ The AniDB rating appears in Silo once an administrator turns on the AniDB rating
 
 ## Posters
 
-Each season uses its Shoko series' preferred poster. Shoko gives a group only its main series' poster, so on its own a show repeats its first season's poster. With the [Season Posters](https://github.com/crowquillx/shoko-season-posters) Shoko plugin installed, a show uses the show poster chosen there in its own show poster mode, and keeps the group poster otherwise. The plugin reads that list at most every 10 minutes. A changed poster appears once the show's metadata is refreshed in Silo, which the plugin [asks Silo to do](#refreshing-silo) when the Silo refresh settings are set. Specials keep the group poster. Each season also gets its Shoko series' backdrop, from the next metadata refresh on.
+Each season uses its Shoko series' preferred poster. Shoko gives a group only its main series' poster, so on its own a show repeats its first season's poster. With the [Season Posters](https://github.com/crowquillx/shoko-season-posters) Shoko plugin installed, a show uses the show poster chosen there in its own show poster mode, and keeps the group poster otherwise. The plugin reads that list at most every 10 minutes. A changed poster appears once the show's metadata is refreshed in Silo, which the plugin [asks Silo to do](#refreshing-silo) when the Silo refresh settings are set. The specials season uses the specials poster chosen there, from Season Posters 0.1.9, and keeps the group poster otherwise. Shoko's group poster is the main series' poster, so without one the specials season repeats season 1's poster. A group that has sub-groups as well as series of its own is a show of those series here, and Season Posters plans a show poster for it too. Each season also gets its Shoko series' backdrop, from the next metadata refresh on.
 
 Silo's artwork picker shows no Shoko artwork for a show or a season. Silo asks providers for that list by TMDB, TVDB or IMDb ID only, and Shoko's artwork is found by Shoko ID. The plugin answers a season's artwork request, but Silo does not send one it can use yet.
 

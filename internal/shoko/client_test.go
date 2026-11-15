@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -338,7 +339,11 @@ func TestShowPostersReadsTheSeasonPostersList(t *testing.T) {
 		if r.URL.Path != "/api/plugin/season-posters/show-posters" || r.Header.Get("apikey") != "test-key" {
 			t.Errorf("request = %s apikey=%q", r.URL.Path, r.Header.Get("apikey"))
 		}
-		fmt.Fprint(w, `{"shows":[{"key":"group:933","groupId":933,"mainSeriesId":102,"imageId":"78141125-0278-55f6-8034-32152fa1a5ed"},{"key":"series:4","groupId":null,"mainSeriesId":4,"imageId":"11111111-1111-4111-8111-111111111111"}]}`)
+		fmt.Fprint(w, `{"shows":[`+
+			`{"key":"group:933","groupId":933,"mainSeriesId":102,"imageId":"78141125-0278-55f6-8034-32152fa1a5ed","specialsImageId":"22222222-2222-4222-8222-222222222222"},`+
+			`{"key":"group:934","groupId":934,"mainSeriesId":103,"imageId":null,"specialsImageId":"33333333-3333-4333-8333-333333333333"},`+
+			`{"key":"group:935","groupId":935,"mainSeriesId":104,"imageId":"44444444-4444-4444-8444-444444444444"},`+
+			`{"key":"series:4","groupId":null,"mainSeriesId":4,"imageId":"11111111-1111-4111-8111-111111111111"}]}`)
 	}))
 	defer server.Close()
 	client, err := NewClient(Config{BaseURL: server.URL, APIKey: "test-key"})
@@ -349,7 +354,12 @@ func TestShowPostersReadsTheSeasonPostersList(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(posters) != 1 || posters[933] != "78141125-0278-55f6-8034-32152fa1a5ed" {
+	want := map[int]ShowPoster{
+		933: {Show: "78141125-0278-55f6-8034-32152fa1a5ed", Specials: "22222222-2222-4222-8222-222222222222"},
+		934: {Specials: "33333333-3333-4333-8333-333333333333"},
+		935: {Show: "44444444-4444-4444-8444-444444444444"},
+	}
+	if !reflect.DeepEqual(posters, want) {
 		t.Fatalf("posters = %#v", posters)
 	}
 }

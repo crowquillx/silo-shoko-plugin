@@ -760,6 +760,62 @@ func TestGroupShowUsesSeasonPostersShowPoster(t *testing.T) {
 	}
 }
 
+const seasonPostersSpecialsPoster = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+
+// A specials poster chosen with the Season Posters Shoko plugin goes first
+// among the specials season's images, whichever way Silo asks for them, and
+// leaves the show's own images alone.
+func TestSpecialsSeasonUsesSeasonPostersSpecialsPoster(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/plugin/season-posters/show-posters":
+			fmt.Fprintf(w, `{"shows":[{"key":"group:5","groupId":5,"mainSeriesId":7,"imageId":null,"specialsImageId":%q}]}`, seasonPostersSpecialsPoster)
+		case "/api/v3/Group/5":
+			fmt.Fprint(w, groupWithImagesFixture)
+		default:
+			t.Errorf("unexpected request path = %q", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	metadata := showMetadataServer(t, server)
+	ctx := context.Background()
+	want := "shoko://image/" + seasonPostersSpecialsPoster
+
+	item, err := metadata.GetImages(ctx, &pluginv1.GetImagesRequest{ProviderId: "group:5:season:0", ItemType: "season", Language: "ja"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if records := item.GetImages(); len(records) != 3 || records[0].GetUrl() != want || records[0].GetLanguage() != "ja" {
+		t.Fatalf("specials season images = %#v", records)
+	}
+
+	zero := int32(0)
+	numbered, err := metadata.GetImages(ctx, &pluginv1.GetImagesRequest{ProviderId: "group:5", SeasonNumber: &zero})
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := numbered.GetImages()
+	if len(records) == 0 || records[0].GetUrl() != want {
+		t.Fatalf("season 0 images = %#v", records)
+	}
+	for _, record := range records {
+		if record.SeasonNumber == nil || record.GetSeasonNumber() != 0 {
+			t.Fatalf("season 0 image without its season number: %#v", record)
+		}
+	}
+
+	show, err := metadata.GetImages(ctx, &pluginv1.GetImagesRequest{ProviderId: "group:5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range show.GetImages() {
+		if record.GetUrl() == want {
+			t.Fatalf("the show took the specials poster: %#v", show.GetImages())
+		}
+	}
+}
+
 // Without the Season Posters plugin, or when it fails, the show keeps the
 // group poster.
 func TestGroupShowKeepsGroupPosterWithoutSeasonPosters(t *testing.T) {
