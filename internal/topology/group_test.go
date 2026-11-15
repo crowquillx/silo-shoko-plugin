@@ -95,3 +95,36 @@ func TestSeasonZeroNumberStaysInFiveDigitsForHugeGroups(t *testing.T) {
 		t.Fatalf("number = %d, want at most 99999", number)
 	}
 }
+
+// While a move between groups is only half read, two groups can list the same
+// series. The series' own parent group decides which show it is a season of.
+func TestSeriesFollowsItsParentGroupWhenTwoGroupsListIt(t *testing.T) {
+	series := member(7, "TV")
+	series.Name = "Show"
+	for _, parent := range []int{3, 4} {
+		series.IDs.ParentGroup = parent
+		id := 42
+		seriesID := 7
+		snapshot := shoko.Snapshot{
+			Files: []shoko.File{{
+				ID:        9,
+				Locations: []shoko.Location{{ManagedFolderID: 1, RelativePath: "a.mkv", IsAccessible: true}},
+				SeriesIDs: []shoko.FileCrossReference{{
+					SeriesID:   shoko.SeriesCrossReferenceIDs{ID: &seriesID},
+					EpisodeIDs: []shoko.EpisodeCrossReferenceIDs{{ID: &id}},
+				}},
+			}},
+			Series:      map[int]shoko.Series{7: series},
+			Groups:      map[int]shoko.Group{3: {Name: "Three"}, 4: {Name: "Four"}},
+			GroupSeries: map[int][]int{3: {7}, 4: {7}},
+			Episodes:    map[int]shoko.Episode{42: regular(1)},
+		}
+		plan, err := Build(snapshot, Policy{VFSRoot: "/vfs", ManagedFolderMap: map[int]string{1: "/media"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(plan.Entries) != 1 || plan.Entries[0].ShokoGroupID != parent {
+			t.Fatalf("parent group %d: entries = %#v", parent, plan.Entries)
+		}
+	}
+}

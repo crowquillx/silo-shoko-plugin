@@ -154,6 +154,8 @@ type recordingHandler struct {
 	connected []bool
 	batches   []Batch
 	applied   chan struct{}
+	// failures is how many more Apply calls return their VFS work to retry.
+	failures int
 }
 
 func (h *recordingHandler) Connected(_ context.Context, reconnect bool) {
@@ -162,11 +164,17 @@ func (h *recordingHandler) Connected(_ context.Context, reconnect bool) {
 	h.connected = append(h.connected, reconnect)
 }
 
-func (h *recordingHandler) Apply(_ context.Context, batch Batch) {
+func (h *recordingHandler) Apply(_ context.Context, batch Batch) Batch {
 	h.mu.Lock()
 	h.batches = append(h.batches, batch)
+	var retry Batch
+	if h.failures > 0 {
+		h.failures--
+		retry.VFS = batch.VFS
+	}
 	h.mu.Unlock()
 	h.applied <- struct{}{}
+	return retry
 }
 
 func TestWatcherMergesABurstIntoOneBatchAndReconnects(t *testing.T) {
@@ -226,6 +234,62 @@ func TestWatcherMergesABurstIntoOneBatchAndReconnects(t *testing.T) {
 	}
 	if !reflect.DeepEqual(handler.batches[1].VFS.Files, []int{3}) {
 		t.Fatalf("second batch = %#v", handler.batches[1])
+	}
+}
+
+func TestWatcherRetriesWorkAHandlerReturns(t *testing.T) {
+	stream := newFakeStream()
+	handler := &recordingHandler{applied: make(chan struct{}, 4), failures: 2}
+	watcher := New(Config{
+		Quiet:      20 * time.Millisecond,
+		MaxDelay:   time.Second,
+		RetryDelay: 40 * time.Millisecond,
+		Dial: func(context.Context, signalr.Config) (Stream, error) {
+			return stream, nil
+		},
+	}, handler)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		watcher.Run(ctx)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	started := time.Now()
+	stream.send("release:saved", `{"FileID":1}`)
+	for call := 0; call < 3; call++ {
+		select {
+		case <-handler.applied:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Apply call %d never came", call+1)
+		}
+		if call == 0 {
+			// An event that arrives while the failed work waits joins it.
+			stream.send("release:saved", `{"FileID":2}`)
+		}
+	}
+	// The two retries wait 40ms and then 80ms.
+	if elapsed := time.Since(started); elapsed < 120*time.Millisecond {
+		t.Fatalf("three calls took %s, so the retries did not back off", elapsed)
+	}
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	if got := handler.batches[0].VFS.Files; !reflect.DeepEqual(got, []int{1}) {
+		t.Fatalf("first batch = %v", got)
+	}
+	for _, batch := range handler.batches[1:] {
+		if got := batch.VFS.Files; !reflect.DeepEqual(got, []int{1, 2}) {
+			t.Fatalf("retried batch = %v, want the failed work with the new event", got)
+		}
+	}
+	select {
+	case <-handler.applied:
+		t.Fatal("work was retried after it succeeded")
+	case <-time.After(200 * time.Millisecond):
 	}
 }
 
@@ -306,6 +370,7 @@ func (h *blockingHandler) Connected(ctx context.Context, _ bool) {
 	}
 }
 
-func (h *blockingHandler) Apply(_ context.Context, batch Batch) {
+func (h *blockingHandler) Apply(_ context.Context, batch Batch) Batch {
 	h.applied <- batch
+	return Batch{}
 }

@@ -21,8 +21,10 @@ type Handler interface {
 	// crawl holds, without the server's buffer for this client filling up.
 	Connected(ctx context.Context, reconnect bool)
 	// Apply is called with the merged work of a burst of events. Calls never
-	// overlap; events that arrive meanwhile wait for the next call.
-	Apply(ctx context.Context, batch Batch)
+	// overlap; events that arrive meanwhile wait for the next call. It returns
+	// the work that could not be done and should be tried again, which comes
+	// back in a later call, after a delay that grows with each failure.
+	Apply(ctx context.Context, batch Batch) (retry Batch)
 }
 
 // Config configures a Watcher.
@@ -34,6 +36,10 @@ type Config struct {
 	Quiet time.Duration
 	// MaxDelay bounds how long a batch can wait while events keep arriving.
 	MaxDelay time.Duration
+	// RetryDelay is how long work a handler returned waits before it is tried
+	// again. It doubles with each failure in a row, up to MaxRetryDelay.
+	RetryDelay    time.Duration
+	MaxRetryDelay time.Duration
 	// Logf reports connection problems.
 	Logf func(format string, args ...any)
 	// OnEvent, if set, is called for every event Shoko sends.
@@ -54,6 +60,8 @@ type Stream interface {
 const (
 	defaultQuiet    = 10 * time.Second
 	defaultMaxDelay = time.Minute
+	defaultRetry    = 15 * time.Second
+	defaultMaxRetry = 5 * time.Minute
 	minBackoff      = 2 * time.Second
 	maxBackoff      = 2 * time.Minute
 	// stableAfter is how long a connection must last for the next failure
@@ -73,6 +81,10 @@ type Watcher struct {
 	last      time.Time
 	wake      chan struct{}
 	connected bool
+	// failures counts the Apply calls in a row that returned work to retry,
+	// and notBefore is when that work may be tried again.
+	failures  int
+	notBefore time.Time
 }
 
 // New returns a watcher that is not running yet.
@@ -82,6 +94,12 @@ func New(config Config, handler Handler) *Watcher {
 	}
 	if config.MaxDelay < config.Quiet {
 		config.MaxDelay = max(defaultMaxDelay, config.Quiet)
+	}
+	if config.RetryDelay <= 0 {
+		config.RetryDelay = defaultRetry
+	}
+	if config.MaxRetryDelay < config.RetryDelay {
+		config.MaxRetryDelay = max(defaultMaxRetry, config.RetryDelay)
 	}
 	if config.Logf == nil {
 		config.Logf = func(string, ...any) {}
@@ -203,6 +221,29 @@ func (w *Watcher) add(batch Batch) {
 	}
 }
 
+// requeue puts work a handler could not do back with the pending work, to be
+// tried again after a delay. An empty retry ends the run of failures.
+func (w *Watcher) requeue(retry Batch) {
+	now := time.Now()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if retry.Empty() {
+		w.failures, w.notBefore = 0, time.Time{}
+		return
+	}
+	delay := w.config.MaxRetryDelay
+	if w.failures < 16 {
+		delay = min(w.config.RetryDelay<<w.failures, w.config.MaxRetryDelay)
+	}
+	w.failures++
+	w.notBefore = now.Add(delay)
+	if w.pending.Empty() {
+		w.first, w.last = now, now
+	}
+	retry.Merge(w.pending)
+	w.pending = retry
+}
+
 // dispatch applies pending work once events have been quiet for Quiet, or
 // once the oldest pending event is MaxDelay old.
 func (w *Watcher) dispatch(ctx context.Context) {
@@ -225,6 +266,9 @@ func (w *Watcher) dispatch(ctx context.Context) {
 		if limit := w.first.Add(w.config.MaxDelay); limit.Before(due) {
 			due = limit
 		}
+		if due.Before(w.notBefore) {
+			due = w.notBefore
+		}
 		wait := time.Until(due)
 		if wait > 0 {
 			w.mu.Unlock()
@@ -234,7 +278,7 @@ func (w *Watcher) dispatch(ctx context.Context) {
 		batch := w.pending
 		w.pending = Batch{}
 		w.mu.Unlock()
-		w.handler.Apply(ctx, batch)
+		w.requeue(w.handler.Apply(ctx, batch))
 		// Events that arrived during Apply are due now or soon.
 		select {
 		case w.wake <- struct{}{}:

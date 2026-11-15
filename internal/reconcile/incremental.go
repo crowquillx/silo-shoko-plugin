@@ -1,7 +1,9 @@
 package reconcile
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -59,51 +61,33 @@ type SnapshotInfo struct {
 	CommittedAt time.Time
 }
 
-// Snapshot reports whether a snapshot of a committed crawl exists for the
-// current settings, and when it was last written.
-func (e *Engine) Snapshot(ctx context.Context) (SnapshotInfo, error) {
-	if e == nil || e.reconciler == nil {
-		return SnapshotInfo{}, errors.New("reconcile: engine is not configured")
-	}
-	var info SnapshotInfo
-	err := e.reconciler.WithExclusive(ctx, func(locked *vfs.Reconciler) error {
-		state, err := loadState(vfs.SnapshotPath(locked.Root()))
-		if errors.Is(err, errStaleState) {
-			return nil
-		}
-		if err != nil || state == nil || state.Fingerprint != e.fingerprint || state.Phase != phaseReady {
-			return err
-		}
-		stat, err := os.Stat(vfs.SnapshotPath(locked.Root()))
-		if err != nil {
-			return fmt.Errorf("reconcile: inspect snapshot: %w", err)
-		}
-		info = SnapshotInfo{Exists: true, CommittedAt: stat.ModTime()}
-		return nil
-	})
-	return info, err
+// View is the snapshot of the last commit with the plan built from it. It is
+// shared between callers and must not be changed.
+type View struct {
+	Snapshot shoko.Snapshot
+	Plan     topology.Plan
+	// CommittedAt is when the snapshot was last committed to the VFS.
+	CommittedAt time.Time
 }
 
-// SnapshotData returns the Shoko data behind the last commit. It fails with
-// ErrNoSnapshot when there is none for the current settings.
-func (e *Engine) SnapshotData(ctx context.Context) (shoko.Snapshot, error) {
+// View returns the snapshot behind the last commit and its plan. It fails
+// with ErrNoSnapshot when there is none for the current settings. The file is
+// read once per version and without the VFS lock, which a crawl holds for
+// long stretches: the file is only ever replaced whole.
+func (e *Engine) View() (*View, error) {
 	if e == nil || e.reconciler == nil {
-		return shoko.Snapshot{}, errors.New("reconcile: engine is not configured")
+		return nil, errors.New("reconcile: engine is not configured")
 	}
-	var snapshot shoko.Snapshot
-	err := e.reconciler.WithExclusive(ctx, func(locked *vfs.Reconciler) error {
-		state, err := e.loadSnapshot(locked)
-		if err != nil {
-			return err
-		}
-		snapshot = stateSnapshot(state)
-		return nil
-	})
-	return snapshot, err
-}
-
-func (e *Engine) loadSnapshot(locked *vfs.Reconciler) (*crawlState, error) {
-	state, err := loadState(vfs.SnapshotPath(locked.Root()))
+	path := vfs.SnapshotPath(e.reconciler.Root())
+	e.viewMu.Lock()
+	defer e.viewMu.Unlock()
+	if stamp, ok := stampFile(path); !ok {
+		e.view = nil
+		return nil, ErrNoSnapshot
+	} else if e.view != nil && e.viewStamp == stamp {
+		return e.view, nil
+	}
+	state, stamp, err := loadStampedState(path)
 	if errors.Is(err, errStaleState) {
 		return nil, ErrNoSnapshot
 	}
@@ -113,7 +97,85 @@ func (e *Engine) loadSnapshot(locked *vfs.Reconciler) (*crawlState, error) {
 	if state == nil || state.Fingerprint != e.fingerprint || state.Phase != phaseReady {
 		return nil, ErrNoSnapshot
 	}
-	return state, nil
+	snapshot := stateSnapshot(state)
+	plan, err := e.Plan(snapshot)
+	if err != nil {
+		return nil, err
+	}
+	e.view = &View{Snapshot: snapshot, Plan: plan, CommittedAt: time.Unix(0, stamp.modified)}
+	e.viewStamp = stamp
+	return e.view, nil
+}
+
+// rememberView keeps the view of a snapshot that was just written, so it is
+// not read back from disk. The caller holds the VFS lock.
+func (e *Engine) rememberView(locked *vfs.Reconciler, state *crawlState, plan topology.Plan) {
+	stamp, ok := stampFile(vfs.SnapshotPath(locked.Root()))
+	if !ok {
+		return
+	}
+	view := &View{Snapshot: stateSnapshot(state), Plan: plan, CommittedAt: time.Unix(0, stamp.modified)}
+	e.viewMu.Lock()
+	e.view, e.viewStamp = view, stamp
+	e.viewMu.Unlock()
+}
+
+// Snapshot reports whether a snapshot of a committed crawl exists for the
+// current settings, and when it was last written.
+func (e *Engine) Snapshot(context.Context) (SnapshotInfo, error) {
+	view, err := e.View()
+	if errors.Is(err, ErrNoSnapshot) {
+		return SnapshotInfo{}, nil
+	}
+	if err != nil {
+		return SnapshotInfo{}, err
+	}
+	return SnapshotInfo{Exists: true, CommittedAt: view.CommittedAt}, nil
+}
+
+// SnapshotData returns the Shoko data behind the last commit, which must not
+// be changed. It fails with ErrNoSnapshot when there is none for the current
+// settings.
+func (e *Engine) SnapshotData(context.Context) (shoko.Snapshot, error) {
+	view, err := e.View()
+	if err != nil {
+		return shoko.Snapshot{}, err
+	}
+	return view.Snapshot, nil
+}
+
+// GroupMembers returns a group's series in the order the VFS numbers its
+// seasons, and false when the last commit does not have the group.
+func (e *Engine) GroupMembers(groupID int) ([]shoko.Series, bool) {
+	view, err := e.View()
+	if err != nil {
+		return nil, false
+	}
+	memberIDs, ok := view.Snapshot.GroupSeries[groupID]
+	if !ok {
+		return nil, false
+	}
+	members := make([]shoko.Series, 0, len(memberIDs))
+	for _, id := range memberIDs {
+		if series, known := view.Snapshot.Series[id]; known {
+			members = append(members, series)
+		}
+	}
+	return members, true
+}
+
+func (e *Engine) loadSnapshot(locked *vfs.Reconciler) (*crawlState, fileStamp, error) {
+	state, stamp, err := loadStampedState(vfs.SnapshotPath(locked.Root()))
+	if errors.Is(err, errStaleState) {
+		return nil, fileStamp{}, ErrNoSnapshot
+	}
+	if err != nil {
+		return nil, fileStamp{}, err
+	}
+	if state == nil || state.Fingerprint != e.fingerprint || state.Phase != phaseReady {
+		return nil, fileStamp{}, ErrNoSnapshot
+	}
+	return state, stamp, nil
 }
 
 // Apply re-reads only what changed from Shoko, updates the snapshot of the
@@ -126,6 +188,28 @@ func (e *Engine) loadSnapshot(locked *vfs.Reconciler) (*crawlState, error) {
 // held up by a large batch. If another commit lands meanwhile, the changes
 // are read again on top of it.
 func (e *Engine) Apply(ctx context.Context, changes Changes) (Outcome, error) {
+	return e.update(ctx, func(state *crawlState) error {
+		return e.refresh(ctx, state, changes)
+	})
+}
+
+// Sweep brings the snapshot up to date without being told what changed, for
+// changes Shoko sent no event for or sent while nobody was listening. It
+// reads the file list of every mapped folder and re-reads the files that
+// differ, then re-reads every group with its series, which covers renamed
+// groups and series and seasons that were added, removed or reordered. It
+// costs a fraction of a full crawl, and like Apply only touches the links
+// that change. Changes to the episodes of a series whose files did not change
+// are left to a full crawl. It fails as Apply does.
+func (e *Engine) Sweep(ctx context.Context) (Outcome, error) {
+	return e.update(ctx, func(state *crawlState) error {
+		return e.sweep(ctx, state)
+	})
+}
+
+// update changes the snapshot with read, which reads Shoko without the VFS
+// lock held, and reconciles the VFS from it.
+func (e *Engine) update(ctx context.Context, read func(*crawlState) error) (Outcome, error) {
 	if e == nil || e.client == nil || e.reconciler == nil {
 		return Outcome{}, errors.New("reconcile: engine is not configured")
 	}
@@ -134,26 +218,26 @@ func (e *Engine) Apply(ctx context.Context, changes Changes) (Outcome, error) {
 	}
 	for attempt := 0; attempt < 3; attempt++ {
 		var state *crawlState
+		var base fileStamp
 		err := e.reconciler.WithExclusive(ctx, func(locked *vfs.Reconciler) error {
 			var err error
-			state, err = e.loadApplicable(locked)
+			state, base, err = e.takeApplicable(locked)
 			return err
 		})
 		if err != nil {
 			return Outcome{}, err
 		}
-		base := state.UpdatedAt
-		if err := e.refresh(ctx, state, changes); err != nil {
+		if err := read(state); err != nil {
 			return Outcome{}, err
 		}
 		var outcome Outcome
 		stale := false
 		err = e.reconciler.WithExclusive(ctx, func(locked *vfs.Reconciler) error {
-			current, err := e.loadApplicable(locked)
-			if err != nil {
+			if err := e.checkApplicable(locked); err != nil {
 				return err
 			}
-			if !current.UpdatedAt.Equal(base) {
+			path := vfs.SnapshotPath(locked.Root())
+			if current, ok := stampFile(path); !ok || current != base {
 				stale = true
 				return nil
 			}
@@ -161,9 +245,15 @@ func (e *Engine) Apply(ctx context.Context, changes Changes) (Outcome, error) {
 			if err != nil {
 				return err
 			}
-			if err := saveState(vfs.SnapshotPath(locked.Root()), state); err != nil {
+			if err := saveState(path, state); err != nil {
 				return err
 			}
+			if stamp, ok := stampFile(path); ok {
+				e.applyMu.Lock()
+				e.applyState, e.applyStamp = state, stamp
+				e.applyMu.Unlock()
+			}
+			e.rememberView(locked, state, plan)
 			outcome = e.progress(state)
 			outcome.Complete = true
 			outcome.Plan = plan
@@ -177,22 +267,39 @@ func (e *Engine) Apply(ctx context.Context, changes Changes) (Outcome, error) {
 	return Outcome{}, errors.New("reconcile: the snapshot kept changing while changes were applied")
 }
 
-// loadApplicable loads the snapshot that changes can be applied to.
-func (e *Engine) loadApplicable(locked *vfs.Reconciler) (*crawlState, error) {
+// checkApplicable fails when a full crawl has to commit before changes can be
+// applied.
+func (e *Engine) checkApplicable(locked *vfs.Reconciler) error {
 	if err := locked.EnsureRootLocked(); err != nil {
-		return nil, err
+		return err
 	}
 	if _, err := os.Lstat(vfs.CrawlStatePath(locked.Root())); err == nil {
-		return nil, ErrCrawlPending
+		return ErrCrawlPending
 	} else if !os.IsNotExist(err) {
-		return nil, fmt.Errorf("reconcile: inspect pending state: %w", err)
+		return fmt.Errorf("reconcile: inspect pending state: %w", err)
+	}
+	return nil
+}
+
+// takeApplicable returns the snapshot that changes can be applied to, with
+// the stamp of its file. The caller owns the snapshot and may change it: the
+// copy Apply kept from its last save is handed over rather than shared, so a
+// failed Apply leaves nothing half changed behind.
+func (e *Engine) takeApplicable(locked *vfs.Reconciler) (*crawlState, fileStamp, error) {
+	if err := e.checkApplicable(locked); err != nil {
+		return nil, fileStamp{}, err
+	}
+	e.applyMu.Lock()
+	state, stamp := e.applyState, e.applyStamp
+	e.applyState = nil
+	e.applyMu.Unlock()
+	if current, ok := stampFile(vfs.SnapshotPath(locked.Root())); state != nil && ok && current == stamp {
+		return state, stamp, nil
 	}
 	return e.loadSnapshot(locked)
 }
 
-// refresh re-reads the changed files and series, then everything they depend
-// on that the snapshot does not have or that may have moved: the groups the
-// series left and joined, and episodes a file links to that are not known yet.
+// refresh re-reads the changed files and series, then what they depend on.
 func (e *Engine) refresh(ctx context.Context, state *crawlState, changes Changes) error {
 	seriesToFetch := make(map[int]struct{})
 	for _, id := range changes.Series {
@@ -234,6 +341,108 @@ func (e *Engine) refresh(ctx context.Context, state *crawlState, changes Changes
 		}
 	}
 
+	return e.refreshGraph(ctx, state, seriesToFetch, changes.Groups)
+}
+
+// sweep is the reading half of Sweep.
+func (e *Engine) sweep(ctx context.Context, state *crawlState) error {
+	listed := make(map[int]shoko.File)
+	order := make([]int, 0, len(state.Files))
+	for _, folderID := range e.folderIDs {
+		files, err := e.client.FilesForManagedFolder(ctx, folderID)
+		if err != nil {
+			return err
+		}
+		for _, file := range files {
+			if _, seen := listed[file.ID]; !seen {
+				order = append(order, file.ID)
+			}
+			listed[file.ID] = file
+		}
+	}
+	seriesToFetch := make(map[int]struct{})
+	touch := func(file shoko.File) {
+		for id := range fileSeriesIDs(file) {
+			seriesToFetch[id] = struct{}{}
+		}
+	}
+	known := make(map[int]struct{}, len(state.Files))
+	var unlisted []int
+	for _, file := range state.Files {
+		known[file.ID] = struct{}{}
+		current, still := listed[file.ID]
+		switch {
+		case !still:
+			unlisted = append(unlisted, file.ID)
+			touch(file)
+		case !sameFile(file, current):
+			touch(file)
+			touch(current)
+		}
+	}
+	for _, id := range order {
+		if _, old := known[id]; !old {
+			touch(listed[id])
+		}
+	}
+	// A list read while Shoko imports can skip a file, as files move between
+	// its pages. So a file that is no longer listed is only dropped once Shoko
+	// confirms it is gone.
+	sort.Ints(unlisted)
+	confirmed, err := fetchAll(ctx, e.concurrency, unlisted, e.client.File)
+	if err != nil {
+		return err
+	}
+	for _, id := range unlisted {
+		if item := confirmed[id]; !item.missing && e.inMappedFolder(item.value) {
+			listed[id] = item.value
+			order = append(order, id)
+			touch(item.value)
+		}
+	}
+	state.Files = make([]shoko.File, 0, len(order))
+	for _, id := range order {
+		state.Files = append(state.Files, listed[id])
+	}
+	if err := e.refreshGraph(ctx, state, seriesToFetch, sortedSet(groupSetOf(state))); err != nil {
+		return err
+	}
+	// A series that no group lists any more has moved to a group the snapshot
+	// does not have. Reading the series names that group.
+	listedIn := make(map[int]struct{})
+	for _, members := range state.GroupSeries {
+		for _, id := range members {
+			listedIn[id] = struct{}{}
+		}
+	}
+	moved := make(map[int]struct{})
+	for _, file := range state.Files {
+		for id := range fileSeriesIDs(file) {
+			if _, grouped := listedIn[id]; !grouped {
+				moved[id] = struct{}{}
+			}
+		}
+	}
+	if len(moved) == 0 {
+		return nil
+	}
+	return e.refreshGraph(ctx, state, moved, nil)
+}
+
+// sameFile reports whether two reads of a file say the same. They are compared
+// as stored, since a file from the snapshot has been through JSON, which does
+// not tell an empty list from a missing one.
+func sameFile(a, b shoko.File) bool {
+	left, leftErr := json.Marshal(a)
+	right, rightErr := json.Marshal(b)
+	return leftErr == nil && rightErr == nil && bytes.Equal(left, right)
+}
+
+// refreshGraph re-reads the given series and groups, then everything they
+// depend on that the snapshot does not have or that may have moved: the
+// groups the series left and joined, and episodes a file links to that are
+// not known yet.
+func (e *Engine) refreshGraph(ctx context.Context, state *crawlState, seriesToFetch map[int]struct{}, groups []int) error {
 	// Episodes a file links to that the snapshot lacks are fetched one by one,
 	// and can name a series that is new to the snapshot.
 	fetchedSeries := make(map[int]bool)
@@ -243,7 +452,7 @@ func (e *Engine) refresh(ctx context.Context, state *crawlState, changes Changes
 			return err
 		}
 		if round == 0 {
-			for _, id := range positiveIDs(changes.Groups) {
+			for _, id := range positiveIDs(groups) {
 				groupsToFetch[id] = struct{}{}
 			}
 		}

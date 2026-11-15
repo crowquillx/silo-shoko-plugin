@@ -38,6 +38,12 @@ type fakeShoko struct {
 	// beforeFile runs, once, before the first single-file lookup is
 	// answered.
 	beforeFile func()
+	// unlisted files are left out of the folder's file list, as a list read
+	// during an import can do.
+	unlisted map[int]bool
+	// pageCap, if set, is the most files a page of the list holds, whatever
+	// size was asked for.
+	pageCap int
 }
 
 type fakeFile struct {
@@ -75,9 +81,17 @@ func (f *fakeShoko) handler(w http.ResponseWriter, r *http.Request) {
 	case path == "/ManagedFolder/1/File":
 		list := make([]any, 0)
 		for _, fileID := range sortedKeys(f.files) {
-			list = append(list, f.fileJSON(fileID))
+			if !f.unlisted[fileID] {
+				list = append(list, f.fileJSON(fileID))
+			}
 		}
-		write(map[string]any{"total": len(list), "list": list})
+		total := len(list)
+		if f.pageCap > 0 {
+			page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+			start := min(max(page-1, 0)*f.pageCap, total)
+			list = list[start:min(start+f.pageCap, total)]
+		}
+		write(map[string]any{"total": total, "list": list})
 	case parts[0] == "File" && len(parts) == 2:
 		if _, ok := f.files[id]; !ok {
 			http.NotFound(w, r)

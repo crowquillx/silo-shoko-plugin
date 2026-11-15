@@ -600,7 +600,7 @@ func (s *metadataServer) GetSeasons(ctx context.Context, req *pluginv1.GetSeason
 		if err != nil {
 			return nil, err
 		}
-		members, err := client.GroupSeries(ctx, token.GroupID)
+		members, err := s.runtime.seasonMembers(ctx, client, token.GroupID)
 		if err != nil {
 			return nil, err
 		}
@@ -669,7 +669,7 @@ func (s *metadataServer) GetEpisodes(ctx context.Context, req *pluginv1.GetEpiso
 	providerIDs := stringMap(req.GetProviderIds())
 	token := requestToken(providerIDs, req.GetSeriesProviderId())
 	if token.GroupID > 0 {
-		members, err := client.GroupSeries(ctx, token.GroupID)
+		members, err := s.runtime.seasonMembers(ctx, client, token.GroupID)
 		if err != nil {
 			return nil, err
 		}
@@ -734,7 +734,7 @@ func (s *metadataServer) GetImages(ctx context.Context, req *pluginv1.GetImagesR
 	// number, and keeps only images that carry the number back. The pointer is
 	// checked, not the value, because season zero is the specials season.
 	if req.SeasonNumber != nil {
-		return seasonImages(ctx, client, groupID, seriesID, int(req.GetSeasonNumber()))
+		return s.runtime.seasonImages(ctx, client, groupID, seriesID, int(req.GetSeasonNumber()))
 	}
 	// Grouped seasons carry both the parent group and their member series ID.
 	// The member series owns the season artwork, so it must win whenever both
@@ -770,7 +770,7 @@ func (s *metadataServer) GetImages(ctx context.Context, req *pluginv1.GetImagesR
 // does not have gets no images, so Silo never files another season's artwork
 // under it. The group wins when both IDs are present: the request is about the
 // show, and only the group knows which series is which season.
-func seasonImages(ctx context.Context, client *shoko.Client, groupID, seriesID, season int) (*pluginv1.GetImagesResponse, error) {
+func (s *runtimeServer) seasonImages(ctx context.Context, client *shoko.Client, groupID, seriesID, season int) (*pluginv1.GetImagesResponse, error) {
 	switch {
 	case groupID > 0 && season == 0:
 		group, err := client.Group(ctx, groupID)
@@ -779,7 +779,7 @@ func seasonImages(ctx context.Context, client *shoko.Client, groupID, seriesID, 
 		}
 		return seasonImageRecords(group.Images, season), nil
 	case groupID > 0:
-		members, err := client.GroupSeries(ctx, groupID)
+		members, err := s.seasonMembers(ctx, client, groupID)
 		if err != nil {
 			return nil, err
 		}
@@ -1476,10 +1476,57 @@ func yearFromMembers(ctx context.Context, client *shoko.Client, group shoko.Grou
 	return 0, nil
 }
 
+// seasonMembers returns a group's series in the order that numbers its
+// seasons. That is the order the VFS was last built with, since the season
+// numbers Silo asks about come from the link names: Shoko's current order can
+// be ahead of the VFS for a moment after a series joins or leaves the group,
+// and would file metadata under the wrong season. Each series' data is still
+// Shoko's current data. A group the VFS does not have yet is in Shoko's order.
+func (s *runtimeServer) seasonMembers(ctx context.Context, client *shoko.Client, groupID int) ([]shoko.Series, error) {
+	members, err := client.GroupSeries(ctx, groupID)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.RLock()
+	engine, current := s.engine, s.client == client
+	s.mu.RUnlock()
+	if engine == nil || !current {
+		return members, nil
+	}
+	built, ok := engine.GroupMembers(groupID)
+	if !ok {
+		return members, nil
+	}
+	return inBuiltOrder(members, built), nil
+}
+
+// inBuiltOrder returns the series of built, in that order, each with its data
+// from current when it is still there. A series only in current has no links
+// in the VFS yet, so it has no season to describe.
+func inBuiltOrder(current, built []shoko.Series) []shoko.Series {
+	byID := make(map[int]shoko.Series, len(current))
+	for _, series := range current {
+		byID[series.IDs.ID] = series
+	}
+	ordered := make([]shoko.Series, 0, len(built))
+	for _, series := range built {
+		if fresh, ok := byID[series.IDs.ID]; ok {
+			series = fresh
+		}
+		ordered = append(ordered, series)
+	}
+	return ordered
+}
+
 func groupEpisodes(ctx context.Context, list func(context.Context, int) ([]shoko.Episode, error), members []shoko.Series) (map[int][]shoko.Episode, error) {
 	episodesBySeries := make(map[int][]shoko.Episode, len(members))
 	for _, series := range members {
 		episodes, err := list(ctx, series.IDs.ID)
+		if shoko.IsNotFound(err) {
+			// A series Shoko just removed still holds its season in the VFS
+			// until the removal is applied; it has no episodes to describe.
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}

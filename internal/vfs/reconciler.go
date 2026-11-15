@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/crowquillx/silo-shoko-plugin/internal/topology"
@@ -29,6 +30,14 @@ var (
 	ErrNotOwned     = errors.New("vfs: path is not owned by this manifest")
 	ErrPathConflict = errors.New("vfs: logical path conflicts with an existing entry")
 )
+
+// ReasonMoved is the reason on both actions of a link whose path changed: the
+// removal of the old path and the update that writes the new one.
+const ReasonMoved = "logical path changed in Shoko snapshot"
+
+// staleKeyPrefix starts the manifest key of a link that should be gone but
+// could not be removed, so a later reconcile tries again.
+const staleKeyPrefix = "stale:"
 
 type Config struct {
 	Root               string
@@ -76,6 +85,11 @@ type Reconciler struct {
 	journalPath  string
 	statePath    string
 	lockPath     string
+
+	// journal is the change journal as last read or written, for the file
+	// with journalStamp. Both are only used while holding WithExclusive.
+	journal      journalState
+	journalStamp journalStamp
 }
 
 func NewReconciler(cfg Config) (*Reconciler, error) {
@@ -189,7 +203,7 @@ func (r *Reconciler) ReconcileLockedWith(ctx context.Context, plan topology.Plan
 		}
 		reason := "no longer present in Shoko snapshot"
 		if keep {
-			reason = "logical path changed in Shoko snapshot"
+			reason = ReasonMoved
 		}
 		result.Actions = append(result.Actions, Action{
 			Kind:        "remove",
@@ -204,11 +218,14 @@ func (r *Reconciler) ReconcileLockedWith(ctx context.Context, plan topology.Plan
 			result.Actions = append(result.Actions, Action{Kind: "unchanged", LogicalPath: item.LogicalPath, TargetPath: item.TargetPath})
 			continue
 		}
-		action := "create"
+		action, reason := "create", ""
 		if existed {
 			action = "update"
+			if old.LogicalPath != item.LogicalPath {
+				reason = ReasonMoved
+			}
 		}
-		result.Actions = append(result.Actions, Action{Kind: action, LogicalPath: item.LogicalPath, TargetPath: item.TargetPath})
+		result.Actions = append(result.Actions, Action{Kind: action, LogicalPath: item.LogicalPath, TargetPath: item.TargetPath, Reason: reason})
 	}
 	sort.Slice(result.Actions, func(i, j int) bool {
 		if result.Actions[i].LogicalPath == result.Actions[j].LogicalPath {
@@ -229,18 +246,27 @@ func (r *Reconciler) ReconcileLockedWith(ctx context.Context, plan topology.Plan
 		failed[item.LogicalPath] = err.Error()
 		result.Failures = append(result.Failures, Failure{LogicalPath: item.LogicalPath, TargetPath: item.TargetPath, Reason: err.Error()})
 	}
+	emptied := make(map[string]struct{})
 	for key, old := range previous.Entries {
 		item, keep := desired[key]
 		if keep && item.LogicalPath == old.LogicalPath {
 			continue
 		}
+		if linkPath, err := r.logicalPath(old.LogicalPath); err == nil {
+			emptied[filepath.Dir(linkPath)] = struct{}{}
+		}
 		if err := r.removeOwned(old); err != nil {
 			fail(old, err)
 			if !keep {
 				entries[key] = old
+			} else {
+				// The key goes on to record the link's new path, so the old
+				// one is kept under a key of its own.
+				entries[staleKeyPrefix+old.LogicalPath] = old
 			}
 		}
 	}
+	dirs := make(verifiedDirs)
 	written := 0
 	for key, item := range desired {
 		old, existed := previous.Entries[key]
@@ -250,7 +276,7 @@ func (r *Reconciler) ReconcileLockedWith(ctx context.Context, plan topology.Plan
 			written++
 			continue
 		}
-		if err := r.writeLink(item, previousItem(old, sameLogicalPath)); err != nil {
+		if err := r.writeLink(item, previousItem(old, sameLogicalPath), dirs); err != nil {
 			fail(item, err)
 			if sameLogicalPath {
 				entries[key] = old
@@ -259,6 +285,9 @@ func (r *Reconciler) ReconcileLockedWith(ctx context.Context, plan topology.Plan
 		}
 		entries[key] = item
 		written++
+	}
+	if !options.TrustUnchanged {
+		r.pruneEmptyFolders(emptied)
 	}
 	manifest := Manifest{Version: manifestVersion, UpdatedAt: time.Now().UTC(), Entries: entries}
 	if err := r.writeManifest(manifest); err != nil {
@@ -511,13 +540,34 @@ func previousItem(item ManifestItem, owned bool) *ManifestItem {
 	return &item
 }
 
-func (r *Reconciler) writeLink(item ManifestItem, previous *ManifestItem) error {
+// verifiedDirs remembers the folders one reconcile has already created and
+// checked, so the links of a season do not each check the same folders again.
+type verifiedDirs map[string]struct{}
+
+func (r *Reconciler) writeLink(item ManifestItem, previous *ManifestItem, dirs verifiedDirs) error {
 	linkPath, err := r.logicalPath(item.LogicalPath)
 	if err != nil {
 		return err
 	}
-	if err := ensureParents(r.config.Root, filepath.Dir(linkPath)); err != nil {
-		return err
+	parent := filepath.Dir(linkPath)
+	if _, verified := dirs[parent]; !verified {
+		if err := ensureParents(r.config.Root, parent); err != nil {
+			return err
+		}
+		if dirs != nil {
+			dirs[parent] = struct{}{}
+		}
+	}
+	relativeTarget, err := filepath.Rel(parent, item.TargetPath)
+	if err != nil {
+		return fmt.Errorf("vfs: calculate link target: %w", err)
+	}
+	// A new link, the common case, needs no temporary name: creating a symlink
+	// is atomic and fails if anything is already there.
+	if err := os.Symlink(relativeTarget, linkPath); err == nil {
+		return nil
+	} else if !os.IsExist(err) {
+		return fmt.Errorf("vfs: create link %q: %w", item.LogicalPath, err)
 	}
 	if info, err := os.Lstat(linkPath); err == nil {
 		if info.Mode()&fs.ModeSymlink == 0 {
@@ -551,10 +601,6 @@ func (r *Reconciler) writeLink(item ManifestItem, previous *ManifestItem) error 
 	if err := os.Remove(tmp); err != nil {
 		return fmt.Errorf("vfs: prepare temporary link: %w", err)
 	}
-	relativeTarget, err := filepath.Rel(filepath.Dir(linkPath), item.TargetPath)
-	if err != nil {
-		return fmt.Errorf("vfs: calculate link target: %w", err)
-	}
 	if err := os.Symlink(relativeTarget, tmp); err != nil {
 		return fmt.Errorf("vfs: create temporary link: %w", err)
 	}
@@ -584,6 +630,41 @@ func (r *Reconciler) removeOwned(item ManifestItem) error {
 		return fmt.Errorf("vfs: remove obsolete link %q: %w", item.LogicalPath, err)
 	}
 	return nil
+}
+
+// pruneDepth is how deep folders are made in the VFS: show, season, and a
+// theme-music folder in either.
+const pruneDepth = 3
+
+// pruneEmptyFolders removes the show, season and theme folders that no longer
+// hold anything, such as those a renamed group leaves behind. Only a full
+// reconcile does this, and it leaves the folders in keep, which this reconcile
+// removed links from: Silo scans the folder of each removed link, and that
+// folder should still be there then. A later full reconcile removes them.
+func (r *Reconciler) pruneEmptyFolders(keep map[string]struct{}) {
+	pruneEmptyBelow(r.config.Root, pruneDepth, keep)
+}
+
+func pruneEmptyBelow(dir string, depth int, keep map[string]struct{}) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		// entry.IsDir is false for a symlink, so no link is ever followed.
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		child := filepath.Join(dir, entry.Name())
+		if _, kept := keep[child]; kept {
+			continue
+		}
+		if depth > 1 {
+			pruneEmptyBelow(child, depth-1, keep)
+		}
+		// Removing a folder that still holds something fails, which is the check.
+		_ = syscall.Rmdir(child)
+	}
 }
 
 func (r *Reconciler) ensureRoot(create bool) error {
@@ -653,6 +734,13 @@ func (r *Reconciler) writeManifest(manifest Manifest) error {
 		_ = tmpFile.Close()
 		_ = os.Remove(tmp)
 		return fmt.Errorf("vfs: write manifest: %w", err)
+	}
+	// Without this a crash soon after the rename can leave an empty manifest,
+	// which no later reconcile can read.
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("vfs: sync manifest: %w", err)
 	}
 	if err := tmpFile.Close(); err != nil {
 		_ = os.Remove(tmp)

@@ -310,7 +310,9 @@ func (c *Client) FilesForManagedFolder(ctx context.Context, folderID int) ([]Fil
 			return nil, err
 		}
 		files = append(files, pageFiles...)
-		if len(pageFiles) == 0 || (total > 0 && len(files) >= total) || len(pageFiles) < pageSize {
+		// A short page only ends the list when Shoko gave no total, since a
+		// server may cap pages below the size asked for.
+		if len(pageFiles) == 0 || (total > 0 && len(files) >= total) || (total <= 0 && len(pageFiles) < pageSize) {
 			return files, nil
 		}
 	}

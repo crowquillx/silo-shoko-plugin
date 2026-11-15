@@ -18,6 +18,7 @@ import (
 	"github.com/crowquillx/silo-shoko-plugin/internal/reconcile"
 	"github.com/crowquillx/silo-shoko-plugin/internal/shoko"
 	"github.com/crowquillx/silo-shoko-plugin/internal/silocatalog"
+	"github.com/crowquillx/silo-shoko-plugin/internal/topology"
 	"github.com/crowquillx/silo-shoko-plugin/internal/vfs"
 )
 
@@ -289,5 +290,77 @@ func TestChangedGroups(t *testing.T) {
 	after := map[int]string{1: "a", 2: "x", 4: "d"}
 	if got := changedGroups(before, after); !reflect.DeepEqual(got, []int{2, 3, 4}) {
 		t.Fatalf("changedGroups = %v", got)
+	}
+}
+
+func TestMovedSeriesNamesOnlySeriesWhoseLinksMoved(t *testing.T) {
+	outcome := reconcile.Outcome{
+		Plan: topology.Plan{Entries: []topology.Entry{
+			{LogicalPath: "Show/Season 02/a.mkv", ShokoSeriesID: 7},
+			{LogicalPath: "Show/Season 02/b.mkv", ShokoSeriesID: 7},
+			{LogicalPath: "Show/Season 01/c.mkv", ShokoSeriesID: 6},
+			{LogicalPath: "Other/Season 01/d.mkv", ShokoSeriesID: 5},
+		}},
+		Result: vfs.Result{Actions: []vfs.Action{
+			{Kind: "remove", LogicalPath: "Show/Season 01/a.mkv", Reason: vfs.ReasonMoved},
+			{Kind: "update", LogicalPath: "Show/Season 02/a.mkv", Reason: vfs.ReasonMoved},
+			{Kind: "update", LogicalPath: "Show/Season 02/b.mkv", Reason: vfs.ReasonMoved},
+			// A new file and a file whose target changed move nothing.
+			{Kind: "create", LogicalPath: "Show/Season 01/c.mkv"},
+			{Kind: "update", LogicalPath: "Other/Season 01/d.mkv"},
+		}},
+	}
+	if got := movedSeries(outcome); !reflect.DeepEqual(got, []int{7}) {
+		t.Fatalf("movedSeries = %v, want [7]", got)
+	}
+}
+
+// Changes that cannot be applied come back to be tried again, and after
+// enough failures a full crawl takes over.
+func TestLiveUpdatesRetryChangesThatCouldNotBeApplied(t *testing.T) {
+	fixture := newLiveFixture(t)
+	ctx := context.Background()
+	if _, err := fixture.updates.engine.Step(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	// An unreadable snapshot fails every apply.
+	if err := os.WriteFile(vfs.SnapshotPath(fixture.root), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	batch := live.Batch{VFS: reconcile.Changes{Files: []int{9}}}
+	for attempt := 1; attempt < maxApplyFailures; attempt++ {
+		retry := fixture.updates.Apply(ctx, batch)
+		if !reflect.DeepEqual(retry, batch) {
+			t.Fatalf("failed apply %d returned %#v to retry, want the batch", attempt, retry)
+		}
+		if fixture.runtime.backgroundCrawlRunning() {
+			t.Fatalf("failed apply %d started a crawl", attempt)
+		}
+	}
+	if retry := fixture.updates.Apply(ctx, batch); !retry.Empty() {
+		t.Fatalf("the last failed apply still returned %#v to retry", retry)
+	}
+	fixture.waitForCrawl(t)
+	if err := fixture.runtime.takeBackgroundCrawlError(); err != nil {
+		t.Fatal(err)
+	}
+	// The crawl left a good snapshot, so the next batch applies.
+	if retry := fixture.updates.Apply(ctx, batch); !retry.Empty() {
+		t.Fatalf("apply after the crawl returned %#v to retry", retry)
+	}
+}
+
+func TestInBuiltOrderKeepsTheSeasonsTheVFSHas(t *testing.T) {
+	series := func(id int, name string) shoko.Series {
+		return shoko.Series{IDs: shoko.IDs{ID: id}, Name: name}
+	}
+	// Shoko already lists a new first season and no longer has series 8; the
+	// VFS was built with 7 then 8.
+	current := []shoko.Series{series(6, "new"), series(7, "seven now")}
+	built := []shoko.Series{series(7, "seven then"), series(8, "eight then")}
+	got := inBuiltOrder(current, built)
+	want := []shoko.Series{series(7, "seven now"), series(8, "eight then")}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("inBuiltOrder = %#v, want %#v", got, want)
 	}
 }

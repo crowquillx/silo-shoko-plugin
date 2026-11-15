@@ -26,6 +26,13 @@ import (
 var liveUpdatesEnabled = true
 
 const (
+	// maxApplyFailures is how many times in a row a batch of VFS changes may
+	// fail to apply before a full crawl takes over from retrying it.
+	maxApplyFailures = 6
+	// sweepInterval is how often the VFS is checked against Shoko's file list
+	// and groups, for changes Shoko sent no event for. Stable servers send
+	// none when a series moves between groups or a group is renamed.
+	sweepInterval = time.Hour
 	// catchUpAfter is how old the last commit may be when the plugin starts
 	// listening before a full crawl catches up on changes it did not hear.
 	catchUpAfter = 10 * time.Minute
@@ -64,6 +71,12 @@ type liveUpdates struct {
 	// identifies the show for a marker queued for a refresh.
 	shows   map[string]string
 	folders map[string]showFolder
+	// described caches describeShows for the view it was made from.
+	described     vfsShows
+	describedView *reconcile.View
+	// applyFailures counts the VFS batches in a row that failed to apply. Only
+	// the watcher's dispatch reads and writes it.
+	applyFailures int
 }
 
 // showFolder is how a show is found in Silo: the VFS folder Silo has for it,
@@ -123,6 +136,7 @@ func (s *runtimeServer) startLiveUpdates(state configuredState) (*liveUpdates, c
 			go updates.queue.Run(ctx)
 			go updates.watchShowPosters(ctx)
 		}
+		go updates.sweepRegularly(ctx)
 		go updates.writeStatusFiles(ctx)
 		watcher.Run(ctx)
 	}()
@@ -130,8 +144,9 @@ func (s *runtimeServer) startLiveUpdates(state configuredState) (*liveUpdates, c
 }
 
 // Connected catches up on changes made while the plugin was not listening,
-// which Shoko does not replay, by starting a full crawl. A commit made just
-// before the plugin started listening is recent enough to skip that.
+// which Shoko does not replay: with a sweep after a dropped connection, and a
+// full crawl for a process that has just started. A commit made just before
+// the plugin started listening is recent enough to skip that.
 func (l *liveUpdates) Connected(ctx context.Context, reconnect bool) {
 	l.status.update(func(s *liveStatus) {
 		s.connected = true
@@ -155,13 +170,76 @@ func (l *liveUpdates) Connected(ctx context.Context, reconnect bool) {
 	if l.runtime.backgroundCrawlRunning() {
 		return
 	}
+	// A dropped connection is usually short, and a sweep finds what changed
+	// meanwhile for a fraction of a crawl's cost. A process that has just
+	// started may have missed far more, so it crawls.
+	if reconnect && info.Exists && l.sweep(ctx) {
+		return
+	}
+	if ctx.Err() != nil || l.runtime.backgroundCrawlRunning() {
+		return
+	}
 	logf("shokoanime: crawling Shoko to catch up on changes made while not listening")
 	l.runtime.startBackgroundCrawl(l.engine)
 }
 
+// sweep checks the VFS against Shoko's file list and groups, and reports
+// whether it could. It may run alongside Apply: whichever commits second
+// reads Shoko again on top of the first.
+func (l *liveUpdates) sweep(ctx context.Context) bool {
+	if !l.waitForCrawl(ctx) {
+		return false
+	}
+	started := time.Now()
+	outcome, err := l.engine.Sweep(ctx)
+	l.status.update(func(s *liveStatus) {
+		s.lastSweepAt, s.lastSweepTook = time.Now(), time.Since(started)
+		s.lastSweepLinks = changedLinks(outcome.Result)
+		s.lastSweepError = ""
+		if err != nil {
+			s.lastSweepError = err.Error()
+		} else {
+			s.sweeps++
+		}
+	})
+	if err != nil {
+		// Without a snapshot, or with a crawl pending, a crawl does the work.
+		if ctx.Err() == nil && !errors.Is(err, reconcile.ErrNoSnapshot) && !errors.Is(err, reconcile.ErrCrawlPending) {
+			logf("shokoanime: could not check the VFS against Shoko: %v", err)
+		}
+		return false
+	}
+	logReconcileFailures(outcome.Result)
+	if count := changedLinks(outcome.Result); count > 0 {
+		logf("shokoanime: checked the VFS against Shoko: %d links changed", count)
+	}
+	if moved := movedSeries(outcome); l.queue != nil && len(moved) > 0 {
+		l.refreshChanged(ctx, live.Refresh{Series: moved})
+	}
+	return true
+}
+
+// sweepRegularly sweeps every sweepInterval while the VFS exists.
+func (l *liveUpdates) sweepRegularly(ctx context.Context) {
+	ticker := time.NewTicker(sweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if !l.runtime.backgroundCrawlRunning() {
+			l.sweep(ctx)
+		}
+	}
+}
+
 // Apply updates the VFS for a batch of changes, then asks Silo to refresh the
-// shows whose metadata or artwork changed.
-func (l *liveUpdates) Apply(ctx context.Context, batch live.Batch) {
+// shows whose metadata or artwork changed. It returns the VFS changes that
+// could not be applied, to be tried again.
+func (l *liveUpdates) Apply(ctx context.Context, batch live.Batch) live.Batch {
+	var retry live.Batch
 	l.status.update(func(s *liveStatus) {
 		s.batches++
 		s.lastBatchAt = time.Now()
@@ -174,19 +252,40 @@ func (l *liveUpdates) Apply(ctx context.Context, batch live.Batch) {
 			l.runtime.startBackgroundCrawl(l.engine)
 		}
 	case !batch.VFS.Empty():
-		l.applyVFS(ctx, batch.VFS)
+		moved, applied := l.applyVFS(ctx, batch.VFS)
+		switch {
+		case applied:
+			l.applyFailures = 0
+			// Silo matched these files under their old season and episode
+			// numbers, so it has to read the show again.
+			batch.Refresh.Series = append(slices.Clone(batch.Refresh.Series), moved...)
+		case ctx.Err() != nil:
+		case l.applyFailures+1 >= maxApplyFailures:
+			l.applyFailures = 0
+			if l.vfsBuilt(ctx) {
+				logf("shokoanime: crawling Shoko, since its changes still could not be applied")
+				l.runtime.startBackgroundCrawl(l.engine)
+			}
+		default:
+			l.applyFailures++
+			retry.VFS = batch.VFS
+		}
 	}
 	if l.queue != nil && !batch.Refresh.Empty() {
 		l.refreshChanged(ctx, batch.Refresh)
 	}
+	return retry
 }
 
-func (l *liveUpdates) applyVFS(ctx context.Context, changes reconcile.Changes) {
+// applyVFS applies changes to the VFS. It returns the series whose links
+// moved to another path, and whether the changes are dealt with: applied, or
+// covered by a full crawl.
+func (l *liveUpdates) applyVFS(ctx context.Context, changes reconcile.Changes) (moved []int, done bool) {
 	for attempt := 0; attempt < 3; attempt++ {
 		// A crawl may have read Shoko before these changes, so they are
 		// applied after it commits.
 		if !l.waitForCrawl(ctx) {
-			return
+			return nil, false
 		}
 		started := time.Now()
 		outcome, err := l.engine.Apply(ctx, changes)
@@ -205,24 +304,53 @@ func (l *liveUpdates) applyVFS(ctx context.Context, changes reconcile.Changes) {
 			if count := changedLinks(outcome.Result); count > 0 {
 				logf("shokoanime: applied Shoko changes (%d files, %d series, %d groups): %d links changed", len(changes.Files), len(changes.Series), len(changes.Groups), count)
 			}
-			return
+			return movedSeries(outcome), true
 		case errors.Is(err, reconcile.ErrCrawlPending):
 			l.runtime.startBackgroundCrawl(l.engine)
 		case errors.Is(err, reconcile.ErrNoSnapshot):
 			// Built by a version without snapshots, or settings changed: a
-			// full crawl covers these changes and leaves a snapshot.
-			if l.vfsBuilt(ctx) && !l.runtime.backgroundCrawlRunning() {
+			// full crawl leaves a snapshot.
+			if !l.vfsBuilt(ctx) {
+				// The reconcile task builds the VFS first, from current data.
+				return nil, true
+			}
+			if !l.runtime.backgroundCrawlRunning() {
+				// This crawl starts after the changes, so it covers them.
 				logf("shokoanime: crawling Shoko once to apply its changes, since there is no snapshot to update yet")
 				l.runtime.startBackgroundCrawl(l.engine)
+				return nil, true
 			}
-			return
+			// A crawl that is already running may have read Shoko before the
+			// changes: apply them to the snapshot it leaves.
 		default:
 			if ctx.Err() == nil {
-				logf("shokoanime: could not apply Shoko changes, the next reconcile will: %v", err)
+				logf("shokoanime: could not apply Shoko changes, trying again shortly: %v", err)
 			}
-			return
+			return nil, false
 		}
 	}
+	return nil, false
+}
+
+// movedSeries returns the series that have a link an apply moved to another
+// path, as a renumbered season or a renamed show does.
+func movedSeries(outcome reconcile.Outcome) []int {
+	paths := make(map[string]struct{})
+	for _, action := range outcome.Result.Actions {
+		if action.Kind == "update" && action.Reason == vfs.ReasonMoved {
+			paths[action.LogicalPath] = struct{}{}
+		}
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+	series := make(map[int]struct{})
+	for _, entry := range outcome.Plan.Entries {
+		if _, moved := paths[entry.LogicalPath]; moved {
+			series[entry.ShokoSeriesID] = struct{}{}
+		}
+	}
+	return slices.Sorted(maps.Keys(series))
 }
 
 // changedLinks counts the links a reconcile created, replaced or removed.
@@ -305,15 +433,16 @@ type vfsShows struct {
 }
 
 func (l *liveUpdates) describeShows(ctx context.Context) (vfsShows, error) {
-	snapshot, err := l.engine.SnapshotData(ctx)
+	view, err := l.engine.View()
 	if err != nil {
 		return vfsShows{}, err
 	}
-	plan, err := l.engine.Plan(snapshot)
-	if err != nil {
-		return vfsShows{}, err
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.describedView != view {
+		l.described, l.describedView = describeShows(l.reconciler.Root(), view.Snapshot, view.Plan), view
 	}
-	return describeShows(l.reconciler.Root(), snapshot, plan), nil
+	return l.described, nil
 }
 
 func describeShows(root string, snapshot shoko.Snapshot, plan topology.Plan) vfsShows {

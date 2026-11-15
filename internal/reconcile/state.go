@@ -42,28 +42,60 @@ type crawlState struct {
 	FolderIndex    int                         `json:"folder_index"`
 	ManagedFolders map[int]shoko.ManagedFolder `json:"managed_folders"`
 	NextFilePage   map[int]int                 `json:"next_file_page"`
-	Files          []shoko.File                `json:"files"`
-	SeriesIDs      []int                       `json:"series_ids"`
-	SeriesDone     map[int]bool                `json:"series_done"`
-	Series         map[int]shoko.Series        `json:"series"`
-	GroupIDs       []int                       `json:"group_ids"`
-	GroupDone      map[int]bool                `json:"group_done"`
-	Groups         map[int]shoko.Group         `json:"groups"`
-	GroupSeries    map[int][]int               `json:"group_series"`
-	EpisodeIDs     []int                       `json:"episode_ids"`
-	EpisodeDone    map[int]bool                `json:"episode_done"`
-	Episodes       map[int]shoko.Episode       `json:"episodes"`
-	UpdatedAt      time.Time                   `json:"updated_at"`
+	// FolderFiles counts the files read from each folder so far.
+	FolderFiles map[int]int           `json:"folder_files,omitempty"`
+	Files       []shoko.File          `json:"files"`
+	SeriesIDs   []int                 `json:"series_ids"`
+	SeriesDone  map[int]bool          `json:"series_done"`
+	Series      map[int]shoko.Series  `json:"series"`
+	GroupIDs    []int                 `json:"group_ids"`
+	GroupDone   map[int]bool          `json:"group_done"`
+	Groups      map[int]shoko.Group   `json:"groups"`
+	GroupSeries map[int][]int         `json:"group_series"`
+	EpisodeIDs  []int                 `json:"episode_ids"`
+	EpisodeDone map[int]bool          `json:"episode_done"`
+	Episodes    map[int]shoko.Episode `json:"episodes"`
+	UpdatedAt   time.Time             `json:"updated_at"`
+}
+
+// fileStamp identifies one written version of a state file.
+type fileStamp struct {
+	modified int64
+	size     int64
+}
+
+func stampOf(info os.FileInfo) fileStamp {
+	return fileStamp{modified: info.ModTime().UnixNano(), size: info.Size()}
+}
+
+// stampFile returns the stamp of the file at path, and false if there is none.
+func stampFile(path string) (fileStamp, bool) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fileStamp{}, false
+	}
+	return stampOf(info), true
 }
 
 func loadState(path string) (*crawlState, error) {
+	state, _, err := loadStampedState(path)
+	return state, err
+}
+
+// loadStampedState is loadState with the file's stamp from before it was read.
+func loadStampedState(path string) (*crawlState, fileStamp, error) {
 	info, err := os.Lstat(path)
 	if os.IsNotExist(err) {
-		return nil, nil
+		return nil, fileStamp{}, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("reconcile: inspect crawl state: %w", err)
+		return nil, fileStamp{}, fmt.Errorf("reconcile: inspect crawl state: %w", err)
 	}
+	state, err := readState(path, info)
+	return state, stampOf(info), err
+}
+
+func readState(path string, info os.FileInfo) (*crawlState, error) {
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return nil, errors.New("reconcile: crawl state is not a regular file")
 	}

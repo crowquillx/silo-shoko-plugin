@@ -100,6 +100,7 @@ func Build(snapshot shoko.Snapshot, policy Policy) (Plan, error) {
 	plan := Plan{Entries: make([]Entry, 0)}
 	seenKeys := make(map[string]struct{})
 	groupLayouts := newSnapshotGroupLayouts(snapshot)
+	seriesGroups := newSeriesGroups(snapshot)
 	// A variation is another version of an episode, so it is left out where
 	// another file already gives that episode a link. But Shoko users also
 	// mark the parts of an episode split across files as variations, to clear
@@ -115,7 +116,7 @@ func Build(snapshot shoko.Snapshot, policy Policy) (Plan, error) {
 			if file.IsVariation != variations {
 				continue
 			}
-			plan.addFile(snapshot, policy, file, covered, seenKeys, groupLayouts)
+			plan.addFile(snapshot, policy, file, covered, seenKeys, groupLayouts, seriesGroups)
 		}
 	}
 	sort.Slice(plan.Entries, func(i, j int) bool {
@@ -131,7 +132,7 @@ func Build(snapshot shoko.Snapshot, policy Policy) (Plan, error) {
 // addFile adds an entry for each episode the file is linked to. Unless the
 // policy includes variations, a variation is skipped for the episodes in
 // covered: those a file that is not a variation already has a link for.
-func (plan *Plan) addFile(snapshot shoko.Snapshot, policy Policy, file shoko.File, covered map[int]struct{}, seenKeys map[string]struct{}, groupLayouts map[int]GroupLayout) {
+func (plan *Plan) addFile(snapshot shoko.Snapshot, policy Policy, file shoko.File, covered map[int]struct{}, seenKeys map[string]struct{}, groupLayouts map[int]GroupLayout, seriesGroups map[int]int) {
 	skipCovered := file.IsVariation && !policy.IncludeVariations
 	location, ok, diagnostic := chooseLocation(file, policy.ManagedFolderMap)
 	if !ok {
@@ -180,7 +181,8 @@ func (plan *Plan) addFile(snapshot shoko.Snapshot, policy Policy, file shoko.Fil
 				})
 				continue
 			}
-			group, groupID, _ := groupForSeries(snapshot, seriesID)
+			groupID := seriesGroups[seriesID]
+			group := snapshot.Groups[groupID]
 			entry := makeEntry(sourceRoot, relative, file, series, seriesID, episode, episodeID, group, groupID, groupLayouts[groupID], snapshot)
 			if _, seen := seenKeys[entry.StableKey]; seen {
 				continue
@@ -194,24 +196,27 @@ func (plan *Plan) addFile(snapshot shoko.Snapshot, policy Policy, file shoko.Fil
 	}
 }
 
-func groupForSeries(snapshot shoko.Snapshot, seriesID int) (shoko.Group, int, bool) {
-	groupIDs := make([]int, 0)
-	for groupID, seriesIDs := range snapshot.GroupSeries {
-		for _, memberID := range seriesIDs {
-			if memberID == seriesID {
-				groupIDs = append(groupIDs, groupID)
-				break
+// newSeriesGroups maps each series to the group it is a season of: the group
+// the series itself names as its parent, when that group lists it, and
+// otherwise the lowest-numbered known group that lists it. A series can be in
+// two lists while a move between groups is only half read.
+func newSeriesGroups(snapshot shoko.Snapshot) map[int]int {
+	groups := make(map[int]int, len(snapshot.Series))
+	for groupID, memberIDs := range snapshot.GroupSeries {
+		if _, known := snapshot.Groups[groupID]; !known {
+			continue
+		}
+		for _, seriesID := range memberIDs {
+			current, taken := groups[seriesID]
+			if taken && current == snapshot.Series[seriesID].IDs.ParentGroup {
+				continue
+			}
+			if !taken || groupID < current || groupID == snapshot.Series[seriesID].IDs.ParentGroup {
+				groups[seriesID] = groupID
 			}
 		}
 	}
-	sort.Ints(groupIDs)
-	for _, groupID := range groupIDs {
-		group, ok := snapshot.Groups[groupID]
-		if ok {
-			return group, groupID, true
-		}
-	}
-	return shoko.Group{}, 0, false
+	return groups
 }
 
 func completeAirDate(series shoko.Series) (time.Time, bool) {

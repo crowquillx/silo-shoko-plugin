@@ -39,6 +39,13 @@ type liveStatus struct {
 	lastApplyLinks int
 	lastApplyError string
 
+	// A sweep checks the VFS against Shoko's file list and groups.
+	sweeps         int
+	lastSweepAt    time.Time
+	lastSweepTook  time.Duration
+	lastSweepLinks int
+	lastSweepError string
+
 	refreshes        int
 	lastRefreshAt    time.Time
 	lastRefreshShow  string
@@ -95,6 +102,11 @@ func (s *liveStatus) report(pending int) map[string]any {
 		"last_apply_seconds": s.lastApplyTook.Seconds(),
 		"last_apply_links":   s.lastApplyLinks,
 		"last_apply_error":   s.lastApplyError,
+		"sweeps":             s.sweeps,
+		"last_sweep_at":      at(s.lastSweepAt),
+		"last_sweep_seconds": s.lastSweepTook.Seconds(),
+		"last_sweep_links":   s.lastSweepLinks,
+		"last_sweep_error":   s.lastSweepError,
 		"refreshes":          s.refreshes,
 		"refreshes_pending":  pending,
 		"last_refresh_at":    at(s.lastRefreshAt),

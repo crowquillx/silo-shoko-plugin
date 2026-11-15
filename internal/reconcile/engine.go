@@ -13,6 +13,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/crowquillx/silo-shoko-plugin/internal/shoko"
@@ -25,6 +26,12 @@ const (
 	defaultConcurrency = 8
 )
 
+// stateSaveInterval is how often a crawl in progress is written to disk. The
+// state holds every file read so far, so writing it after each small batch of
+// series made a large library's crawl mostly disk writes. A crawl that is
+// stopped loses at most this much work.
+var stateSaveInterval = 5 * time.Second
+
 type Engine struct {
 	client           *shoko.Client
 	reconciler       *vfs.Reconciler
@@ -32,6 +39,17 @@ type Engine struct {
 	folderIDs        []int
 	fingerprint      string
 	concurrency      int
+
+	// viewMu guards view, the snapshot file as last read with its plan, and is
+	// held while the file is read so concurrent callers share one read.
+	viewMu    sync.Mutex
+	view      *View
+	viewStamp fileStamp
+	// applyMu guards applyState, the snapshot Apply last saved, kept so the
+	// next Apply need not read the file again.
+	applyMu    sync.Mutex
+	applyState *crawlState
+	applyStamp fileStamp
 }
 
 // Config contains the already validated runtime objects. The engine never
@@ -155,67 +173,35 @@ func (e *Engine) Step(ctx context.Context, budget time.Duration) (Outcome, error
 				return err
 			}
 		}
+		statePath := vfs.CrawlStatePath(locked.Root())
+		lastSave, dirty := time.Now(), false
+		persist := func() error {
+			if !dirty {
+				return nil
+			}
+			if err := saveState(statePath, state); err != nil {
+				return err
+			}
+			lastSave, dirty = time.Now(), false
+			return nil
+		}
 		for {
 			if stepCtx.Err() != nil {
 				outcome = e.progress(state)
-				return nil
+				return persist()
 			}
+			var fetch func(context.Context, *crawlState) error
 			switch state.Phase {
 			case phaseFolders:
-				if err := e.fetchFolders(stepCtx, state); err != nil {
-					if isBudgetExpiry(stepCtx, ctx, err) {
-						if saveErr := saveState(vfs.CrawlStatePath(locked.Root()), state); saveErr != nil {
-							return saveErr
-						}
-						outcome = e.progress(state)
-						return nil
-					}
-					return err
-				}
+				fetch = e.fetchFolders
 			case phaseFiles:
-				if err := e.fetchFilePage(stepCtx, state); err != nil {
-					if isBudgetExpiry(stepCtx, ctx, err) {
-						if saveErr := saveState(vfs.CrawlStatePath(locked.Root()), state); saveErr != nil {
-							return saveErr
-						}
-						outcome = e.progress(state)
-						return nil
-					}
-					return err
-				}
+				fetch = e.fetchFilePage
 			case phaseSeries:
-				if err := e.fetchSeries(stepCtx, state); err != nil {
-					if isBudgetExpiry(stepCtx, ctx, err) {
-						if saveErr := saveState(vfs.CrawlStatePath(locked.Root()), state); saveErr != nil {
-							return saveErr
-						}
-						outcome = e.progress(state)
-						return nil
-					}
-					return err
-				}
+				fetch = e.fetchSeries
 			case phaseGroups:
-				if err := e.fetchGroups(stepCtx, state); err != nil {
-					if isBudgetExpiry(stepCtx, ctx, err) {
-						if saveErr := saveState(vfs.CrawlStatePath(locked.Root()), state); saveErr != nil {
-							return saveErr
-						}
-						outcome = e.progress(state)
-						return nil
-					}
-					return err
-				}
+				fetch = e.fetchGroups
 			case phaseEpisodes:
-				if err := e.fetchEpisodes(stepCtx, state); err != nil {
-					if isBudgetExpiry(stepCtx, ctx, err) {
-						if saveErr := saveState(vfs.CrawlStatePath(locked.Root()), state); saveErr != nil {
-							return saveErr
-						}
-						outcome = e.progress(state)
-						return nil
-					}
-					return err
-				}
+				fetch = e.fetchEpisodes
 			case phaseReady:
 				// Do not begin a large filesystem commit at the tail end of a
 				// scheduled-task budget. The commit does not stop at the budget,
@@ -253,6 +239,7 @@ func (e *Engine) Step(ctx context.Context, budget time.Duration) (Outcome, error
 				if err := os.Chtimes(vfs.SnapshotPath(locked.Root()), now, now); err != nil {
 					return fmt.Errorf("reconcile: date crawl snapshot: %w", err)
 				}
+				e.rememberView(locked, state, plan)
 				outcome = e.progress(state)
 				outcome.Complete = true
 				outcome.Plan = plan
@@ -261,8 +248,24 @@ func (e *Engine) Step(ctx context.Context, budget time.Duration) (Outcome, error
 			default:
 				return fmt.Errorf("reconcile: unsupported crawl phase %q", state.Phase)
 			}
-			if err := saveState(vfs.CrawlStatePath(locked.Root()), state); err != nil {
+			before := state.Phase
+			err := fetch(stepCtx, state)
+			// A failed batch still records the lookups in it that succeeded.
+			dirty = true
+			if err != nil {
+				saveErr := persist()
+				if isBudgetExpiry(stepCtx, ctx, err) {
+					outcome = e.progress(state)
+					return saveErr
+				}
 				return err
+			}
+			// The commit moves the state file, so it is always written on
+			// reaching a new phase.
+			if state.Phase != before || time.Since(lastSave) >= stateSaveInterval {
+				if err := persist(); err != nil {
+					return err
+				}
 			}
 		}
 	})
@@ -329,12 +332,25 @@ func (e *Engine) fetchFilePage(ctx context.Context, state *crawlState) error {
 	if page < 1 {
 		page = 1
 	}
-	files, _, err := e.client.FilesForManagedFolderPage(ctx, folderID, page)
+	files, total, err := e.client.FilesForManagedFolderPage(ctx, folderID, page)
 	if err != nil {
 		return err
 	}
 	state.Files = append(state.Files, files...)
-	if len(files) == 0 || len(files) < shokoPageSize {
+	if state.FolderFiles == nil {
+		state.FolderFiles = make(map[int]int)
+	}
+	state.FolderFiles[folderID] += len(files)
+	// Shoko's total decides when a folder is done. A short page only ends it
+	// when there is no total, since a server may cap pages below the size
+	// asked for.
+	done := len(files) == 0
+	if total > 0 {
+		done = done || state.FolderFiles[folderID] >= total
+	} else {
+		done = done || len(files) < shokoPageSize
+	}
+	if done {
 		state.FolderIndex++
 		state.NextFilePage[folderID] = 0
 	} else {

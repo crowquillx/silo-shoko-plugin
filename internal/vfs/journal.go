@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +23,21 @@ const (
 	liveStatusName       = ".shokoanime-live-status.json"
 	maxJournalLineBytes  = 1 << 20
 )
+
+// The journal is trimmed once it holds more than journalTrimAbove entries:
+// those older than journalKeep go, which a host that polls at all has long
+// since read. A host that was away for longer is sent a scan of the whole
+// library, as on its first poll. They are variables for tests.
+var (
+	journalTrimAbove = 10000
+	journalKeep      = 72 * time.Hour
+)
+
+// journalStamp identifies one written version of the journal file.
+type journalStamp struct {
+	modified int64
+	size     int64
+}
 
 // ChangeJournalEntry is one successfully reconciled VFS path. Sequence is an
 // opaque-to-the-host cursor value; the plugin only requires that callers send
@@ -101,6 +117,10 @@ func (r *Reconciler) PollChangesLocked(ctx context.Context, marker string) ([]st
 	parsed, err := parseMarker(marker)
 	if err != nil {
 		return nil, "", err
+	}
+	if len(state.entries) > 0 && parsed+1 < state.entries[0].Sequence {
+		// Entries after the marker were trimmed, so some changes are unknown.
+		return nil, "", fmt.Errorf("%w: marker %d is older than the journal's first entry %d", ErrUnusableMarker, parsed, state.entries[0].Sequence)
 	}
 	if parsed > state.last {
 		// The journal has never reached this position, so it is not the journal
@@ -206,6 +226,8 @@ func (r *Reconciler) appendJournal(paths []string) error {
 	var data bytes.Buffer
 	sequence := state.last
 	now := time.Now().UTC()
+	// The entries are appended to a copy, since state may be the cached one.
+	entries := state.entries[:len(state.entries):len(state.entries)]
 	for _, path := range unique {
 		sequence++
 		entry := ChangeJournalEntry{
@@ -220,6 +242,12 @@ func (r *Reconciler) appendJournal(paths []string) error {
 		}
 		data.Write(encoded)
 		data.WriteByte('\n')
+		entries = append(entries, entry)
+	}
+	if len(entries) > journalTrimAbove {
+		if kept := recentEntries(entries, now.Add(-journalKeep)); len(kept) < len(entries) {
+			return r.rewriteJournal(kept)
+		}
 	}
 
 	if info, err := os.Lstat(r.journalPath); err == nil {
@@ -248,7 +276,64 @@ func (r *Reconciler) appendJournal(paths []string) error {
 	if err := file.Close(); err != nil {
 		return fmt.Errorf("vfs: close change journal: %w", err)
 	}
+	r.rememberJournal(journalState{entries: entries, last: sequence})
 	return nil
+}
+
+// recentEntries returns the entries reconciled since cutoff. The newest entry
+// is always kept, since the next sequence number is read from it.
+func recentEntries(entries []ChangeJournalEntry, cutoff time.Time) []ChangeJournalEntry {
+	first := sort.Search(len(entries), func(i int) bool { return !entries[i].ReconciledAt.Before(cutoff) })
+	return entries[min(first, len(entries)-1):]
+}
+
+// rewriteJournal replaces the journal with entries.
+func (r *Reconciler) rewriteJournal(entries []ChangeJournalEntry) error {
+	var data bytes.Buffer
+	for _, entry := range entries {
+		encoded, err := json.Marshal(entry)
+		if err != nil {
+			return fmt.Errorf("vfs: encode change journal entry: %w", err)
+		}
+		data.Write(encoded)
+		data.WriteByte('\n')
+	}
+	tmpFile, err := os.CreateTemp(r.config.Root, ".shokoanime-journal-*")
+	if err != nil {
+		return fmt.Errorf("vfs: create change journal temp file: %w", err)
+	}
+	tmp := tmpFile.Name()
+	defer os.Remove(tmp)
+	if err := tmpFile.Chmod(0o600); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("vfs: protect change journal: %w", err)
+	}
+	if _, err := tmpFile.Write(data.Bytes()); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("vfs: write change journal: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("vfs: sync change journal: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("vfs: close change journal: %w", err)
+	}
+	if err := os.Rename(tmp, r.journalPath); err != nil {
+		return fmt.Errorf("vfs: install change journal: %w", err)
+	}
+	r.rememberJournal(journalState{entries: entries, last: entries[len(entries)-1].Sequence})
+	return nil
+}
+
+// rememberJournal keeps the journal as just written, so polls between
+// reconciles do not read the file again.
+func (r *Reconciler) rememberJournal(state journalState) {
+	r.journal, r.journalStamp = journalState{}, journalStamp{}
+	if info, err := os.Lstat(r.journalPath); err == nil {
+		r.journal = state
+		r.journalStamp = journalStamp{modified: info.ModTime().UnixNano(), size: info.Size()}
+	}
 }
 
 func uniquePaths(paths []string) []string {
@@ -268,7 +353,26 @@ func uniquePaths(paths []string) []string {
 	return result
 }
 
+// readJournal returns the journal, from memory when the file is the one last
+// read or written. The result is shared and must not be changed.
 func (r *Reconciler) readJournal() (journalState, error) {
+	info, err := os.Lstat(r.journalPath)
+	if err == nil {
+		stamp := journalStamp{modified: info.ModTime().UnixNano(), size: info.Size()}
+		if info.Mode().IsRegular() && r.journalStamp == stamp && stamp != (journalStamp{}) {
+			return r.journal, nil
+		}
+		state, err := r.loadJournal()
+		if err != nil {
+			return journalState{}, err
+		}
+		r.journal, r.journalStamp = state, stamp
+		return state, nil
+	}
+	return r.loadJournal()
+}
+
+func (r *Reconciler) loadJournal() (journalState, error) {
 	if info, err := os.Lstat(r.journalPath); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			return journalState{}, errors.New("vfs: change journal is not a regular file")
