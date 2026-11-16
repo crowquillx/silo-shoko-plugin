@@ -1,6 +1,6 @@
 {
   "plugin_id": "silo.shokoanime",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "supported_platforms": [
@@ -20,7 +20,7 @@
   "presentation": {
     "display_name": "ShokoAnime VFS",
     "summary": "Builds a Shoko-backed virtual filesystem for Silo libraries.",
-    "description_markdown": "Works with both stable (5.x) and daily (6.x) Shoko Server. Reads Shoko Server API v3, reconciles deterministic plugin-owned leaf symlinks, and publishes successful VFS changes for targeted Silo scans. It listens to Shoko's events, so new, moved and deleted files reach the VFS within seconds, and can ask Silo to refresh a show when its metadata or artwork changes in Shoko. It deliberately does not expose remote streams. It changes Shoko data only for profiles that connect the Shoko watch provider, which marks an episode watched in Shoko when the profile finishes playing it, and can export the profile's Silo watch history to Shoko. That provider can also import Shoko's watched episodes into Silo, which is off until a profile turns it on.",
+    "description_markdown": "Works with both stable (5.x) and daily (6.x) Shoko Server. Reads Shoko Server API v3, reconciles deterministic plugin-owned leaf symlinks, and publishes successful VFS changes for targeted Silo scans. It listens to Shoko's events, so new, moved and deleted files reach the VFS within seconds, and can ask Silo to refresh a show when its metadata or artwork changes in Shoko. It also provides a TheIntroDB marker provider that looks Shoko episodes up by their linked TMDB episode, so online intro and credits markers match the episode instead of its place in the Shoko group. It deliberately does not expose remote streams. It changes Shoko data only for profiles that connect the Shoko watch provider, which marks an episode watched in Shoko when the profile finishes playing it, and can export the profile's Silo watch history to Shoko. That provider can also import Shoko's watched episodes into Silo, which is off until a profile turns it on.",
     "setup_markdown": "Configure a Shoko Server URL, API key, a Silo-visible output root, and managed-folder path mappings, then use the connection test: it checks the URL, the API key, and every mapped folder. The plugin and Silo must share the same filesystem namespace. Run the Reconcile Shoko VFS task to build the library: a crawl that outlasts the task keeps running in the background, and the task output reports its progress. Enable the Shoko VFS autoscan source and set Silo's default autoscan poll interval to 30 to 60 seconds, which also bounds this source, so Silo scans changed paths soon after Shoko changes; the reconcile task then only needs to run every few hours or daily as a repair. To have Silo refresh shows whose metadata or artwork changes in Shoko, set the Silo server URL and a Silo administrator's API key for refreshes. To mark finished episodes watched in Shoko, each profile connects the Shoko watch provider with its own Shoko API key (Shoko Web UI: Settings > API Keys) and a Silo API key for the same profile.",
     "homepage_url": "https://github.com/crowquillx/silo-shoko-plugin",
     "source_url": "https://github.com/crowquillx/silo-shoko-plugin",
@@ -84,6 +84,16 @@
           "connection": "none",
           "emits_native_paths": true
         }
+      }
+    },
+    {
+      "type": "marker_provider.v1",
+      "id": "theintrodb",
+      "display_name": "TheIntroDB (Shoko numbering)",
+      "description": "Fetches intro, credits, recap and preview markers from TheIntroDB. A Shoko VFS episode is looked up by the TMDB episode Shoko links it to, in that TMDB show's own season and episode numbering, instead of by its place in the Shoko group. Other episodes are looked up as Silo numbers them when that numbering is TVDB's or TMDB's, and movies by their IDs. It never submits markers.",
+      "metadata": {
+        "default_fetch_priority": 10,
+        "supports_contribution": false
       }
     },
     {
@@ -161,7 +171,7 @@
       "key": "connection",
       "title": "ShokoAnime connection",
       "description": "Shoko connection and VFS path policy. The API key is encrypted by Silo.",
-      "json_schema": "{\"type\":\"object\",\"properties\":{\"base_url\":{\"type\":\"string\",\"format\":\"uri\",\"minLength\":1},\"image_mode\":{\"type\":\"string\",\"enum\":[\"direct\",\"public_url\",\"s3\"]},\"image_base_url\":{\"type\":\"string\"},\"s3_endpoint\":{\"type\":\"string\"},\"s3_region\":{\"type\":\"string\"},\"s3_bucket\":{\"type\":\"string\"},\"s3_prefix\":{\"type\":\"string\"},\"s3_access_key_id\":{\"type\":\"string\"},\"s3_secret_access_key\":{\"type\":\"string\"},\"api_key\":{\"type\":\"string\",\"minLength\":1},\"vfs_root\":{\"type\":\"string\",\"minLength\":1},\"managed_folder_map\":{\"type\":\"string\",\"minLength\":2},\"live_updates\":{\"type\":\"boolean\"},\"silo_base_url\":{\"type\":\"string\"},\"silo_api_key\":{\"type\":\"string\"}},\"required\":[\"base_url\",\"api_key\",\"vfs_root\",\"managed_folder_map\"],\"additionalProperties\":false}",
+      "json_schema": "{\"type\":\"object\",\"properties\":{\"base_url\":{\"type\":\"string\",\"format\":\"uri\",\"minLength\":1},\"image_mode\":{\"type\":\"string\",\"enum\":[\"direct\",\"public_url\",\"s3\"]},\"image_base_url\":{\"type\":\"string\"},\"s3_endpoint\":{\"type\":\"string\"},\"s3_region\":{\"type\":\"string\"},\"s3_bucket\":{\"type\":\"string\"},\"s3_prefix\":{\"type\":\"string\"},\"s3_access_key_id\":{\"type\":\"string\"},\"s3_secret_access_key\":{\"type\":\"string\"},\"api_key\":{\"type\":\"string\",\"minLength\":1},\"vfs_root\":{\"type\":\"string\",\"minLength\":1},\"managed_folder_map\":{\"type\":\"string\",\"minLength\":2},\"live_updates\":{\"type\":\"boolean\"},\"silo_base_url\":{\"type\":\"string\"},\"silo_api_key\":{\"type\":\"string\"},\"introdb_api_key\":{\"type\":\"string\"}},\"required\":[\"base_url\",\"api_key\",\"vfs_root\",\"managed_folder_map\"],\"additionalProperties\":false}",
       "required": true,
       "admin_form": {
         "fields": [
@@ -335,6 +345,13 @@
             "key": "silo_api_key",
             "label": "Silo admin API key (for refreshes)",
             "description": "Optional. An API key of a Silo administrator, with no scope limits. Silo gives plugins no other way to start a refresh.",
+            "control": "ADMIN_FORM_CONTROL_PASSWORD",
+            "secret": true
+          },
+          {
+            "key": "introdb_api_key",
+            "label": "TheIntroDB API key (optional)",
+            "description": "Optional. A key from your theintrodb.org account raises the daily lookup budget for the TheIntroDB (Shoko numbering) marker provider. Lookups work without one.",
             "control": "ADMIN_FORM_CONTROL_PASSWORD",
             "secret": true
           }

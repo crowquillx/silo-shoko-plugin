@@ -38,6 +38,9 @@ type Connection struct {
 	// belong to an administrator.
 	SiloBaseURL string
 	SiloAPIKey  string
+	// IntroDBAPIKey, optional, raises TheIntroDB's lookup budget for the
+	// plugin's marker provider. Lookups work without it.
+	IntroDBAPIKey string
 }
 
 // Decode reads the plugin's global config entry. Unknown entries are ignored
@@ -94,6 +97,7 @@ func decodeRaw(raw map[string]any) (Connection, error) {
 		LiveUpdates:      boolValue(raw, "live_updates", true),
 		SiloBaseURL:      strings.TrimRight(stringValue(raw, "silo_base_url"), "/"),
 		SiloAPIKey:       stringValue(raw, "silo_api_key"),
+		IntroDBAPIKey:    stringValue(raw, "introdb_api_key"),
 	}
 	if cfg.ImageMode == "" {
 		cfg.ImageMode = ImageDirect

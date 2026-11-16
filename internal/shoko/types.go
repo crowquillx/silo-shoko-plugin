@@ -187,6 +187,15 @@ type Person struct {
 	Image *Image `json:"image"`
 }
 
+// TMDBEpisode is the part of a TMDB episode the plugin reads: where it sits in
+// its TMDB show. Season 0 holds TMDB's specials.
+type TMDBEpisode struct {
+	ID            int `json:"ID"`
+	ShowID        int `json:"ShowID"`
+	SeasonNumber  int `json:"SeasonNumber"`
+	EpisodeNumber int `json:"EpisodeNumber"`
+}
+
 // TMDBShow is the part of a linked TMDB show the plugin reads.
 type TMDBShow struct {
 	ContentRatings []ContentRating `json:"contentRatings"`

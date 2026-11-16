@@ -87,6 +87,28 @@ In the S3 mode, an image that cannot be copied falls back to Shoko's own URL, an
 
 Silo asks the plugin for an image's URL each time it downloads it, so queued downloads use a new artwork source on their next attempt. Downloads that already gave up are retried when an item is refreshed, or for the whole catalog by the **Backfill Metadata Images** task in **Administration → Tasks**.
 
+## Intro and credits markers
+
+Silo's online marker lookups address an episode by its show's TMDB, TVDB or IMDb ID and the episode's season and number. A Shoko VFS episode is numbered by its place in the Shoko group, which often is not the TMDB or TVDB numbering. JoJo's Stardust Crusaders Battle in Egypt is season 3 of its group, but its episodes are S02E25 onwards on TMDB. With the stock TheIntroDB provider, such an episode gets another episode's markers. Silo can also share local detections with TheIntroDB under the same wrong numbers.
+
+The plugin adds its own marker provider, **TheIntroDB (Shoko numbering)**, which looks markers up in TheIntroDB the right way:
+
+- A Shoko VFS episode is looked up by the TMDB episode Shoko links it to. The plugin asks Shoko where that TMDB episode sits in its show (`GET /api/v3/TMDB/Episode/<id>` in TMDB's default order), then asks TheIntroDB for that show, season and episode.
+- An episode Shoko has no TMDB link for gets no markers from this provider. Its number would name some other episode.
+- An episode from another library is looked up as Silo numbers it, as long as Silo says that numbering is TVDB's or TMDB's. A movie is looked up by its IDs. The provider can therefore replace the stock one for every library.
+- Credits and previews are kept only when TheIntroDB timed them on a release within 5 minutes of the file's length. Intros and recaps are kept either way.
+- The provider only fetches. It never submits markers to TheIntroDB.
+
+To use it:
+
+1. In Silo's admin settings, open **Providers → Marker providers**. For the stock **TheIntroDB** provider, turn off **Get markers from this provider** and **Allow sharing with this provider**. Silo cannot keep a provider away from one library, so it would otherwise keep looking Shoko episodes up by the group's numbering.
+2. Turn on **Get markers from this provider** for **TheIntroDB (Shoko numbering)**, and leave sharing off. The provider does not share.
+3. In the **Playback** settings, set the marker mode to online, or to online with local detection as a fallback. Local detection is chosen per library.
+
+Lookups work without an account, but TheIntroDB currently allows 5,000 anonymous lookups a day, so a first sync of a large library takes several days. Silo's **Sync online markers** task resumes where the budget ran out. A key from your theintrodb.org account, entered as **TheIntroDB API key** in the plugin settings, raises the daily lookup budget. When TheIntroDB asks clients to slow down, the plugin tells Silo to pause the provider for that long.
+
+Online markers outrank local detections in Silo. The exception is a local marker taken from the file's own chapters, which an online marker only replaces when TheIntroDB rates it at least as high.
+
 ## Theme songs
 
 Theme songs are kept in sync between your media folders and the VFS, in both directions:

@@ -448,6 +448,29 @@ func (c *Client) MetadataEpisodes(ctx context.Context, seriesID int) ([]Episode,
 	}
 }
 
+// TMDBEpisode returns the TMDB episode with the given TMDB episode ID, numbered
+// in TMDB's own order rather than an alternate ordering chosen in Shoko. found
+// is false when Shoko does not have the episode, which is the case for any
+// episode of a show no Shoko series is linked to.
+func (c *Client) TMDBEpisode(ctx context.Context, tmdbEpisodeID int) (TMDBEpisode, bool, error) {
+	if tmdbEpisodeID < 1 {
+		return TMDBEpisode{}, false, errors.New("shoko: TMDB episode ID must be positive")
+	}
+	var result TMDBEpisode
+	err := c.get(ctx, "/TMDB/Episode/"+strconv.Itoa(tmdbEpisodeID), url.Values{"alternateOrderingID": {"default"}}, &result)
+	var httpErr *HTTPError
+	if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound {
+		return TMDBEpisode{}, false, nil
+	}
+	if err != nil {
+		return TMDBEpisode{}, false, err
+	}
+	if result.ID != tmdbEpisodeID || result.ShowID < 1 || result.SeasonNumber < 0 || result.EpisodeNumber < 1 {
+		return TMDBEpisode{}, false, fmt.Errorf("shoko: TMDB episode %d has an unusable show, season or number", tmdbEpisodeID)
+	}
+	return result, true, nil
+}
+
 // genreTagFilter asks Shoko for only the tags it classifies as genres: the
 // Genre bit with Invert set keeps that category and drops every other one.
 const genreTagFilter = 1<<31 | 1<<7

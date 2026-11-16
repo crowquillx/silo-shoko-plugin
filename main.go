@@ -29,6 +29,7 @@ import (
 	"github.com/crowquillx/silo-shoko-plugin/internal/config"
 	"github.com/crowquillx/silo-shoko-plugin/internal/identity"
 	"github.com/crowquillx/silo-shoko-plugin/internal/imagestore"
+	"github.com/crowquillx/silo-shoko-plugin/internal/introdb"
 	"github.com/crowquillx/silo-shoko-plugin/internal/reconcile"
 	"github.com/crowquillx/silo-shoko-plugin/internal/shoko"
 	"github.com/crowquillx/silo-shoko-plugin/internal/silocatalog"
@@ -78,6 +79,12 @@ type runtimeServer struct {
 	posters        map[int]shoko.ShowPoster
 	postersClient  *shoko.Client
 	postersFetched time.Time
+
+	// intro looks markers up in TheIntroDB for the configured API key.
+	// introBaseURL overrides TheIntroDB's address in tests.
+	introMu      sync.Mutex
+	intro        *introdb.Client
+	introBaseURL string
 }
 
 // showPosterTTL bounds how long a show poster chosen with the Season Posters
@@ -1306,6 +1313,7 @@ func main() {
 			ScheduledTask:     &scheduledTaskServer{runtime: rt},
 			ScanSource:        &scanSourceServer{runtime: rt},
 			WatchSyncProvider: &watchSyncServer{runtime: rt},
+			MarkerProvider:    &markerServer{runtime: rt},
 		},
 	})
 }
