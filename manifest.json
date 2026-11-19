@@ -1,6 +1,6 @@
 {
   "plugin_id": "silo.shokoanime",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "supported_platforms": [
@@ -171,7 +171,7 @@
       "key": "connection",
       "title": "ShokoAnime connection",
       "description": "Shoko connection and VFS path policy. The API key is encrypted by Silo.",
-      "json_schema": "{\"type\":\"object\",\"properties\":{\"base_url\":{\"type\":\"string\",\"format\":\"uri\",\"minLength\":1},\"image_mode\":{\"type\":\"string\",\"enum\":[\"direct\",\"public_url\",\"s3\"]},\"image_base_url\":{\"type\":\"string\"},\"s3_endpoint\":{\"type\":\"string\"},\"s3_region\":{\"type\":\"string\"},\"s3_bucket\":{\"type\":\"string\"},\"s3_prefix\":{\"type\":\"string\"},\"s3_access_key_id\":{\"type\":\"string\"},\"s3_secret_access_key\":{\"type\":\"string\"},\"api_key\":{\"type\":\"string\",\"minLength\":1},\"vfs_root\":{\"type\":\"string\",\"minLength\":1},\"managed_folder_map\":{\"type\":\"string\",\"minLength\":2},\"live_updates\":{\"type\":\"boolean\"},\"silo_base_url\":{\"type\":\"string\"},\"silo_api_key\":{\"type\":\"string\"},\"introdb_api_key\":{\"type\":\"string\"}},\"required\":[\"base_url\",\"api_key\",\"vfs_root\",\"managed_folder_map\"],\"additionalProperties\":false}",
+      "json_schema": "{\"type\":\"object\",\"properties\":{\"base_url\":{\"type\":\"string\",\"format\":\"uri\",\"minLength\":1},\"image_mode\":{\"type\":\"string\",\"enum\":[\"direct\",\"public_url\",\"s3\"]},\"image_base_url\":{\"type\":\"string\"},\"s3_endpoint\":{\"type\":\"string\"},\"s3_region\":{\"type\":\"string\"},\"s3_bucket\":{\"type\":\"string\"},\"s3_prefix\":{\"type\":\"string\"},\"s3_access_key_id\":{\"type\":\"string\"},\"s3_secret_access_key\":{\"type\":\"string\"},\"api_key\":{\"type\":\"string\",\"minLength\":1},\"vfs_root\":{\"type\":\"string\",\"minLength\":1},\"managed_folder_map\":{\"type\":\"string\",\"minLength\":2},\"live_updates\":{\"type\":\"boolean\"},\"short_season_titles\":{\"type\":\"boolean\"},\"silo_base_url\":{\"type\":\"string\"},\"silo_api_key\":{\"type\":\"string\"},\"introdb_api_key\":{\"type\":\"string\"}},\"required\":[\"base_url\",\"api_key\",\"vfs_root\",\"managed_folder_map\"],\"additionalProperties\":false}",
       "required": true,
       "admin_form": {
         "fields": [
@@ -333,6 +333,13 @@
             "description": "Listen to Shoko's events and update the VFS within seconds of a file being added, moved, renamed or deleted, instead of waiting for the Reconcile Shoko VFS task.",
             "control": "ADMIN_FORM_CONTROL_SWITCH",
             "default_value": true
+          },
+          {
+            "key": "short_season_titles",
+            "label": "Shorten season titles",
+            "description": "Name a show's seasons without the show's own title: under Demon Slayer, \"Demon Slayer: Entertainment District Arc\" becomes \"Entertainment District Arc\". A season keeps its full name when only a year, a number or a few characters would be left. Seasons Shoko gives the same name are told apart with their AniDB main title. Refresh a show's metadata in Silo to rename its seasons.",
+            "control": "ADMIN_FORM_CONTROL_SWITCH",
+            "default_value": false
           },
           {
             "key": "silo_base_url",

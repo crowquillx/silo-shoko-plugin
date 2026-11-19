@@ -87,7 +87,7 @@ func TestGroupSeasonsUseEachTVSeriesPoster(t *testing.T) {
 		{IDs: shoko.IDs{ID: 10}, Name: "First", AniDB: &shoko.AnimeMetadata{Type: "TV", AirDate: "2010-01-01"}, Images: shoko.Images{Posters: []shoko.Image{{UID: "11111111-1111-4111-8111-111111111111", Available: true}}}},
 		{IDs: shoko.IDs{ID: 20}, Name: "Second", AniDB: &shoko.AnimeMetadata{Type: "TV", AirDate: "2020-01-01"}, Images: shoko.Images{Posters: []shoko.Image{{UID: "22222222-2222-4222-8222-222222222222", Available: true}}}},
 	}
-	response := groupSeasons(shoko.Group{IDs: shoko.GroupIDs{ID: 5}, Name: "Group"}, members, nil, "")
+	response := groupSeasons(shoko.Group{IDs: shoko.GroupIDs{ID: 5}, Name: "Group"}, members, nil, "", false)
 	if len(response.GetSeasons()) != 2 {
 		t.Fatalf("seasons = %#v", response.GetSeasons())
 	}
@@ -107,13 +107,39 @@ func TestGroupSeasonsListSpecialsOnlyWhenTheyExist(t *testing.T) {
 	regular := shoko.Episode{IDs: shoko.IDs{ID: 1}, AniDB: &shoko.AnimeMetadata{Type: "Episode", EpisodeNumber: 1}}
 	special := shoko.Episode{IDs: shoko.IDs{ID: 2}, AniDB: &shoko.AnimeMetadata{Type: "Special", EpisodeNumber: 1}}
 
-	without := groupSeasons(group, []shoko.Series{tv}, map[int][]shoko.Episode{10: {regular}}, "")
+	without := groupSeasons(group, []shoko.Series{tv}, map[int][]shoko.Episode{10: {regular}}, "", false)
 	if len(without.GetSeasons()) != 1 {
 		t.Fatalf("seasons without specials = %#v", without.GetSeasons())
 	}
-	with := groupSeasons(group, []shoko.Series{tv}, map[int][]shoko.Episode{10: {regular, special}}, "")
+	with := groupSeasons(group, []shoko.Series{tv}, map[int][]shoko.Episode{10: {regular, special}}, "", false)
 	if len(with.GetSeasons()) != 2 || with.GetSeasons()[1].GetSeasonNumber() != 0 || with.GetSeasons()[1].GetTitle() != "Specials" {
 		t.Fatalf("seasons with specials = %#v", with.GetSeasons())
+	}
+}
+
+func TestGroupSeasonsShortenTitlesOnlyWhenAsked(t *testing.T) {
+	members := []shoko.Series{
+		{IDs: shoko.IDs{ID: 10}, Name: "Demon Slayer", AniDB: &shoko.AnimeMetadata{Type: "TV"}},
+		{IDs: shoko.IDs{ID: 20}, Name: "Demon Slayer: Mugen Train Arc", AniDB: &shoko.AnimeMetadata{Type: "TV"}},
+		{IDs: shoko.IDs{ID: 30}, Name: "Demon Slayer (2026)", AniDB: &shoko.AnimeMetadata{Type: "TV"}},
+	}
+	group := shoko.Group{IDs: shoko.GroupIDs{ID: 5, MainSeries: 10}, Name: "Demon Slayer"}
+	for _, test := range []struct {
+		short bool
+		want  []string
+	}{
+		{false, []string{"Demon Slayer", "Demon Slayer: Mugen Train Arc", "Demon Slayer (2026)"}},
+		{true, []string{"Demon Slayer", "Mugen Train Arc", "Demon Slayer (2026)"}},
+	} {
+		seasons := groupSeasons(group, members, nil, "", test.short).GetSeasons()
+		if len(seasons) != len(test.want) {
+			t.Fatalf("short=%v seasons = %#v", test.short, seasons)
+		}
+		for index, want := range test.want {
+			if seasons[index].GetSeasonNumber() != int32(index+1) || seasons[index].GetTitle() != want {
+				t.Errorf("short=%v season %d = %q, want %q", test.short, index+1, seasons[index].GetTitle(), want)
+			}
+		}
 	}
 }
 
@@ -123,7 +149,7 @@ func TestGroupSeasonsFollowShokoOrderAcrossTypes(t *testing.T) {
 		{IDs: shoko.IDs{ID: 10}, Name: "The Show", AniDB: &shoko.AnimeMetadata{Type: "TV"}},
 		{IDs: shoko.IDs{ID: 20}, Name: "The Movie", AniDB: &shoko.AnimeMetadata{Type: "Movie"}},
 	}
-	seasons := groupSeasons(shoko.Group{IDs: shoko.GroupIDs{ID: 5}, Name: "Group"}, members, nil, "").GetSeasons()
+	seasons := groupSeasons(shoko.Group{IDs: shoko.GroupIDs{ID: 5}, Name: "Group"}, members, nil, "", false).GetSeasons()
 	if len(seasons) != len(members) {
 		t.Fatalf("seasons = %#v", seasons)
 	}
@@ -258,7 +284,7 @@ func TestSeasonsCarryTheirOwnBackdrop(t *testing.T) {
 	}
 	group := shoko.Group{IDs: shoko.GroupIDs{ID: 5}, Name: "Group", Images: shoko.Images{Backdrops: []shoko.Image{{UID: groupBackdrop, Available: true}}}}
 	special := shoko.Episode{IDs: shoko.IDs{ID: 2}, AniDB: &shoko.AnimeMetadata{Type: "Special", EpisodeNumber: 1}}
-	seasons := groupSeasons(group, members, map[int][]shoko.Episode{10: {special}}, "").GetSeasons()
+	seasons := groupSeasons(group, members, map[int][]shoko.Episode{10: {special}}, "", false).GetSeasons()
 	// A series without a backdrop has none: the show's backdrop is not its own.
 	want := []string{shokoImageScheme + firstBackdrop, shokoImageScheme + secondBackdrop, "", shokoImageScheme + groupBackdrop}
 	if len(seasons) != len(want) {
@@ -307,7 +333,7 @@ func TestGroupSeasonsUseTheSeasonPostersSpecialsPoster(t *testing.T) {
 	group := shoko.Group{IDs: shoko.GroupIDs{ID: 5}, Name: "Group"}
 	special := shoko.Episode{IDs: shoko.IDs{ID: 2}, AniDB: &shoko.AnimeMetadata{Type: "Special", EpisodeNumber: 1}}
 
-	seasons := groupSeasons(group, []shoko.Series{tv}, map[int][]shoko.Episode{10: {special}}, "shoko://image/dddddddd-dddd-4ddd-8ddd-dddddddddddd").GetSeasons()
+	seasons := groupSeasons(group, []shoko.Series{tv}, map[int][]shoko.Episode{10: {special}}, "shoko://image/dddddddd-dddd-4ddd-8ddd-dddddddddddd", false).GetSeasons()
 	if len(seasons) != 2 || seasons[1].GetSeasonNumber() != 0 || seasons[1].GetPosterPath() != "shoko://image/dddddddd-dddd-4ddd-8ddd-dddddddddddd" {
 		t.Fatalf("seasons = %#v", seasons)
 	}

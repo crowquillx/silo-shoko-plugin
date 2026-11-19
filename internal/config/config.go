@@ -41,6 +41,9 @@ type Connection struct {
 	// IntroDBAPIKey, optional, raises TheIntroDB's lookup budget for the
 	// plugin's marker provider. Lookups work without it.
 	IntroDBAPIKey string
+	// ShortSeasonTitles names a show's seasons without the part of their
+	// title that repeats the show's.
+	ShortSeasonTitles bool
 }
 
 // Decode reads the plugin's global config entry. Unknown entries are ignored
@@ -91,13 +94,14 @@ func decodeRaw(raw map[string]any) (Connection, error) {
 			AccessKeyID:     stringValue(raw, "s3_access_key_id"),
 			SecretAccessKey: stringValue(raw, "s3_secret_access_key"),
 		},
-		APIKey:           stringValue(raw, "api_key"),
-		VFSRoot:          stringValue(raw, "vfs_root"),
-		ManagedFolderMap: make(map[int]string),
-		LiveUpdates:      boolValue(raw, "live_updates", true),
-		SiloBaseURL:      strings.TrimRight(stringValue(raw, "silo_base_url"), "/"),
-		SiloAPIKey:       stringValue(raw, "silo_api_key"),
-		IntroDBAPIKey:    stringValue(raw, "introdb_api_key"),
+		APIKey:            stringValue(raw, "api_key"),
+		VFSRoot:           stringValue(raw, "vfs_root"),
+		ManagedFolderMap:  make(map[int]string),
+		LiveUpdates:       boolValue(raw, "live_updates", true),
+		SiloBaseURL:       strings.TrimRight(stringValue(raw, "silo_base_url"), "/"),
+		SiloAPIKey:        stringValue(raw, "silo_api_key"),
+		IntroDBAPIKey:     stringValue(raw, "introdb_api_key"),
+		ShortSeasonTitles: boolValue(raw, "short_season_titles", false),
 	}
 	if cfg.ImageMode == "" {
 		cfg.ImageMode = ImageDirect

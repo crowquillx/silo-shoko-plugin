@@ -151,14 +151,14 @@ func TestDecodeLiveUpdatesAndSiloRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.LiveUpdates || cfg.SiloBaseURL != "" || cfg.SiloAPIKey != "" || cfg.IntroDBAPIKey != "" {
+	if !cfg.LiveUpdates || cfg.SiloBaseURL != "" || cfg.SiloAPIKey != "" || cfg.IntroDBAPIKey != "" || cfg.ShortSeasonTitles {
 		t.Fatalf("defaults = %#v", cfg)
 	}
-	cfg, err = decode(map[string]any{"live_updates": false, "silo_base_url": "http://silo:8080/", "silo_api_key": "sa_key", "introdb_api_key": " tidb_key "})
+	cfg, err = decode(map[string]any{"live_updates": false, "silo_base_url": "http://silo:8080/", "silo_api_key": "sa_key", "introdb_api_key": " tidb_key ", "short_season_titles": true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.LiveUpdates || cfg.SiloBaseURL != "http://silo:8080" || cfg.SiloAPIKey != "sa_key" || cfg.IntroDBAPIKey != "tidb_key" {
+	if cfg.LiveUpdates || cfg.SiloBaseURL != "http://silo:8080" || cfg.SiloAPIKey != "sa_key" || cfg.IntroDBAPIKey != "tidb_key" || !cfg.ShortSeasonTitles {
 		t.Fatalf("decoded = %#v", cfg)
 	}
 	for _, extra := range []map[string]any{

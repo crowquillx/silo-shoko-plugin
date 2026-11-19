@@ -67,6 +67,18 @@ Shows get their dates, status, genres, studios, cast and AniDB rating from all o
 
 The AniDB rating appears in Silo once an administrator turns on the AniDB rating source the plugin declares.
 
+### Season titles
+
+A season has its Shoko series' name, which usually starts with the show's: under Demon Slayer, `Demon Slayer: Entertainment District Arc`. Silo cuts long names off, so the part that tells seasons apart is often hidden. Switch on **Shorten season titles** to drop the show's title from the front, leaving `Entertainment District Arc`. It is off by default.
+
+- A season keeps its full name when only a year, a number or a few characters would be left, such as `Spy x Family (2023)`, `Overlord II` or `Symphogear G`, and when it is named exactly like the show.
+- Case and punctuation do not have to match, so `Armored Trooper Votoms: Pailsen Files` is shortened under `Armored Trooper VOTOMS`.
+- When the show's title has a subtitle of its own, as in `Ghost in the Shell: Stand Alone Complex`, seasons that share only the first part are shortened too, so `Ghost in the Shell: Arise` becomes `Arise`.
+- When fewer than half of a show's seasons start with its title, as in a group that mixes several franchises, every season keeps its full name.
+- Shoko gives several seasons the same name when it has no title for them in its language. They are told apart with the rest of their AniDB main title, which is romanised: three more seasons named `Tokyo Revengers` become `Seiya Kessen Hen`, `Tenjiku Hen` and `Santen Sensou Hen`.
+
+Silo keeps the titles it already has until a show's metadata is refreshed, so refresh the library's metadata after changing the setting.
+
 ## Posters
 
 Each season uses its Shoko series' preferred poster. Shoko gives a group only its main series' poster, so on its own a show repeats its first season's poster. With the [Season Posters](https://github.com/crowquillx/shoko-season-posters) Shoko plugin installed, a show uses the show poster chosen there in its own show poster mode, and keeps the group poster otherwise. The plugin reads that list at most every 10 minutes. A changed poster appears once the show's metadata is refreshed in Silo, which the plugin [asks Silo to do](#refreshing-silo) when the Silo refresh settings are set. The specials season uses the specials poster chosen there, from Season Posters 0.1.9, and keeps the group poster otherwise. Shoko's group poster is the main series' poster, so without one the specials season repeats season 1's poster. A group that has sub-groups as well as series of its own is a show of those series here, and Season Posters plans a show poster for it too. Each season also gets its Shoko series' backdrop, from the next metadata refresh on.

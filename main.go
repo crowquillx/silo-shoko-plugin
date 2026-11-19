@@ -613,7 +613,7 @@ func (s *metadataServer) GetMetadata(ctx context.Context, req *pluginv1.GetMetad
 }
 
 func (s *metadataServer) GetSeasons(ctx context.Context, req *pluginv1.GetSeasonsRequest) (*pluginv1.GetSeasonsResponse, error) {
-	_, client, _, err := s.runtime.state()
+	cfg, client, _, err := s.runtime.state()
 	if err != nil {
 		return nil, err
 	}
@@ -632,7 +632,7 @@ func (s *metadataServer) GetSeasons(ctx context.Context, req *pluginv1.GetSeason
 		if err != nil {
 			return nil, err
 		}
-		return groupSeasons(group, members, episodesBySeries, s.runtime.specialsPoster(ctx, client, group.IDs.ID)), nil
+		return groupSeasons(group, members, episodesBySeries, s.runtime.specialsPoster(ctx, client, group.IDs.ID), cfg.ShortSeasonTitles), nil
 	}
 	seriesID := token.SeriesID
 	if seriesID == 0 {
@@ -1570,8 +1570,16 @@ func groupEpisodes(ctx context.Context, list func(context.Context, int) ([]shoko
 
 // groupSeasons lists a group's seasons. specialsPoster is the specials season's
 // poster chosen with the Season Posters Shoko plugin, or "" to use the group's.
-func groupSeasons(group shoko.Group, members []shoko.Series, episodesBySeries map[int][]shoko.Episode, specialsPoster string) *pluginv1.GetSeasonsResponse {
+// A season has its series' name, without the part that repeats the group's
+// name when shortTitles is set.
+func groupSeasons(group shoko.Group, members []shoko.Series, episodesBySeries map[int][]shoko.Episode, specialsPoster string, shortTitles bool) *pluginv1.GetSeasonsResponse {
 	layout := topology.NewGroupLayout(members)
+	titles := make(map[int]string, len(layout.OrderedMembers))
+	if shortTitles {
+		for index, title := range topology.SeasonTitles(group.Name, group.IDs.MainSeries, layout.OrderedMembers) {
+			titles[layout.OrderedMembers[index].IDs.ID] = title
+		}
+	}
 	response := &pluginv1.GetSeasonsResponse{Seasons: make([]*pluginv1.SeasonRecord, 0, len(layout.OrderedMembers)+1)}
 	groupID := strconv.Itoa(group.IDs.ID)
 	groupPoster := selectedPosterPath(group.Images)
@@ -1587,7 +1595,7 @@ func groupSeasons(group shoko.Group, members []shoko.Series, episodesBySeries ma
 		}
 		response.Seasons = append(response.Seasons, &pluginv1.SeasonRecord{
 			SeasonNumber: int32(season),
-			Title:        series.Name,
+			Title:        cmp.Or(titles[series.IDs.ID], series.Name),
 			Overview:     sanitizeDescription(series.Description),
 			AirDate:      seriesAirDate(series),
 			PosterPath:   poster,
