@@ -42,11 +42,16 @@ type liveFixture struct {
 	posters   string
 	// noRoots makes Silo list no roots, as for a show an autoscan added.
 	noRoots bool
+	// group is the Shoko group that holds series 7. Changing it regroups the
+	// series, as Shoko does when it merges groups.
+	group int
+	// patched records the episode IDs Silo was asked to clear, by episode.
+	patched []string
 }
 
 func newLiveFixture(t *testing.T) *liveFixture {
 	t.Helper()
-	fixture := &liveFixture{posters: `{"shows":[]}`}
+	fixture := &liveFixture{posters: `{"shows":[]}`, group: 3}
 	sourceRoot := filepath.Join(t.TempDir(), "source")
 	fixture.root = filepath.Join(t.TempDir(), "vfs")
 	if err := os.MkdirAll(sourceRoot, 0o755); err != nil {
@@ -63,13 +68,31 @@ func newLiveFixture(t *testing.T) *liveFixture {
 		case "/api/v3/ManagedFolder/1/File":
 			fmt.Fprint(w, `{"total":1,"list":[{"id":9,"locations":[{"managedFolderId":1,"relativePath":"a.mkv","isAccessible":true}],"seriesIds":[{"seriesId":{"id":7},"episodeIds":[{"id":42}]}]}]}`)
 		case "/api/v3/Series/7":
-			fmt.Fprint(w, `{"ids":{"id":7,"parentGroup":3},"name":"Show","aniDB":{"type":"TV","airDate":"2020-01-01"}}`)
+			fixture.mu.Lock()
+			group := fixture.group
+			fixture.mu.Unlock()
+			fmt.Fprintf(w, `{"ids":{"id":7,"parentGroup":%d},"name":"Show","aniDB":{"type":"TV","airDate":"2020-01-01"}}`, group)
 		case "/api/v3/Series/7/Episode":
 			fmt.Fprint(w, `{"total":1,"list":[{"ids":{"id":42,"parentSeries":7},"name":"E1","aniDB":{"type":"Normal","episodeNumber":1}}]}`)
-		case "/api/v3/Group/3":
-			fmt.Fprint(w, `{"IDs":{"ID":3},"Name":"Show"}`)
-		case "/api/v3/Group/3/Series":
-			fmt.Fprint(w, `[{"ids":{"id":7,"parentGroup":3},"name":"Show","aniDB":{"type":"TV","airDate":"2020-01-01"}}]`)
+		case "/api/v3/Group/3", "/api/v3/Group/5":
+			fixture.mu.Lock()
+			group := fixture.group
+			fixture.mu.Unlock()
+			if r.URL.Path != fmt.Sprintf("/api/v3/Group/%d", group) {
+				http.NotFound(w, r)
+				return
+			}
+			name := map[int]string{3: "Show", 5: "Franchise"}[group]
+			fmt.Fprintf(w, `{"IDs":{"ID":%d},"Name":%q}`, group, name)
+		case "/api/v3/Group/3/Series", "/api/v3/Group/5/Series":
+			fixture.mu.Lock()
+			group := fixture.group
+			fixture.mu.Unlock()
+			if r.URL.Path != fmt.Sprintf("/api/v3/Group/%d/Series", group) {
+				fmt.Fprint(w, `[]`)
+				return
+			}
+			fmt.Fprintf(w, `[{"ids":{"id":7,"parentGroup":%d},"name":"Show","aniDB":{"type":"TV","airDate":"2020-01-01"}}]`, group)
 		case "/api/plugin/season-posters/show-posters":
 			fixture.mu.Lock()
 			fmt.Fprint(w, fixture.posters)
@@ -82,7 +105,14 @@ func newLiveFixture(t *testing.T) *liveFixture {
 	siloServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fixture.mu.Lock()
 		defer fixture.mu.Unlock()
+		if strings.HasPrefix(r.URL.Path, "/api/v2/catalog") && r.Header.Get("X-Profile-Id") != "admin-profile" {
+			// Silo requires a profile on its catalog endpoints.
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			return
+		}
 		switch {
+		case r.URL.Path == "/api/v2/profiles":
+			fmt.Fprint(w, `{"items":[{"id":"admin-profile"}]}`)
 		case r.URL.Path == "/api/v2/libraries":
 			fmt.Fprintf(w, `{"items":[{"id":"1","paths":[%q]},{"id":"2","paths":["/elsewhere"]}]}`, fixture.root)
 		case r.URL.Path == "/api/v2/libraries/roots":
@@ -104,6 +134,13 @@ func newLiveFixture(t *testing.T) *liveFixture {
 			fmt.Fprint(w, `{"content_id":"decoy","folder_paths":["/elsewhere/Show (2020)"]}`)
 		case r.URL.Path == "/api/v2/catalog/items/silo-show":
 			fmt.Fprintf(w, `{"content_id":"silo-show","folder_paths":[%q]}`, filepath.Join(fixture.root, "Show (2020)"))
+		case r.URL.Path == "/api/v2/catalog/series/silo-show/seasons":
+			fmt.Fprint(w, `{"items":[{"season_number":1}]}`)
+		case r.URL.Path == "/api/v2/catalog/series/silo-show/seasons/1/episodes":
+			fmt.Fprint(w, `{"items":[{"content_id":"silo-e1","tmdb_id":"1001","tvdb_id":"2001"},{"content_id":"silo-e2"}]}`)
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/metadata"):
+			fixture.patched = append(fixture.patched, strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v2/admin/items/"), "/metadata"))
+			fmt.Fprint(w, `{}`)
 		case strings.HasSuffix(r.URL.Path, "/refresh-metadata"):
 			fixture.refreshed = append(fixture.refreshed, strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v2/admin/items/"), "/refresh-metadata"))
 			w.WriteHeader(http.StatusAccepted)
@@ -282,6 +319,73 @@ func TestLiveUpdatesRecrawlWhenShokoRecreatesGroups(t *testing.T) {
 	after, err := fixture.updates.engine.Snapshot(ctx)
 	if err != nil || !after.CommittedAt.After(before.CommittedAt) {
 		t.Fatalf("snapshot after recrawl = %#v (before %#v), %v", after, before, err)
+	}
+}
+
+// When Shoko moves a series into another group, the old group's show folder
+// leaves the VFS and the series appears in another show. The Silo show for the
+// old group gives up its episodes' external IDs, so the show that now holds the
+// files can take them.
+func TestLiveUpdatesReleaseTheIDsOfAShowWhoseSeriesMoved(t *testing.T) {
+	fixture := newLiveFixture(t)
+	fixture.updates.status = &liveStatus{startedAt: time.Now()}
+	ctx := context.Background()
+	if _, err := fixture.updates.engine.Step(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// A change that keeps every show releases nothing.
+	fixture.updates.Apply(ctx, live.Batch{VFS: reconcile.Changes{Series: []int{7}}})
+	fixture.mu.Lock()
+	if len(fixture.patched) != 0 {
+		t.Fatalf("patched = %v after a change that removed no show", fixture.patched)
+	}
+	fixture.group = 5
+	fixture.mu.Unlock()
+
+	fixture.updates.Apply(ctx, live.Batch{VFS: reconcile.Changes{Series: []int{7}, Groups: []int{3, 5}}})
+	shows, err := fixture.updates.describeShows(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shows.bySeries[7] != "[Shoko Group=5]" {
+		t.Fatalf("series 7 is in %q after the regroup", shows.bySeries[7])
+	}
+	fixture.mu.Lock()
+	patched := slices.Clone(fixture.patched)
+	fixture.mu.Unlock()
+	// Only the episode that had IDs is edited.
+	if !reflect.DeepEqual(patched, []string{"silo-e1"}) {
+		t.Fatalf("patched = %v", patched)
+	}
+	report := fixture.updates.status.report(0)
+	if report["retired_shows"] != 1 || report["released_episodes"] != 1 || report["last_retire_show"] != "[Shoko Group=3]" {
+		t.Fatalf("status = retired %v, released %v, show %v", report["retired_shows"], report["released_episodes"], report["last_retire_show"])
+	}
+}
+
+func TestRegroupedShowsNamesOnlyShowsWhoseSeriesMoved(t *testing.T) {
+	folder := func(path string) showFolder { return showFolder{path: path} }
+	before := vfsShows{
+		bySeries: map[int]string{1: "[Shoko Group=1]", 2: "[Shoko Group=2]", 3: "[Shoko Group=3]", 4: "[Shoko Group=4]"},
+		folders: map[string]showFolder{
+			"[Shoko Group=1]": folder("/vfs/A (2001)"),
+			"[Shoko Group=2]": folder("/vfs/B (2002)"),
+			"[Shoko Group=3]": folder("/vfs/C (2003)"),
+			"[Shoko Group=4]": folder("/vfs/D (2004)"),
+		},
+	}
+	after := vfsShows{
+		// Series 1 moved into group 2. Group 3's only file was replaced, so its
+		// series is gone for now. Group 4 was renumbered but kept its folder.
+		bySeries: map[int]string{1: "[Shoko Group=2]", 2: "[Shoko Group=2]", 4: "[Shoko Group=9]"},
+		folders: map[string]showFolder{
+			"[Shoko Group=2]": folder("/vfs/B (2002)"),
+			"[Shoko Group=9]": folder("/vfs/D (2004)"),
+		},
+	}
+	if got := regroupedShows(before, after); !reflect.DeepEqual(got, []string{"[Shoko Group=1]"}) {
+		t.Fatalf("regroupedShows = %v", got)
 	}
 }
 

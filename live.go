@@ -252,10 +252,15 @@ func (l *liveUpdates) Apply(ctx context.Context, batch live.Batch) live.Batch {
 			l.runtime.startBackgroundCrawl(l.engine)
 		}
 	case !batch.VFS.Empty():
+		// The shows in the VFS before the change, to tell which ones it removes.
+		before, describedBefore := l.showsBefore(ctx)
 		moved, applied := l.applyVFS(ctx, batch.VFS)
 		switch {
 		case applied:
 			l.applyFailures = 0
+			if describedBefore {
+				l.retireRemovedShows(ctx, before)
+			}
 			// Silo matched these files under their old season and episode
 			// numbers, so it has to read the show again.
 			batch.Refresh.Series = append(slices.Clone(batch.Refresh.Series), moved...)
@@ -275,6 +280,108 @@ func (l *liveUpdates) Apply(ctx context.Context, batch live.Batch) live.Batch {
 		l.refreshChanged(ctx, batch.Refresh)
 	}
 	return retry
+}
+
+// showsBefore describes the VFS before a change is applied, when Silo
+// refreshes are on. It reports false when there is nothing to compare with.
+func (l *liveUpdates) showsBefore(ctx context.Context) (vfsShows, bool) {
+	if l.admin == nil {
+		return vfsShows{}, false
+	}
+	shows, err := l.describeShows(ctx)
+	if err != nil {
+		return vfsShows{}, false
+	}
+	return shows, true
+}
+
+// retireRemovedShows releases the episode IDs of every Silo show the last
+// change retired by moving its series into other shows.
+//
+// When Shoko moves a series into another group, the old group's folder leaves
+// the VFS and the series' files appear under the group that now holds them.
+// Silo makes a new show for those files or adds them to the existing one, but
+// the old show keeps its episodes' TMDB, TVDB and IMDb IDs until Silo deletes
+// it, which takes at least its missing-file grace period and does not always
+// happen. Silo stores each of those IDs on one episode only, so the episodes of
+// the show that now holds the files cannot take them and keep "Episode N"
+// placeholders. Releasing the IDs right away lets the refresh that follows the
+// change fill those episodes in.
+//
+// The old show is looked up now, before Silo scans the change, while Silo still
+// lists it under its folder. Nothing is deleted: the old show, its titles and
+// any watch state stay until Silo removes the show itself.
+func (l *liveUpdates) retireRemovedShows(ctx context.Context, before vfsShows) {
+	after, err := l.describeShows(ctx)
+	if err != nil {
+		return
+	}
+	for _, marker := range regroupedShows(before, after) {
+		l.mu.Lock()
+		l.folders[marker] = before.folders[marker]
+		l.mu.Unlock()
+		contentID, err := l.showContentID(ctx, marker)
+		if err == nil && contentID == "" {
+			// Silo never scanned the show, or already removed it.
+			continue
+		}
+		released := 0
+		if err == nil {
+			released, _, err = l.admin.ReleaseEpisodeIDs(ctx, contentID)
+		}
+		l.mu.Lock()
+		delete(l.shows, marker)
+		delete(l.folders, marker)
+		l.mu.Unlock()
+		l.status.update(func(s *liveStatus) {
+			s.lastRetireAt, s.lastRetireShow, s.lastRetireError = time.Now(), marker, ""
+			if err != nil {
+				s.lastRetireError = err.Error()
+				return
+			}
+			s.retiredShows++
+			s.releasedIDs += released
+		})
+		switch {
+		case err != nil && ctx.Err() == nil:
+			logf("shokoanime: could not release the episode IDs of the Silo show for %s, whose series moved to another show: %v", marker, err)
+		case err == nil:
+			logf("shokoanime: released the IDs of %d episodes of the Silo show for %s, whose series moved to another show", released, marker)
+		}
+	}
+}
+
+// regroupedShows returns, in order, the shows a change retired by moving their
+// series into other shows: the show's marker is gone, no show is left in its
+// folder, and at least one of its series is now in another show. A show that
+// only lost its files, as when its last file is replaced or deleted, is not
+// one of them; Silo keeps or removes that show by itself.
+func regroupedShows(before, after vfsShows) []string {
+	folders := make(map[string]struct{}, len(after.folders))
+	for _, folder := range after.folders {
+		folders[folder.path] = struct{}{}
+	}
+	moved := make(map[string]bool)
+	for series, marker := range before.bySeries {
+		if now, ok := after.bySeries[series]; ok && now != marker {
+			moved[marker] = true
+		}
+	}
+	var retired []string
+	for marker, folder := range before.folders {
+		if _, ok := after.folders[marker]; ok {
+			continue
+		}
+		if _, ok := folders[folder.path]; ok {
+			// Another show took over the folder, and Silo keeps its show for it.
+			continue
+		}
+		if moved[marker] {
+			retired = append(retired, marker)
+		}
+	}
+	slices.Sort(retired)
+	return retired
 }
 
 // applyVFS applies changes to the VFS. It returns the series whose links

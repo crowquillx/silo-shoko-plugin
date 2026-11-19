@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // AdminConfig names a Silo server and an API key of an administrator, which
@@ -33,6 +35,11 @@ func (c AdminConfig) Validate() error {
 type Admin struct {
 	config AdminConfig
 	http   *http.Client
+
+	// profileMu guards profile, the administrator's profile the catalog
+	// endpoints are read as. Silo requires an X-Profile-Id header on them.
+	profileMu sync.Mutex
+	profile   string
 }
 
 // NewAdmin returns an admin client. A nil httpClient uses a default with a
@@ -187,7 +194,111 @@ func (a *Admin) Refresh(ctx context.Context, contentID string) (found bool, err 
 	return status != http.StatusNotFound, nil
 }
 
+// ReleaseEpisodeIDs clears the TMDB, TVDB and IMDb IDs on every episode of a
+// show that Silo still lists. Silo keeps each of those IDs on one episode
+// only, so a show that went away when Shoko regrouped its series would
+// otherwise keep them, and the show that now holds the files could not store
+// them: its episodes would keep Silo's "Episode N" placeholders until Silo
+// deleted the old show. Only the IDs change; titles, watch state and the show
+// itself stay as they are. found is false when Silo has no such show.
+func (a *Admin) ReleaseEpisodeIDs(ctx context.Context, seriesID string) (released int, found bool, err error) {
+	var seasons struct {
+		Items []struct {
+			SeasonNumber int `json:"season_number"`
+		} `json:"items"`
+	}
+	status, err := a.do(ctx, http.MethodGet, "/api/v2/catalog/series/"+url.PathEscape(seriesID)+"/seasons", nil, &seasons)
+	if err != nil {
+		return 0, false, err
+	}
+	if status == http.StatusNotFound {
+		return 0, false, nil
+	}
+	cleared := ""
+	for _, season := range seasons.Items {
+		var episodes struct {
+			Items []struct {
+				ContentID string `json:"content_id"`
+				ImdbID    string `json:"imdb_id"`
+				TmdbID    string `json:"tmdb_id"`
+				TvdbID    string `json:"tvdb_id"`
+			} `json:"items"`
+		}
+		status, err := a.do(ctx, http.MethodGet, fmt.Sprintf("/api/v2/catalog/series/%s/seasons/%d/episodes", url.PathEscape(seriesID), season.SeasonNumber), nil, &episodes)
+		if err != nil {
+			return released, true, err
+		}
+		if status == http.StatusNotFound {
+			continue
+		}
+		for _, episode := range episodes.Items {
+			if episode.ContentID == "" || (episode.ImdbID == "" && episode.TmdbID == "" && episode.TvdbID == "") {
+				continue
+			}
+			// An admin edit changes only the fields it names and locks nothing,
+			// so the episode can take IDs again if its show comes back.
+			body := map[string]*string{"imdb_id": &cleared, "tmdb_id": &cleared, "tvdb_id": &cleared}
+			status, err := a.do(ctx, http.MethodPatch, "/api/v2/admin/items/"+url.PathEscape(episode.ContentID)+"/metadata", body, nil)
+			if err != nil {
+				return released, true, err
+			}
+			if status != http.StatusNotFound {
+				released++
+			}
+		}
+	}
+	return released, true, nil
+}
+
+// catalogProfile returns the profile to read Silo's catalog as: the API key
+// owner's first profile that is not a child's, has no PIN and is not limited
+// to some libraries, or else their first profile that is not a child's. Silo's
+// catalog endpoints require a profile and show only what it may see. It is
+// looked up once; "" means Silo listed no usable profile, and requests go
+// without one.
+func (a *Admin) catalogProfile(ctx context.Context) (string, error) {
+	a.profileMu.Lock()
+	defer a.profileMu.Unlock()
+	if a.profile != "" {
+		return a.profile, nil
+	}
+	var response struct {
+		Items []struct {
+			ID                string   `json:"id"`
+			IsChild           bool     `json:"is_child"`
+			HasPIN            bool     `json:"has_pin"`
+			AllowedLibraryIDs []string `json:"allowed_library_ids"`
+		} `json:"items"`
+	}
+	status, err := a.do(ctx, http.MethodGet, "/api/v2/profiles", nil, &response)
+	if err != nil || status == http.StatusNotFound {
+		return "", err
+	}
+	fallback := ""
+	for _, profile := range response.Items {
+		if profile.ID == "" || profile.IsChild {
+			continue
+		}
+		if !profile.HasPIN && len(profile.AllowedLibraryIDs) == 0 {
+			a.profile = profile.ID
+			return a.profile, nil
+		}
+		if fallback == "" {
+			fallback = profile.ID
+		}
+	}
+	a.profile = fallback
+	return a.profile, nil
+}
+
 func (a *Admin) do(ctx context.Context, method, apiPath string, body any, target any) (int, error) {
+	profile := ""
+	if strings.HasPrefix(apiPath, "/api/v2/catalog") {
+		var err error
+		if profile, err = a.catalogProfile(ctx); err != nil {
+			return 0, err
+		}
+	}
 	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 	var reader io.Reader
@@ -204,6 +315,9 @@ func (a *Admin) do(ctx context.Context, method, apiPath string, body any, target
 	}
 	request.Header.Set("Authorization", "Bearer "+a.config.APIKey)
 	request.Header.Set("Accept", "application/json")
+	if profile != "" {
+		request.Header.Set("X-Profile-Id", profile)
+	}
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}

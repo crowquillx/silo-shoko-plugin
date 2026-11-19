@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -85,5 +86,79 @@ func TestAdminFindsAndRefreshesAShow(t *testing.T) {
 	var siloErr *Error
 	if !errors.As(err, &siloErr) || siloErr.Kind != InvalidCredential {
 		t.Fatalf("Libraries with a wrong key = %v", err)
+	}
+}
+
+func TestAdminReleasesEpisodeIDs(t *testing.T) {
+	type patch struct {
+		id   string
+		body map[string]*string
+	}
+	var patches []patch
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/v2/catalog") && r.Header.Get("X-Profile-Id") != "p-main" {
+			// Silo requires a profile on its catalog endpoints.
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			return
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v2/profiles":
+			_, _ = w.Write([]byte(`{"items":[
+				{"id":"p-kid","is_child":true},
+				{"id":"p-pin","has_pin":true},
+				{"id":"p-main","allowed_library_ids":[]}
+			]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v2/catalog/series/old-show/seasons":
+			_, _ = w.Write([]byte(`{"items":[{"season_number":0},{"season_number":1},{"season_number":2}]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v2/catalog/series/old-show/seasons/0/episodes":
+			_, _ = w.Write([]byte(`{"items":[{"content_id":"s0e1","tmdb_id":"","tvdb_id":"","imdb_id":""}]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v2/catalog/series/old-show/seasons/1/episodes":
+			_, _ = w.Write([]byte(`{"items":[
+				{"content_id":"s1e1","tmdb_id":"101","tvdb_id":"201"},
+				{"content_id":"s1e2","imdb_id":"tt1"},
+				{"content_id":"gone","tmdb_id":"103"}
+			]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v2/catalog/series/old-show/seasons/2/episodes":
+			http.NotFound(w, r)
+		case r.Method == http.MethodPatch && r.URL.Path == "/api/v2/admin/items/gone/metadata":
+			http.NotFound(w, r)
+		case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/api/v2/admin/items/") && strings.HasSuffix(r.URL.Path, "/metadata"):
+			var body map[string]*string
+			if json.NewDecoder(r.Body).Decode(&body) != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v2/admin/items/"), "/metadata")
+			patches = append(patches, patch{id, body})
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	admin := NewAdmin(AdminConfig{BaseURL: server.URL, APIKey: "sa_admin"}, nil)
+	ctx := context.Background()
+
+	released, found, err := admin.ReleaseEpisodeIDs(ctx, "old-show")
+	if err != nil || !found || released != 2 {
+		t.Fatalf("ReleaseEpisodeIDs = %d, %v, %v", released, found, err)
+	}
+	if len(patches) != 2 || patches[0].id != "s1e1" || patches[1].id != "s1e2" {
+		t.Fatalf("patched %+v; want s1e1 and s1e2 only, not episodes without IDs", patches)
+	}
+	for _, p := range patches {
+		// Each edit names exactly the three ID fields, set to empty strings, and
+		// no locked_fields, so nothing is locked.
+		if len(p.body) != 3 {
+			t.Fatalf("patch for %s = %v", p.id, p.body)
+		}
+		for _, field := range []string{"imdb_id", "tmdb_id", "tvdb_id"} {
+			if value, ok := p.body[field]; !ok || value == nil || *value != "" {
+				t.Fatalf("patch for %s sets %s to %v", p.id, field, value)
+			}
+		}
+	}
+	if released, found, err := admin.ReleaseEpisodeIDs(ctx, "unknown"); err != nil || found || released != 0 {
+		t.Fatalf("ReleaseEpisodeIDs for an unknown show = %d, %v, %v", released, found, err)
 	}
 }
