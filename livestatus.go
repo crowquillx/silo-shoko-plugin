@@ -50,6 +50,14 @@ type liveStatus struct {
 	lastRefreshAt    time.Time
 	lastRefreshShow  string
 	lastRefreshError string
+
+	// retiredShows counts Silo shows whose episode IDs were released after
+	// their Shoko group left the VFS, and releasedIDs their episodes.
+	retiredShows    int
+	releasedIDs     int
+	lastRetireAt    time.Time
+	lastRetireShow  string
+	lastRetireError string
 }
 
 func (s *liveStatus) update(fn func(*liveStatus)) {
@@ -112,6 +120,11 @@ func (s *liveStatus) report(pending int) map[string]any {
 		"last_refresh_at":    at(s.lastRefreshAt),
 		"last_refresh_show":  s.lastRefreshShow,
 		"last_refresh_error": s.lastRefreshError,
+		"retired_shows":      s.retiredShows,
+		"released_episodes":  s.releasedIDs,
+		"last_retire_at":     at(s.lastRetireAt),
+		"last_retire_show":   s.lastRetireShow,
+		"last_retire_error":  s.lastRetireError,
 	}
 }
 
