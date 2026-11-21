@@ -373,6 +373,14 @@ func IsNotFound(err error) bool {
 	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound
 }
 
+// IsHidden reports whether err is Shoko answering 403 to an ID lookup, which
+// daily servers do for a file, series, group or episode that the API key's
+// user may not see because of its restricted tags.
+func IsHidden(err error) bool {
+	var httpErr *HTTPError
+	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusForbidden
+}
+
 func (c *Client) Series(ctx context.Context, seriesID int) (Series, error) {
 	if seriesID < 1 {
 		return Series{}, errors.New("shoko: series ID must be positive")

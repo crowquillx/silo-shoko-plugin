@@ -63,6 +63,16 @@ func TestTranslate(t *testing.T) {
 			Batch{Refresh: Refresh{Series: []int{3}, Episodes: []int{30}}}, true,
 		},
 		{
+			// Daily servers since 6.0.0-dev.605 name events in camelCase.
+			"daily camelCase image event without a reason", "metadata:episode.imageAdded", `{"ShokoSeriesIDs":[3],"ShokoEpisodeIDs":[30]}`,
+			Batch{Refresh: Refresh{Series: []int{3}, Episodes: []int{30}}}, true,
+		},
+		{
+			"daily camelCase group image event", "group:group.imageUpdated", `{"GroupID":5}`,
+			Batch{Refresh: Refresh{Groups: []int{5}}}, true,
+		},
+		{"daily camelCase hidden episode", "metadata:episode.hiddenChanged", `{"ShokoSeriesIDs":[3],"ShokoEpisodeIDs":[30]}`, Batch{}, false},
+		{
 			"daily combined reasons as flags", "metadata:series.18", `{"Reason":18,"ShokoSeriesIDs":[3]}`,
 			Batch{VFS: reconcile.Changes{Series: []int{3}}, Refresh: Refresh{Series: []int{3}}}, true,
 		},

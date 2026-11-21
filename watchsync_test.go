@@ -682,3 +682,13 @@ func TestListRemoteStateFaults(t *testing.T) {
 		t.Fatalf("progress request: response = %v, err = %v", response, err)
 	}
 }
+
+// Daily Shoko answers 403 for an episode the profile's user may not see
+// because of its restricted tags, which retrying cannot change.
+func TestEpisodeFaultNamesAnEpisodeShokoHides(t *testing.T) {
+	err := &shoko.HTTPError{Endpoint: "/Episode/42/Watched/true", StatusCode: http.StatusForbidden}
+	fault := episodeFault(42, err, "mark watched")
+	if fault.GetCode() != pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_PERMANENT || !strings.Contains(fault.GetSafeMessage(), "restricted tags") {
+		t.Fatalf("fault = %v", fault)
+	}
+}

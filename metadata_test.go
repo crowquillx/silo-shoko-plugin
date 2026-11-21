@@ -420,6 +420,38 @@ func TestShowTitleWithoutALibraryLanguageKeepsNoLanguage(t *testing.T) {
 	}
 }
 
+// Daily Shoko drops AniDB's generic titles and makes a name up in the first
+// language of its episode title settings, which no pattern can recognize. The
+// episode then has no AniDB titles, which is what gives the name away.
+func TestEpisodeTitleReplacesNamesShokoMadeUp(t *testing.T) {
+	decode := func(raw string) shoko.Episode {
+		t.Helper()
+		var episode shoko.Episode
+		if err := json.Unmarshal([]byte(raw), &episode); err != nil {
+			t.Fatal(err)
+		}
+		return episode
+	}
+	const tmdb = `"TMDB":{"Episodes":[{"Title":"The Return"}]}`
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"made up in Japanese", `{"Name":"第3話","HasCustomName":false,"AniDB":{"Type":"Normal","EpisodeNumber":3,"Titles":[]},` + tmdb + `}`, "The Return"},
+		{"made up for a special", `{"Name":"Special 1","AniDB":{"Type":"Special","EpisodeNumber":1,"Titles":[]},` + tmdb + `}`, "The Return"},
+		{"made up without a TMDB title", `{"Name":"Folge 3","AniDB":{"Titles":[]}}`, "Folge 3"},
+		{"named by a Shoko user", `{"Name":"Mein Titel","HasCustomName":true,"AniDB":{"Titles":[]},` + tmdb + `}`, "Mein Titel"},
+		{"real AniDB title", `{"Name":"第3話 旅立ち","AniDB":{"Titles":[{"Name":"第3話 旅立ち","Language":"ja","Type":"Official","Source":"AniDB"}]},` + tmdb + `}`, "第3話 旅立ち"},
+		{"no AniDB data asked for", `{"Name":"Folge 3",` + tmdb + `}`, "Folge 3"},
+	}
+	for _, tt := range tests {
+		if got := episodeTitle(decode(tt.raw)); got != tt.want {
+			t.Errorf("%s: episodeTitle = %q, want %q", tt.name, got, tt.want)
+		}
+	}
+}
+
 func TestEpisodeTitleReplacesAniDBPlaceholders(t *testing.T) {
 	withTMDB := func(name, tmdb string) shoko.Episode {
 		return shoko.Episode{Name: name, TMDB: json.RawMessage(`{"Episodes":[{"Title":` + strconv.Quote(tmdb) + `}]}`)}

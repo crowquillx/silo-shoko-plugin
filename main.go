@@ -1050,7 +1050,42 @@ func (s *scheduledTaskServer) Run(ctx context.Context, req *pluginv1.RunSchedule
 	if live, err := structpb.NewValue(s.runtime.liveReport()); err == nil {
 		output.Fields["live"] = live
 	}
+	if user := s.runtime.shokoUserReport(ctx); user != nil {
+		if value, err := structpb.NewValue(user); err == nil {
+			output.Fields["shoko_user"] = value
+		}
+	}
 	return &pluginv1.RunScheduledTaskResponse{Output: output}, nil
+}
+
+// shokoUserReportTimeout bounds the task output's user lookup, so a slow
+// Shoko does not hold up a task that has already done its work.
+const shokoUserReportTimeout = 2 * time.Second
+
+// shokoUserReport describes the Shoko user the API key belongs to for the
+// task output, with a warning when Shoko hides tags from it: the VFS then
+// leaves out every show with one of those tags. It is nil when Shoko cannot
+// say in time, which never fails or holds up the task.
+func (s *runtimeServer) shokoUserReport(ctx context.Context) map[string]any {
+	_, client, _, err := s.state()
+	if err != nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, shokoUserReportTimeout)
+	defer cancel()
+	user, err := client.CurrentUser(ctx)
+	if err != nil {
+		return nil
+	}
+	report := map[string]any{
+		"name":            user.Username,
+		"admin":           user.IsAdmin,
+		"restricted_tags": len(user.RestrictedTags),
+	}
+	if len(user.RestrictedTags) > 0 {
+		report["warning"] = fmt.Sprintf("Shoko hides %d tags from this user, so the VFS leaves out every show with one of them. Use an API key of a user without restricted tags to include them.", len(user.RestrictedTags))
+	}
+	return report
 }
 
 const (
@@ -1555,9 +1590,10 @@ func groupEpisodes(ctx context.Context, list func(context.Context, int) ([]shoko
 	episodesBySeries := make(map[int][]shoko.Episode, len(members))
 	for _, series := range members {
 		episodes, err := list(ctx, series.IDs.ID)
-		if shoko.IsNotFound(err) {
-			// A series Shoko just removed still holds its season in the VFS
-			// until the removal is applied; it has no episodes to describe.
+		if shoko.IsNotFound(err) || shoko.IsHidden(err) {
+			// A series Shoko just removed, or now hides from the API key's
+			// user, still holds its season in the VFS until the change is
+			// applied; it has no episodes to describe.
 			continue
 		}
 		if err != nil {

@@ -29,6 +29,10 @@ type VersionSet struct {
 type User struct {
 	ID       int    `json:"id"`
 	Username string `json:"username"`
+	IsAdmin  bool   `json:"isAdmin"`
+	// RestrictedTags are the tags whose groups and series Shoko hides from
+	// the user.
+	RestrictedTags []int `json:"restrictedTags"`
 }
 
 type listResult[T any] struct {
@@ -306,6 +310,8 @@ type Episode struct {
 	Watched string `json:"watched,omitempty"`
 	// WatchCount is how many times the API key's user watched the episode.
 	WatchCount int `json:"watchCount,omitempty"`
+	// HasCustomName is set when a Shoko user named the episode.
+	HasCustomName bool `json:"hasCustomName"`
 }
 
 // WatchedAt returns when the API key's user last watched the episode.

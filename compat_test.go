@@ -353,6 +353,50 @@ func TestReconcileTaskFinishesInBackgroundWithoutAutoscan(t *testing.T) {
 	}
 }
 
+// The task output names the API key's Shoko user and warns when Shoko hides
+// tags from it, since the VFS then leaves out every show with one of them.
+func TestReconcileTaskReportsARestrictedShokoUser(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		user    string
+		warning bool
+	}{
+		{"unrestricted", `{"ID":1,"Username":"admin","IsAdmin":true,"RestrictedTags":[]}`, false},
+		{"restricted", `{"ID":2,"Username":"family","IsAdmin":false,"RestrictedTags":[12,35]}`, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := shokoGenerations[1].handler(t)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/v3/User/Current" {
+					w.Header().Set("Content-Type", "application/json")
+					fmt.Fprint(w, tt.user)
+					return
+				}
+				handler.ServeHTTP(w, r)
+			}))
+			defer server.Close()
+			source, _ := mediaFixture(t)
+			runtime := configuredRuntime(t, server.URL, compatAPIKey, fmt.Sprintf(`{"1":%q}`, source), filepath.Join(t.TempDir(), "vfs"))
+			task := &scheduledTaskServer{runtime: runtime}
+			output, err := task.Run(context.Background(), &pluginv1.RunScheduledTaskRequest{TaskKey: "reconcile"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			user, ok := output.GetOutput().AsMap()["shoko_user"].(map[string]any)
+			if !ok {
+				t.Fatalf("task output has no shoko_user: %#v", output.GetOutput().AsMap())
+			}
+			warning, hasWarning := user["warning"].(string)
+			if hasWarning != tt.warning {
+				t.Fatalf("shoko_user = %#v, want a warning: %v", user, tt.warning)
+			}
+			if tt.warning && (user["restricted_tags"] != float64(2) || user["name"] != "family" || !strings.Contains(warning, "hides 2 tags")) {
+				t.Fatalf("shoko_user = %#v", user)
+			}
+		})
+	}
+}
+
 func TestNextTaskRunReportsBackgroundFailure(t *testing.T) {
 	release := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

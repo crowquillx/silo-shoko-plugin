@@ -676,14 +676,17 @@ func sortedKeys[T any](values map[int]T) []int {
 	return keys
 }
 
-// fetched is one ID lookup. missing means Shoko answered 404.
+// fetched is one ID lookup. missing means Shoko answered 404, or 403 for an
+// entry the API key's user may not see.
 type fetched[T any] struct {
 	value   T
 	missing bool
 }
 
 // fetchAll looks up ids with at most limit requests in flight. A 404 is a
-// result, not an error; any other error fails the whole call.
+// result, not an error, and so is a 403: Shoko leaves an entry the user may
+// not see out of its lists, so the VFS leaves it out too. Any other error
+// fails the whole call.
 func fetchAll[T any](ctx context.Context, limit int, ids []int, get func(context.Context, int) (T, error)) (map[int]fetched[T], error) {
 	results := make(map[int]fetched[T], len(ids))
 	if len(ids) == 0 {
@@ -713,7 +716,7 @@ func fetchAll[T any](ctx context.Context, limit int, ids []int, get func(context
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
-			case shoko.IsNotFound(err):
+			case shoko.IsNotFound(err) || shoko.IsHidden(err):
 				results[id] = fetched[T]{missing: true}
 			case err != nil:
 				if firstErr == nil {

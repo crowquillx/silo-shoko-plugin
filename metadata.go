@@ -497,11 +497,21 @@ func episodeRecord(season, number int, episode shoko.Episode) *pluginv1.EpisodeR
 // title it does not know yet, such as "Episode 12" or "TBA".
 var placeholderEpisodeTitle = regexp.MustCompile(`(?i)^\s*(episode\s*\d+(\.\d+)?|tba|tbd|to be announced)\s*$`)
 
+// synthesizedEpisodeName reports whether Shoko made the episode's name up.
+// Daily servers drop AniDB's generic titles, such as "Episode 5", and name an
+// episode left with no title in the first language of the episode title
+// settings, such as "第5話" or "Folge 5", which no pattern can know. Such an
+// episode has no AniDB titles at all, unless a Shoko user named it. Stable
+// servers keep AniDB's generic titles, so placeholderEpisodeTitle finds them.
+func synthesizedEpisodeName(episode shoko.Episode) bool {
+	return !episode.HasCustomName && episode.AniDB != nil && len(episode.AniDB.Titles) == 0
+}
+
 // episodeTitle is Shoko's name for the episode, unless that is a placeholder
-// and a linked TMDB episode has a real title.
+// or made up by Shoko, and a linked TMDB episode has a real title.
 func episodeTitle(episode shoko.Episode) string {
 	name := strings.TrimSpace(episode.Name)
-	if name != "" && !placeholderEpisodeTitle.MatchString(name) {
+	if name != "" && !placeholderEpisodeTitle.MatchString(name) && !synthesizedEpisodeName(episode) {
 		return name
 	}
 	for _, title := range episode.TMDBTitles() {

@@ -44,6 +44,10 @@ type fakeShoko struct {
 	// pageCap, if set, is the most files a page of the list holds, whatever
 	// size was asked for.
 	pageCap int
+	// hiddenSeries are series the API key's user may not see, as Shoko hides
+	// series with a restricted tag: lookups of them and their files answer
+	// 403, and lists leave them out.
+	hiddenSeries map[int]bool
 }
 
 type fakeFile struct {
@@ -75,13 +79,14 @@ func (f *fakeShoko) handler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(value)
 	}
+	forbidden := func() { http.Error(w, "Accessing it is not allowed for the current user", http.StatusForbidden) }
 	switch {
 	case path == "/ManagedFolder":
 		write([]map[string]any{{"id": 1, "name": "a", "path": "/x"}})
 	case path == "/ManagedFolder/1/File":
 		list := make([]any, 0)
 		for _, fileID := range sortedKeys(f.files) {
-			if !f.unlisted[fileID] {
+			if !f.unlisted[fileID] && !f.hiddenSeries[f.files[fileID].series] {
 				list = append(list, f.fileJSON(fileID))
 			}
 		}
@@ -97,11 +102,19 @@ func (f *fakeShoko) handler(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
+		if f.hiddenSeries[f.files[id].series] {
+			forbidden()
+			return
+		}
 		write(f.fileJSON(id))
 	case parts[0] == "Series" && len(parts) == 2:
 		group, ok := f.seriesGroup[id]
 		if !ok {
 			http.NotFound(w, r)
+			return
+		}
+		if f.hiddenSeries[id] {
+			forbidden()
 			return
 		}
 		write(f.seriesJSON(id, group))
@@ -128,7 +141,7 @@ func (f *fakeShoko) handler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		for _, seriesID := range order {
-			if group, ok := f.seriesGroup[seriesID]; ok && group == id {
+			if group, ok := f.seriesGroup[seriesID]; ok && group == id && !f.hiddenSeries[seriesID] {
 				members = append(members, f.seriesJSON(seriesID, id))
 			}
 		}
@@ -343,6 +356,59 @@ func changedLinks(outcome Outcome) int {
 		}
 	}
 	return changed
+}
+
+// Daily Shoko answers 403 for an entry the API key's user may not see, such
+// as a series that has just been given a restricted tag. It leaves that entry
+// out of its lists, so the VFS leaves it out too instead of failing the
+// update, which would otherwise be retried forever.
+func TestApplyDropsWhatShokoNowHides(t *testing.T) {
+	sourceRoot := filepath.Join(t.TempDir(), "source")
+	outputRoot := filepath.Join(t.TempDir(), "vfs")
+	if err := os.MkdirAll(sourceRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"a.mkv", "b.mkv"} {
+		if err := os.WriteFile(filepath.Join(sourceRoot, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fake := &fakeShoko{
+		files:       map[int]fakeFile{9: {path: "a.mkv", series: 7, episode: 42}, 10: {path: "b.mkv", series: 8, episode: 43}},
+		seriesGroup: map[int]int{7: 3, 8: 4},
+		episodes:    map[int][2]int{42: {7, 1}, 43: {8, 1}},
+		requests:    make(map[string]int),
+	}
+	server := httptest.NewServer(http.HandlerFunc(fake.handler))
+	defer server.Close()
+	client, err := shoko.NewClient(shoko.Config{BaseURL: server.URL, APIKey: "key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconciler, err := vfs.NewReconciler(vfs.Config{Root: outputRoot, AllowedSourceRoots: []string{sourceRoot}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, err := New(Config{Client: client, Reconciler: reconciler, ManagedFolderMap: map[int]string{1: sourceRoot}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if outcome, err := engine.Step(ctx, 0); err != nil || !outcome.Complete {
+		t.Fatalf("full crawl = %#v, %v", outcome, err)
+	}
+	if got := vfsLinks(t, outputRoot); len(got) != 2 {
+		t.Fatalf("links after crawl = %v", got)
+	}
+
+	fake.update(func() { fake.hiddenSeries = map[int]bool{8: true} })
+	if _, err := engine.Apply(ctx, Changes{Files: []int{10}, Series: []int{8}, Groups: []int{4}}); err != nil {
+		t.Fatalf("Apply after Shoko hid a series = %v", err)
+	}
+	got := vfsLinks(t, outputRoot)
+	if len(got) != 1 || !strings.Contains(got[0], "[Shoko File=9]") {
+		t.Fatalf("links after Shoko hid series 8 = %v", got)
+	}
 }
 
 func TestApplyWithOtherSettingsNeedsACrawl(t *testing.T) {

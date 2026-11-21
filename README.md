@@ -7,7 +7,7 @@ Part of [Crowquillx Silo Plugins](https://github.com/crowquillx/crowquillx-silo-
 ## Install
 
 1. Add the [Crowquillx catalog](https://github.com/crowquillx/crowquillx-silo-plugins#install) in **Administration → Plugins → Catalog** and install **ShokoAnime VFS**.
-2. In **Installed**, open the plugin's **Configure** button or settings gear, then **Global Configuration**. Enter the Shoko server URL, Shoko API key and a writable **VFS output root** separate from your media folders.
+2. In **Installed**, open the plugin's **Configure** button or settings gear, then **Global Configuration**. Enter the Shoko server URL, Shoko API key and a writable **VFS output root** separate from your media folders. The VFS holds what the API key's Shoko user can see, so a user with restricted tags leaves out every show with one of them; the **Reconcile Shoko VFS** task output names the user under `shoko_user` and warns when it has restricted tags.
 3. Set **Managed-folder path map (JSON)** to map Shoko's numeric managed-folder IDs to media paths visible to both Silo and the plugin. For example:
 
 ```json
@@ -65,7 +65,7 @@ Regular episodes go in their series' season, and specials, credits, trailers and
 
 ## Metadata
 
-Shows get their dates, status, genres, studios, cast and AniDB rating from all of their Shoko series, and their title aliases from the group's main series. A show's title is Shoko's name for the group, so Shoko's language settings decide it; the plugin tells Silo it is in the library's language, so Silo shows it instead of an AniDB synonym. The original title is the AniDB main title. Episodes use Shoko's episode titles, except that AniDB placeholders such as `Episode 12` or `TBA` are replaced by the linked TMDB episode's title when it has a real one. Genres are the tags Shoko classifies as genres. The content rating is the strictest US rating of the linked TMDB shows, or `18+` when AniDB marks a series restricted. Seasons get their series' overview and air date, and episodes their air date, still and TMDB rating.
+Shows get their dates, status, genres, studios, cast and AniDB rating from all of their Shoko series, and their title aliases from the group's main series. A show's title is Shoko's name for the group, so Shoko's language settings decide it; the plugin tells Silo it is in the library's language, so Silo shows it instead of an AniDB synonym. The original title is the AniDB main title. Episodes use Shoko's episode titles, except that AniDB placeholders such as `Episode 12` or `TBA` are replaced by the linked TMDB episode's title when it has a real one. Daily Shoko drops these placeholders and makes a name up in the first language of its episode title settings, such as `第12話`; that name is replaced the same way, unless a Shoko user gave the episode its name. Genres are the tags Shoko classifies as genres. The content rating is the strictest US rating of the linked TMDB shows, or `18+` when AniDB marks a series restricted. Seasons get their series' overview and air date, and episodes their air date, still and TMDB rating.
 
 The AniDB rating appears in Silo once an administrator turns on the AniDB rating source the plugin declares.
 

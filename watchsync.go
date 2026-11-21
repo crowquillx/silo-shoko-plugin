@@ -401,6 +401,11 @@ func episodeFault(episodeID int, err error, action string) *pluginv1.WatchSyncFa
 	if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound {
 		fault.SafeMessage = fmt.Sprintf("Shoko has no episode %d; reconcile the Shoko VFS", episodeID)
 	}
+	if shoko.IsHidden(err) {
+		// Retrying cannot help until the user's restricted tags change.
+		fault.Code = pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_PERMANENT
+		fault.SafeMessage = fmt.Sprintf("the profile's Shoko user may not see episode %d because of its restricted tags", episodeID)
+	}
 	fmt.Fprintf(os.Stderr, "shokoanime: could not %s Shoko episode %d: %s\n", action, episodeID, fault.GetSafeMessage())
 	return fault
 }
