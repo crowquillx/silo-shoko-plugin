@@ -1143,24 +1143,25 @@ func taskOutput(dryRun, complete bool, phase string, filesFetched, seriesFetched
 		})
 	}
 	return structpb.NewStruct(map[string]any{
-		"message":           taskMessage(dryRun, complete, filesFetched, len(plan.Entries), result),
-		"dry_run":           dryRun,
-		"complete":          complete,
-		"queued":            !complete,
-		"phase":             phase,
-		"files_fetched":     filesFetched,
-		"series_fetched":    seriesFetched,
-		"episodes_fetched":  episodesFetched,
-		"planned_entries":   len(plan.Entries),
-		"action_count":      len(result.Actions),
-		"actions_returned":  len(actions),
-		"actions_truncated": len(result.Actions) - len(actions),
-		"actions":           actions,
-		"failure_count":     len(result.Failures),
-		"failures":          failures,
-		"diagnostic_count":  len(plan.Diagnostics),
-		"themes":            themeOutput(result.Themes),
-		"diagnostics":       diagnostics(plan.Diagnostics),
+		"message":            taskMessage(dryRun, complete, filesFetched, len(plan.Entries), result),
+		"dry_run":            dryRun,
+		"complete":           complete,
+		"queued":             !complete,
+		"phase":              phase,
+		"files_fetched":      filesFetched,
+		"series_fetched":     seriesFetched,
+		"episodes_fetched":   episodesFetched,
+		"planned_entries":    len(plan.Entries),
+		"action_count":       len(result.Actions),
+		"actions_returned":   len(actions),
+		"actions_truncated":  len(result.Actions) - len(actions),
+		"actions":            actions,
+		"failure_count":      len(result.Failures),
+		"failures":           failures,
+		"diagnostic_count":   len(plan.Diagnostics),
+		"themes":             themeOutput(result.Themes),
+		"diagnostics":        diagnostics(plan.Diagnostics),
+		"diagnostic_summary": diagnosticSummary(plan.Diagnostics),
 	})
 }
 
@@ -1903,6 +1904,32 @@ func episodeIDs(episode shoko.Episode) map[string]string {
 
 func idsStruct(ids map[string]string) *structpb.Struct {
 	return stringStruct(ids)
+}
+
+// diagnosticSummary counts the diagnostics by message, most common first, as
+// the list itself is cut short. A managed folder whose share is down gives
+// every one of its files the same warning, which reads here as one line.
+func diagnosticSummary(values []topology.Diagnostic) []any {
+	type key struct{ message, severity string }
+	counts := make(map[key]int)
+	for _, value := range values {
+		counts[key{value.Message, value.Severity}]++
+	}
+	keys := make([]key, 0, len(counts))
+	for k := range counts {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if counts[keys[i]] != counts[keys[j]] {
+			return counts[keys[i]] > counts[keys[j]]
+		}
+		return keys[i].message < keys[j].message
+	})
+	result := make([]any, 0, len(keys))
+	for _, k := range keys {
+		result = append(result, map[string]any{"message": k.message, "severity": k.severity, "count": counts[k]})
+	}
+	return result
 }
 
 func diagnostics(values []topology.Diagnostic) []any {

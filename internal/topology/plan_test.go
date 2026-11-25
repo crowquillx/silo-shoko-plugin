@@ -290,3 +290,48 @@ func TestBuildNumbersGroupSeasonsInShokoOrder(t *testing.T) {
 		}
 	}
 }
+
+func TestChooseLocationPrefersTheFileItselfOverItsLinks(t *testing.T) {
+	roots := map[int]string{1: "/media/a", 2: "/media/b"}
+	choose := func(locations ...shoko.Location) int {
+		t.Helper()
+		location, ok, _ := chooseLocation(shoko.File{ID: 9, Locations: locations}, roots)
+		if !ok {
+			t.Fatal("no location chosen")
+		}
+		return location.ID
+	}
+
+	// A stable server sends no file groups: the first accessible location.
+	if got := choose(
+		shoko.Location{ID: 1, ManagedFolderID: 3, IsAccessible: true},
+		shoko.Location{ID: 2, ManagedFolderID: 1},
+		shoko.Location{ID: 3, ManagedFolderID: 2, IsAccessible: true},
+		shoko.Location{ID: 4, ManagedFolderID: 1, IsAccessible: true},
+	); got != 3 {
+		t.Fatalf("stable server's locations: chose %d, want 3", got)
+	}
+	// A symbolic link listed first loses to the file it leads to.
+	if got := choose(
+		shoko.Location{ID: 5, ManagedFolderID: 1, IsAccessible: true, IsSymbolicLink: true, PrimaryID: 6, IsPreferredGroup: true},
+		shoko.Location{ID: 6, ManagedFolderID: 2, IsAccessible: true, PrimaryID: 6, IsPreferredGroup: true},
+	); got != 6 {
+		t.Fatalf("symbolic link and its file: chose %d, want 6", got)
+	}
+	// A kept group wins over a duplicate, and a group's primary over its hard
+	// links.
+	if got := choose(
+		shoko.Location{ID: 7, ManagedFolderID: 1, IsAccessible: true, PrimaryID: 7},
+		shoko.Location{ID: 8, ManagedFolderID: 1, IsAccessible: true, PrimaryID: 9, IsPreferredGroup: true},
+		shoko.Location{ID: 9, ManagedFolderID: 2, IsAccessible: true, PrimaryID: 9, IsPreferredGroup: true},
+	); got != 9 {
+		t.Fatalf("duplicate and hard-linked group: chose %d, want 9", got)
+	}
+	// An accessible link still wins over the inaccessible file.
+	if got := choose(
+		shoko.Location{ID: 10, ManagedFolderID: 1, PrimaryID: 10, IsPreferredGroup: true},
+		shoko.Location{ID: 11, ManagedFolderID: 2, IsAccessible: true, IsSymbolicLink: true, PrimaryID: 10, IsPreferredGroup: true},
+	); got != 11 {
+		t.Fatalf("inaccessible file and accessible link: chose %d, want 11", got)
+	}
+}

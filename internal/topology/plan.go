@@ -227,20 +227,31 @@ func completeAirDate(series shoko.Series) (time.Time, bool) {
 	return date, err == nil
 }
 
+// chooseLocation picks the location of a file that its links lead to: one in a
+// mapped managed folder, preferably accessible. Among those it prefers the
+// file itself to a symbolic link to it, whose target is a path as Shoko sees
+// it and may not resolve where Silo reads the VFS, then a location of a group
+// daily Shoko keeps rather than counts as a duplicate, then the primary of its
+// group, and otherwise Shoko's order. A file with one location, or from a
+// stable server, which sends none of these, gets its first accessible one.
 func chooseLocation(file shoko.File, roots map[int]string) (shoko.Location, bool, Diagnostic) {
-	var fallback *shoko.Location
+	var best, fallback *shoko.Location
 	for i := range file.Locations {
 		location := &file.Locations[i]
 		root, mapped := roots[location.ManagedFolderID]
 		if !mapped || strings.TrimSpace(root) == "" {
 			continue
 		}
-		if fallback == nil {
+		if location.IsAccessible {
+			if best == nil || locationRank(*location) > locationRank(*best) {
+				best = location
+			}
+		} else if fallback == nil || locationRank(*location) > locationRank(*fallback) {
 			fallback = location
 		}
-		if location.IsAccessible {
-			return *location, true, Diagnostic{}
-		}
+	}
+	if best != nil {
+		return *best, true, Diagnostic{}
 	}
 	if fallback == nil {
 		return shoko.Location{}, false, Diagnostic{
@@ -254,6 +265,22 @@ func chooseLocation(file shoko.File, roots map[int]string) (shoko.Location, bool
 		Message:  "using an inaccessible Shoko location as a planned target",
 		Severity: "warning",
 	}
+}
+
+// locationRank orders a file's locations for chooseLocation; higher is
+// better.
+func locationRank(location shoko.Location) int {
+	rank := 0
+	if !location.IsSymbolicLink {
+		rank += 4
+	}
+	if location.IsPreferredGroup {
+		rank += 2
+	}
+	if location.PrimaryID != 0 && location.PrimaryID == location.ID {
+		rank++
+	}
+	return rank
 }
 
 func resolveEpisode(snapshot shoko.Snapshot, seriesID int, reference shoko.EpisodeCrossReferenceIDs) (shoko.Episode, int, bool) {

@@ -36,10 +36,28 @@ type HTTPError struct {
 }
 
 func (e *HTTPError) Error() string {
+	if e.RouteMissing() {
+		return fmt.Sprintf("shoko: %s returned HTTP 404 with no body, so the server does not serve that route; check that the server URL points at Shoko Server and that its APIv3 is turned on", e.Endpoint)
+	}
 	if e.Detail == "" {
 		return fmt.Sprintf("shoko: %s returned HTTP %d", e.Endpoint, e.StatusCode)
 	}
 	return fmt.Sprintf("shoko: %s returned HTTP %d: %s", e.Endpoint, e.StatusCode, e.Detail)
+}
+
+// RouteMissing reports whether the error is a 404 for a route the server does
+// not serve, rather than for an item it does not have. Shoko answers a missing
+// item with a message, such as "No Series entry for the given seriesID", and a
+// route it does not serve with an empty body: a route of a newer or older
+// server, or any APIv3 route while APIv3 is turned off, which daily Shoko
+// allows while it runs. An HTML page, as a reverse proxy sends for a path it
+// does not forward, counts as a missing route too.
+func (e *HTTPError) RouteMissing() bool {
+	if e.StatusCode != http.StatusNotFound {
+		return false
+	}
+	detail := strings.TrimSpace(e.Detail)
+	return detail == "" || strings.HasPrefix(detail, "<")
 }
 
 // Config configures a Shoko v3 client. The API key is only used for the
@@ -267,7 +285,7 @@ func (c *Client) ManagedFolders(ctx context.Context) ([]ManagedFolder, error) {
 	})
 	var httpErr *HTTPError
 	if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound {
-		return nil, errors.New("shoko: neither /ManagedFolder nor /ImportFolder exists; check that the server URL points at Shoko Server")
+		return nil, errors.New("shoko: neither /ManagedFolder nor /ImportFolder exists; check that the server URL points at Shoko Server and that its APIv3 is turned on")
 	}
 	return result, err
 }
@@ -366,11 +384,21 @@ func (c *Client) File(ctx context.Context, fileID int) (File, error) {
 	return result, err
 }
 
-// IsNotFound reports whether err is Shoko answering 404, which for an ID
-// lookup means the item no longer exists.
+// IsNotFound reports whether err is Shoko answering 404 for an item it does
+// not have, which for an ID lookup means the item no longer exists. A 404 for
+// a route the server does not serve is not one: while daily Shoko's APIv3 is
+// turned off every lookup answers 404, and reading that as every item being
+// gone would empty the VFS.
 func IsNotFound(err error) bool {
 	var httpErr *HTTPError
-	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound
+	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound && !httpErr.RouteMissing()
+}
+
+// IsRouteMissing reports whether err is a 404 for a route the server does not
+// serve. See HTTPError.RouteMissing.
+func IsRouteMissing(err error) bool {
+	var httpErr *HTTPError
+	return errors.As(err, &httpErr) && httpErr.RouteMissing()
 }
 
 // IsHidden reports whether err is Shoko answering 403 to an ID lookup, which
@@ -466,8 +494,7 @@ func (c *Client) TMDBEpisode(ctx context.Context, tmdbEpisodeID int) (TMDBEpisod
 	}
 	var result TMDBEpisode
 	err := c.get(ctx, "/TMDB/Episode/"+strconv.Itoa(tmdbEpisodeID), url.Values{"alternateOrderingID": {"default"}}, &result)
-	var httpErr *HTTPError
-	if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound {
+	if IsNotFound(err) {
 		return TMDBEpisode{}, false, nil
 	}
 	if err != nil {

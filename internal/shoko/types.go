@@ -70,6 +70,14 @@ type Location struct {
 	RelativePath    string `json:"relativePath"`
 	AbsolutePath    string `json:"absolutePath"`
 	IsAccessible    bool   `json:"isAccessible"`
+	// Daily Shoko groups the locations that are the same file, hard links of
+	// each other and symbolic links with the file they lead to. PrimaryID is
+	// the ID of the group's primary location, the file itself rather than a
+	// link to it. IsPreferredGroup marks the groups to keep rather than
+	// duplicates. Stable servers send none of these.
+	PrimaryID        int  `json:"primaryId,omitempty"`
+	IsPreferredGroup bool `json:"isPreferredGroup,omitempty"`
+	IsSymbolicLink   bool `json:"isSymbolicLink,omitempty"`
 }
 
 // UnmarshalJSON accepts the import-folder field used by stable servers.

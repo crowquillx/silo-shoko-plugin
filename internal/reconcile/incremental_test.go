@@ -48,6 +48,9 @@ type fakeShoko struct {
 	// series with a restricted tag: lookups of them and their files answer
 	// 403, and lists leave them out.
 	hiddenSeries map[int]bool
+	// apiOff answers every request as daily Shoko does while its APIv3 is
+	// turned off: 404 with an empty body, as the routes are not served.
+	apiOff bool
 }
 
 type fakeFile struct {
@@ -68,6 +71,10 @@ func (f *fakeShoko) handler(w http.ResponseWriter, r *http.Request) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.apiOff {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
 	path := strings.TrimPrefix(r.URL.Path, "/api/v3")
 	f.requests[path]++
 	parts := strings.Split(strings.Trim(path, "/"), "/")
@@ -408,6 +415,63 @@ func TestApplyDropsWhatShokoNowHides(t *testing.T) {
 	got := vfsLinks(t, outputRoot)
 	if len(got) != 1 || !strings.Contains(got[0], "[Shoko File=9]") {
 		t.Fatalf("links after Shoko hid series 8 = %v", got)
+	}
+}
+
+func TestApplyKeepsTheVFSWhileShokosAPIIsOff(t *testing.T) {
+	sourceRoot := filepath.Join(t.TempDir(), "source")
+	outputRoot := filepath.Join(t.TempDir(), "vfs")
+	if err := os.MkdirAll(sourceRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceRoot, "a.mkv"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeShoko{
+		files:       map[int]fakeFile{9: {path: "a.mkv", series: 7, episode: 42}},
+		seriesGroup: map[int]int{7: 3},
+		episodes:    map[int][2]int{42: {7, 1}},
+		requests:    make(map[string]int),
+	}
+	server := httptest.NewServer(http.HandlerFunc(fake.handler))
+	defer server.Close()
+	client, err := shoko.NewClient(shoko.Config{BaseURL: server.URL, APIKey: "key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconciler, err := vfs.NewReconciler(vfs.Config{Root: outputRoot, AllowedSourceRoots: []string{sourceRoot}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, err := New(Config{Client: client, Reconciler: reconciler, ManagedFolderMap: map[int]string{1: sourceRoot}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if outcome, err := engine.Step(ctx, 0); err != nil || !outcome.Complete {
+		t.Fatalf("full crawl = %#v, %v", outcome, err)
+	}
+	before := vfsLinks(t, outputRoot)
+	if len(before) != 1 {
+		t.Fatalf("links after crawl = %v", before)
+	}
+
+	// Every lookup now answers 404, but for a route Shoko does not serve, not
+	// for an item it does not have: the update fails and is retried instead
+	// of removing everything it read.
+	fake.update(func() { fake.apiOff = true })
+	_, err = engine.Apply(ctx, Changes{Files: []int{9}, Series: []int{7}, Groups: []int{3}})
+	if !shoko.IsRouteMissing(err) || !strings.Contains(err.Error(), "APIv3") {
+		t.Fatalf("Apply while APIv3 is off = %v, want a missing-route error naming APIv3", err)
+	}
+	if got := vfsLinks(t, outputRoot); strings.Join(got, "\n") != strings.Join(before, "\n") {
+		t.Fatalf("links changed while APIv3 was off = %v", got)
+	}
+	if _, err := engine.Step(ctx, 0); err == nil || !strings.Contains(err.Error(), "APIv3") {
+		t.Fatalf("crawl while APIv3 is off = %v, want an error naming APIv3", err)
+	}
+	if got := vfsLinks(t, outputRoot); strings.Join(got, "\n") != strings.Join(before, "\n") {
+		t.Fatalf("links changed by a crawl while APIv3 was off = %v", got)
 	}
 }
 

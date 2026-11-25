@@ -397,9 +397,13 @@ func markEpisodes(
 // episodeFault maps a failed read or write of one Shoko episode to a fault.
 func episodeFault(episodeID int, err error, action string) *pluginv1.WatchSyncFault {
 	fault := shokoFault(err)
-	var httpErr *shoko.HTTPError
-	if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound {
+	switch {
+	case shoko.IsNotFound(err):
 		fault.SafeMessage = fmt.Sprintf("Shoko has no episode %d; reconcile the Shoko VFS", episodeID)
+	case shoko.IsRouteMissing(err):
+		// Retried, as the sync works again once APIv3 is back on.
+		fault.Code = pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_TEMPORARY
+		fault.SafeMessage = "Shoko does not serve its APIv3 at the configured URL; check the URL and that APIv3 is turned on in Shoko's settings"
 	}
 	if shoko.IsHidden(err) {
 		// Retrying cannot help until the user's restricted tags change.

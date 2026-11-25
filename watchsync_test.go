@@ -692,3 +692,17 @@ func TestEpisodeFaultNamesAnEpisodeShokoHides(t *testing.T) {
 		t.Fatalf("fault = %v", fault)
 	}
 }
+
+// A 404 with a message is an episode Shoko does not have; one with no body is
+// a route it does not serve, as while its APIv3 is turned off, which is worth
+// retrying.
+func TestEpisodeFaultTellsAMissingEpisodeFromAMissingAPI(t *testing.T) {
+	missing := episodeFault(42, &shoko.HTTPError{Endpoint: "/Episode/42", StatusCode: http.StatusNotFound, Detail: `"No Episode entry for the given episodeID"`}, "read")
+	if !strings.Contains(missing.GetSafeMessage(), "has no episode 42") {
+		t.Fatalf("missing episode fault = %v", missing)
+	}
+	off := episodeFault(42, &shoko.HTTPError{Endpoint: "/Episode/42", StatusCode: http.StatusNotFound}, "read")
+	if off.GetCode() != pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_TEMPORARY || !strings.Contains(off.GetSafeMessage(), "APIv3") {
+		t.Fatalf("missing route fault = %v", off)
+	}
+}

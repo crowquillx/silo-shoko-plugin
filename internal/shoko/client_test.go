@@ -444,3 +444,47 @@ func TestMarkEpisodeWatchedAndCurrentUser(t *testing.T) {
 		t.Fatal("episode 0 should be rejected")
 	}
 }
+
+func TestNotFoundTellsAMissingItemFromAMissingRoute(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v3/Series/1":
+			// How Shoko answers for an item it does not have.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`"No Series entry for the given seriesID"`))
+		case "/api/v3/Series/2":
+			// A reverse proxy's page for a path it does not forward.
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte("<html><body>404 Not Found</body></html>"))
+		default:
+			// How Shoko answers for a route it does not serve, such as any
+			// APIv3 route while APIv3 is turned off.
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{BaseURL: server.URL, APIKey: "key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	_, err = client.Series(ctx, 1)
+	if !IsNotFound(err) || IsRouteMissing(err) {
+		t.Fatalf("missing series: IsNotFound = %v, IsRouteMissing = %v", IsNotFound(err), IsRouteMissing(err))
+	}
+	for _, id := range []int{2, 3} {
+		_, err = client.Series(ctx, id)
+		if IsNotFound(err) || !IsRouteMissing(err) || !strings.Contains(err.Error(), "APIv3") {
+			t.Fatalf("series %d: IsNotFound = %v, IsRouteMissing = %v, error %v", id, IsNotFound(err), IsRouteMissing(err), err)
+		}
+	}
+	if _, found, err := client.TMDBEpisode(ctx, 5); found || !IsRouteMissing(err) {
+		t.Fatalf("TMDB episode while APIv3 is off = %v, %v; want a missing-route error, not \"no episode\"", found, err)
+	}
+	if _, err := client.ManagedFolders(ctx); err == nil || !strings.Contains(err.Error(), "APIv3 is turned on") {
+		t.Fatalf("managed folders while APIv3 is off = %v", err)
+	}
+}

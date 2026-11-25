@@ -866,3 +866,27 @@ func siloPosterChoice(records []*pluginv1.ImageRecord, language string) string {
 	}
 	return ""
 }
+
+func TestTaskOutputCountsDiagnosticsByMessage(t *testing.T) {
+	plan := topology.Plan{}
+	for i := 1; i <= 150; i++ {
+		plan.Diagnostics = append(plan.Diagnostics, topology.Diagnostic{FileID: i, Message: "using an inaccessible Shoko location as a planned target", Severity: "warning"})
+	}
+	plan.Diagnostics = append(plan.Diagnostics, topology.Diagnostic{FileID: 151, Message: "file has no location in a configured managed-folder map", Severity: "warning"})
+	output, err := taskOutput(false, true, "complete", 0, 0, 0, plan, vfs.Result{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := output.AsMap()
+	if values["diagnostic_count"] != float64(151) || len(values["diagnostics"].([]any)) != maxTaskOutputFailures {
+		t.Fatalf("diagnostic_count = %v, diagnostics listed = %d", values["diagnostic_count"], len(values["diagnostics"].([]any)))
+	}
+	summary := values["diagnostic_summary"].([]any)
+	if len(summary) != 2 {
+		t.Fatalf("diagnostic_summary = %v", summary)
+	}
+	first, second := summary[0].(map[string]any), summary[1].(map[string]any)
+	if first["count"] != float64(150) || first["message"] != "using an inaccessible Shoko location as a planned target" || second["count"] != float64(1) {
+		t.Fatalf("diagnostic_summary = %v", summary)
+	}
+}
